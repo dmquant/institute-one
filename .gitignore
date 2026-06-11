@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+frontend/dist/
+obsidian-plugin/node_modules/
+# NOTE: obsidian-plugin/main.js IS committed on purpose — Obsidian plugins are
+# distributed as manifest.json + main.js, so users can install without a Node build.
+.pytest_cache/
+*.egg-info/
+.DS_Store

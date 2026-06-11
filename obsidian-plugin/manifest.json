@@ -1,0 +1,9 @@
+{
+	"id": "institute-one",
+	"name": "Institute One",
+	"version": "0.2.0",
+	"minAppVersion": "1.4.0",
+	"description": "Institute One cockpit: live dashboard (queue, hands, dailies, events), ask analysts, deep research, whiteboard, mailbox, archive search and vault export — all against a local Institute One backend.",
+	"author": "institute-one",
+	"isDesktopOnly": true
+}
