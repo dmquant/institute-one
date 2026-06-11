@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     enable_claude: bool = True
     enable_codex: bool = True
     enable_gemini: bool = True
+    enable_agy: bool = True       # Google Antigravity CLI (gemini successor)
     enable_opencode: bool = True
     enable_ollama: bool = False
     enable_echo: bool = True  # trivial built-in hand used by tests/smoke checks

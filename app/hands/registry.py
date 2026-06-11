@@ -25,7 +25,8 @@ log = logging.getLogger("institute.registry")
 DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
     "claude": ["codex", "gemini", "claude-api"],
     "codex": ["claude", "gemini", "openai-api"],
-    "gemini": ["claude", "codex", "gemini-api"],
+    "gemini": ["agy", "claude", "codex", "gemini-api"],
+    "agy": ["gemini", "claude", "codex", "gemini-api"],
     "opencode": ["claude", "codex"],
     "claude-api": [],
     "openai-api": [],

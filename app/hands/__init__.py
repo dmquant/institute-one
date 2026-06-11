@@ -64,6 +64,7 @@ def finalize_cli_result(
 
 def build_hands(settings: Settings) -> list[Hand]:
     """Construct every hand. Availability filtering is the registry's job."""
+    from .agy_hand import AgyHand
     from .api_hands import ClaudeApiHand, GeminiApiHand, OpenAiApiHand
     from .claude_hand import ClaudeHand
     from .codex_hand import CodexHand
@@ -75,6 +76,7 @@ def build_hands(settings: Settings) -> list[Hand]:
         ClaudeHand(settings),
         CodexHand(settings),
         GeminiHand(settings),
+        AgyHand(settings),
         OpencodeHand(settings),
         OllamaHand(settings),
         ClaudeApiHand(settings),

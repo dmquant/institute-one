@@ -164,7 +164,8 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 - ☐ **Research projects** (M). Group research runs + boards + threads under a named long-running project; project page; project digest endpoint.
 - ☐ **BFS research tree / Explore mode** (L). Port `research-worker` `prompt.ts` + 7-step defensive `parser.ts` behavior; `research_tree_*` tables; server-side drain under the global semaphore; `/research/tree/:id` SSE viewer (proposal §6.2).
 - ☐ **Multi-agent vocabulary** (M). `fan_out(agents, prompt)` + `join(all|first_success|majority_vote|best_effort)`; `POST /api/multi-agent/run`; the ask/compare SPA page.
-- ☐ **More hands** (S each). agy (with its process-wide lock + artifact capture), vane (search), mflux (image gen) — port from `agent-route-node/app/hands/*`.
+- ☑ **agy hand** (done 2026-06-11). Ported from `agent-route-node/app/hands/agy_hand.py` with the serial lock, flag-order rules, stdin=DEVNULL, brain/scratch artifact capture, and walkthrough inlining; gemini-family rate-limit signatures; chained `gemini ↔ agy`.
+- ☐ **More hands** (S each). vane (search), mflux (image gen) — port from `agent-route-node/app/hands/*`.
 - ☐ **Bilingual twins** (M). `report.{zh,en}.md` convention for dossiers/briefings; locale toggle in the SPA.
 - ☐ **Favorites & visualizations** (M, optional).
 

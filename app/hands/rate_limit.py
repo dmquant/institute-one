@@ -165,6 +165,7 @@ _DETECTORS = {
     "claude": _detect_claude,
     "codex": _detect_codex,
     "gemini": _detect_gemini,
+    "agy": _detect_gemini,  # agy is gemini-powered: same quota signatures
     "opencode": _detect_opencode,
     "claude-api": _detect_api,
     "openai-api": _detect_api,

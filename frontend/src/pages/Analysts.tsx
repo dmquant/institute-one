@@ -13,7 +13,7 @@ import {
 } from "../api";
 import { Empty, ErrorNote, Loading, PageHead, useLoad } from "../ui";
 
-const HANDS = ["claude", "codex", "gemini", "opencode", "ollama"];
+const HANDS = ["claude", "codex", "gemini", "agy", "opencode", "ollama"];
 const CUSTOM_ROLE = "__custom__";
 
 interface FormState {
