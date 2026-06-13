@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from pathlib import Path
 
@@ -23,10 +24,12 @@ from .base import Hand, RateLimitInfo
 log = logging.getLogger("institute.registry")
 
 DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
-    "claude": ["codex", "gemini", "claude-api"],
-    "codex": ["claude", "gemini", "openai-api"],
-    "gemini": ["agy", "claude", "codex", "gemini-api"],
-    "agy": ["gemini", "claude", "codex", "gemini-api"],
+    "claude": ["agy-opus", "agy", "codex", "claude-api"],
+    "codex": ["claude", "agy-opus", "agy", "openai-api"],
+    # Legacy requests for the obsolete Gemini CLI are routed to Antigravity.
+    "gemini": ["agy", "agy-opus", "codex", "claude", "gemini-api"],
+    "agy": ["agy-opus", "codex", "claude", "gemini-api"],
+    "agy-opus": ["agy", "codex", "claude", "gemini-api"],
     "opencode": ["claude", "codex"],
     "claude-api": [],
     "openai-api": [],
@@ -125,8 +128,34 @@ class HandRegistry:
             return False
         return True
 
+    def _pool_names(self) -> list[str]:
+        names: list[str] = []
+        for raw in self.settings.hand_pool.split(","):
+            name = raw.strip()
+            if name and name != "pool" and name not in names:
+                names.append(name)
+        return names
+
+    def _resolve_pool(self, *, allow_degraded: bool = False) -> tuple[Hand | None, list[str]]:
+        tried = ["pool"]
+        candidates = self._pool_names()
+        random.shuffle(candidates)
+        for cand in candidates:
+            tried.append(cand)
+            if self.is_available(cand, allow_degraded=allow_degraded):
+                return self._hands[cand], tried
+        return None, tried
+
     def resolve(self, name: str, *, allow_fallback: bool = True) -> tuple[Hand | None, list[str]]:
         """Pick the hand to run. Returns (hand_or_None, tried_names)."""
+        if name == "pool":
+            hand, tried = self._resolve_pool()
+            if hand is not None:
+                return hand, tried
+            # last resort mirrors named chains: a degraded hand is preferable
+            # to dropping the task when every healthy pool member is exhausted.
+            return self._resolve_pool(allow_degraded=True)
+
         tried: list[str] = []
         candidates = [name] + (DEFAULT_FALLBACK_CHAINS.get(name, []) if allow_fallback else [])
         for cand in candidates:
@@ -143,6 +172,18 @@ class HandRegistry:
     def status_snapshot(self) -> list[dict]:
         out = []
         now = time.time()
+        pool_names = self._pool_names()
+        out.append({
+            "name": "pool",
+            "type": "router",
+            "installed": any(name in self._hands for name in pool_names),
+            "available": any(self.is_available(name) for name in pool_names),
+            "degraded": False,
+            "cooldown_until": None,
+            "cooldown_reason": None,
+            "consecutive_failures": 0,
+            "fallback_chain": pool_names,
+        })
         for name, hand in self._hands.items():
             cd = self._cooldowns.get(name)
             cooling = cd and cd.get("until", 0) > now

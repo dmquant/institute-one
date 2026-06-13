@@ -6,6 +6,7 @@ exporter. Bind: 127.0.0.1, no auth (single operator, single machine).
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -19,6 +20,14 @@ from .router import executor
 
 log = logging.getLogger("institute")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+SECRET_QUERY_RE = re.compile(r"([?&](?:apikey|api_key|key|token|access_token)=)[^&\\s]+", re.IGNORECASE)
+
+
+def _sanitize_error(text: str) -> str:
+    return SECRET_QUERY_RE.sub(r"\\1[redacted]", text)
 
 
 @asynccontextmanager
@@ -56,12 +65,18 @@ def create_app() -> FastAPI:
         transient = "locked" in str(exc).lower() or "busy" in str(exc).lower()
         return JSONResponse(
             status_code=500,
-            content={"error": type(exc).__name__, "message": str(exc), "path": request.url.path, "transient": transient},
+            content={
+                "error": type(exc).__name__,
+                "message": _sanitize_error(str(exc)),
+                "path": request.url.path,
+                "transient": transient,
+            },
         )
 
     from .api import (
         analysts as api_analysts,
         archive as api_archive,
+        data as api_data,
         events as api_events,
         hands as api_hands,
         mailbox as api_mailbox,
@@ -79,7 +94,7 @@ def create_app() -> FastAPI:
         api_meta.router, api_tasks.router, api_hands.router, api_events.router,
         api_analysts.router, api_sessions.router, api_workflows.router,
         api_whiteboard.router, api_mailbox.router, api_research.router,
-        api_archive.router, api_vault.router, api_mcp.router,
+        api_archive.router, api_data.router, api_vault.router, api_mcp.router,
     ):
         app.include_router(r)
 

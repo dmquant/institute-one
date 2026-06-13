@@ -2,7 +2,7 @@
 
 **From the v0.1 MVP to the full single-node AI institute described in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md).**
 
-This file is written to be **vibe-coded**: every item is a self-contained milestone with grounding (which proposal section, which legacy source to port from, which current files to touch), and the keystone items carry a ready-to-paste prompt for Claude Code / Codex / Gemini — the rest give you enough grounding to write your own. Read [`CLAUDE.md`](./CLAUDE.md) first — it encodes the repo's hard rules; the prompts below assume the agent has it loaded.
+This file is written to be **vibe-coded**: every item is a self-contained milestone with grounding (which proposal section, which legacy source to port from, which current files to touch), and the keystone items carry a ready-to-paste prompt for Claude Code / Codex / Antigravity — the rest give you enough grounding to write your own. Read [`CLAUDE.md`](./CLAUDE.md) first — it encodes the repo's hard rules; the prompts below assume the agent has it loaded.
 
 How to use: pick an unchecked item (respect the dependency arrows in §0), paste the prompt, review the diff, run `pytest -q`, tick the box, commit. Items inside a phase are mostly independent; phases are ordered by dependency, not importance.
 
@@ -17,7 +17,7 @@ flowchart LR
     V01["v0.1 ✅<br/>executor spine · 4+3 hands<br/>5 loops · vault · SPA · plugin · MCP<br/>(~20–25% of the proposal)"]
     P0["Phase 0 🔧<br/>Hardening<br/>(14 verified issues)"]
     P1A["Phase 1a<br/>Embeddings<br/>(sqlite-vec + bge-m3)"]
-    P1B["Phase 1b<br/>Market data<br/>(FMP/Stooq/Sina)"]
+    P1B["Phase 1b<br/>Market data<br/>(IBKR bars + FMP/SEC)"]
     P2["Phase 2<br/>Memory & quality<br/>(analyst memory · digests ·<br/>hand weights · scorecard)"]
     P3["Phase 3<br/>Fact-check v2<br/>(+ claim-check)"]
     P4["Phase 4<br/>Chain graph<br/>(vault = graph)"]
@@ -104,8 +104,9 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 
 *Proposal §6.2 marketdata row, §9 Data row, §10. Port from `researchos/data-updater/src/*` (fetcher ladders, symbol-quirk tables, confidence-gated writes). Unblocks paper book; enriches research.*
 
-- ☐ **`institute/marketdata.py`** (L). FMP → Stooq → Sina fetcher ladder, `(topic, work_date)` upsert into `shared_data`, confidence-gated refuse-to-write, hourly scheduler job (maintenance-exempt), `GET /api/data/:topic/latest`, `GET /api/quote/:ticker`. Settings: `INSTITUTE_FMP_API_KEY` etc.; job disabled when no keys.
-- ☐ **Research data injection** (S). Fetch the company bundle in `research_dispatch` and inline a ≤4KB summary into the financial steps via a `${DATA_BUNDLE}` variable — replacing "please web-search" with grounded numbers.
+- ☑ **`institute/marketdata.py` first pass** (M). Local `shared_data` cache, `GET /api/data/:topic/latest`, `GET /api/quote/:ticker`, `GET /api/data/:topic/bundle`; FMP/SEC financial snapshots; optional IBKR recent historical bar quote. FMP is deliberately not used for prices, and IBKR price mode avoids paid per-request snapshots.
+- ☑ **Research data injection** (S). Fetch the company bundle in `research_dispatch` and inline a ≤4KB summary into the financial steps via a `${DATA_BUNDLE}` variable — replacing "please web-search" with grounded numbers.
+- ☐ **Marketdata hardening** (M). Add batch historical refresh, IBKR pacing/backoff, exchange/security-type routing beyond US stocks, and local Parquet/SQLite series storage for repeated research.
 
 ## Phase 2 — Memory & quality loop
 
@@ -124,9 +125,9 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 
 *Proposal §6.2 row 3. Legacy: researchos fact-check modules + Filter-A/B prompts + the verdict regex cascade (UNVERIFIABLE before DISPUTED) + `FACT_REUSE_POLICY`. Needs 1a.*
 
-- ☐ **Claim extraction** (M). After whiteboard cards and research reports: an opencode/cheap-hand task extracts ≤3 checkable claims (Filter-A/B style prompt) → `fact_cards` rows (category taxonomy: numerical/financial/event/policy/…).
+- ◩ **Claim extraction / triage MVP** (M). `fact_cards` rows now exist via deterministic post-export extraction for workflows, research, analyst dailies, whiteboards, and whiteboard cards. It flags `source_attached`, `weak_source`, `unsupported`, and `declared_unverified`, and surfaces risky claims as Obsidian callouts on new exports. This is claim triage, not truth verification; the original opencode/cheap-hand Filter-A/B extractor can still replace or enrich it later.
 - ☐ **Tier-1 reuse gate** (M). Embed the claim, query `vec_factclaims`; per-category cosine thresholds + TTLs decide reuse vs re-verify; a disputed near-neighbor marks `self_contradicted`.
-- ☐ **Verification** (M). A `websearch` verification task (claude/gemini with web access; the legacy vane hand stays optional) → verdict parsed via the regex cascade → `verified_facts`.
+- ☐ **Verification** (M). A `websearch` verification task (claude/agy with web access; the legacy vane hand stays optional) → verdict parsed via the regex cascade → `verified_facts`.
 - ☐ **Disputed-claim surfacing** (M). Mailbox feedback thread to the claiming analyst; `Inbox/Disputed Claims.md` digest in the vault; `> [!warning]` callouts injected into the source dossier's managed region; Step-0 disputed-claims block in that analyst's prompts.
 - ☐ **Claim-check-before-write** (S). `POST /api/meta/claim_check_before_write` + the Obsidian plugin command (check selection against verified/disputed facts while you write — the proposal calls it the highest-value writing-time feature).
 - ☐ MCP: `fact_cards_list/get`, `claim_check` read tools.
@@ -164,7 +165,7 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 - ☐ **Research projects** (M). Group research runs + boards + threads under a named long-running project; project page; project digest endpoint.
 - ☐ **BFS research tree / Explore mode** (L). Port `research-worker` `prompt.ts` + 7-step defensive `parser.ts` behavior; `research_tree_*` tables; server-side drain under the global semaphore; `/research/tree/:id` SSE viewer (proposal §6.2).
 - ☐ **Multi-agent vocabulary** (M). `fan_out(agents, prompt)` + `join(all|first_success|majority_vote|best_effort)`; `POST /api/multi-agent/run`; the ask/compare SPA page.
-- ☑ **agy hand** (done 2026-06-11). Ported from `agent-route-node/app/hands/agy_hand.py` with the serial lock, flag-order rules, stdin=DEVNULL, brain/scratch artifact capture, and walkthrough inlining; gemini-family rate-limit signatures; chained `gemini ↔ agy`.
+- ☑ **agy hand** (done 2026-06-11). Ported from `agent-route-node/app/hands/agy_hand.py` with the serial lock, flag-order rules, stdin=DEVNULL, brain/scratch artifact capture, and walkthrough inlining; gemini-family rate-limit signatures; legacy `gemini` requests route to `agy`.
 - ☐ **More hands** (S each). vane (search), mflux (image gen) — port from `agent-route-node/app/hands/*`.
 - ☐ **Bilingual twins** (M). `report.{zh,en}.md` convention for dossiers/briefings; locale toggle in the SPA.
 - ☐ **Favorites & visualizations** (M, optional).

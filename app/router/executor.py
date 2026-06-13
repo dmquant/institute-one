@@ -270,14 +270,14 @@ async def list_tasks(
 
 async def cancel(task_id: str) -> bool:
     atask = _running.get(task_id)
-    if atask is not None and not atask.done():
-        atask.cancel()
-        return True
     n = await db.execute(
-        "UPDATE tasks SET status='cancelled', finished_at=?, error='cancelled while queued' "
+        "UPDATE tasks SET status='cancelled', finished_at=?, error='cancelled by operator' "
         "WHERE id=? AND status IN ('queued','running')",
         (bus.now_iso(), task_id),
     )
+    if atask is not None and not atask.done():
+        atask.cancel()
+        return True
     return n > 0
 
 

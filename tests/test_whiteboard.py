@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 from app import bus, db
 from app.institute import whiteboard
@@ -91,3 +92,91 @@ async def test_tick_drives_board_to_completed_on_echo():
     assert digest.is_file()
     text = digest.read_text(encoding="utf-8")
     assert "宏观利率走向" in text
+    assert "## 停止条件" in text
+    assert "## 需监控的新证据清单" in text
+
+
+async def test_tick_marks_missing_card_output_failed(monkeypatch):
+    board = await whiteboard.create_board("空输出防护", "completed 但没有文件怎么办？", max_cards=1)
+    board_id = board["id"]
+    seen: dict[str, object] = {}
+
+    async def fake_submit(*args, **kwargs):
+        return SimpleNamespace(id="task-empty-card", status="completed", output="", error=None, hand="agy-opus")
+
+    class FakeRegistry:
+        def mark_rate_limited(self, hand_name, info):
+            seen["cooldown"] = (hand_name, info.reason, info.retry_after_s)
+
+        def record_result(self, hand_name, *, ok, rate_limited=False):
+            seen["record"] = (hand_name, ok, rate_limited)
+
+    monkeypatch.setattr(whiteboard.executor, "submit", fake_submit)
+    monkeypatch.setattr(whiteboard, "get_registry", lambda: FakeRegistry())
+
+    await whiteboard.tick()
+    await _drain_bg()
+
+    after = await whiteboard.get_board(board_id)
+    assert after["cards"][0]["status"] == "failed"
+    assert seen["cooldown"] == ("agy-opus", "invalid_output", whiteboard.INVALID_OUTPUT_COOLDOWN_S)
+    assert seen["record"] == ("agy-opus", False, True)
+
+    events = await bus.replay(0, types=["whiteboard.card_invalid_output"])
+    assert any(e.ref_id == after["cards"][0]["id"] for e in events)
+
+
+def test_closure_block_prefers_analyst_written_sections():
+    block = whiteboard.closure_block_from_texts(
+        "SpaceX 估值补充",
+        "太空 AI 算力是否改变估值？",
+        [
+            "## 核心结论\n还需要讨论。",
+            (
+                "## 核心结论\n已经收束。\n\n"
+                "## 停止条件\n- 等待 Starship 发射成本新披露。\n\n"
+                "## 需监控的新证据清单\n- DoD 或情报系统采购合同。"
+            ),
+        ],
+        card_count=2,
+    )
+
+    assert "等待 Starship 发射成本新披露" in block
+    assert "DoD 或情报系统采购合同" in block
+    assert "继续让模型互相推理只会重复既有假设" not in block
+
+
+def test_closure_block_falls_back_when_sections_are_missing():
+    block = whiteboard.closure_block_from_texts(
+        "AI 基础模型估值",
+        "平台还是出版商？",
+        ["## 核心结论\n只剩几个情景。"],
+        card_count=1,
+    )
+
+    assert "## 停止条件" in block
+    assert "## 需监控的新证据清单" in block
+    assert "继续让模型互相推理只会重复既有假设" in block
+
+
+async def test_finalize_refuses_pending_cards_after_handoff():
+    board = await whiteboard.create_board("能源通胀联动", "还有宏观和固收分歧吗？", max_cards=3)
+    board_id = board["id"]
+    first = board["cards"][0]
+    await db.execute(
+        "UPDATE whiteboard_cards SET status='completed', summary='商品端认为 headline 先回落', "
+        "output_file='card-01.md', finished_at=? WHERE id=?",
+        (bus.now_iso(), first["id"]),
+    )
+    await db.execute(
+        "INSERT INTO whiteboard_cards (id, board_id, idx, analyst_id, status, question, created_at) "
+        "VALUES (?,?,2,'macro-analyst','pending','宏观端是否确认政策转向？',?)",
+        ("pendingcard01", board_id, bus.now_iso()),
+    )
+
+    fresh = await db.query_one("SELECT * FROM whiteboard_boards WHERE id=?", (board_id,))
+    await whiteboard._finalize(fresh)
+
+    after = await whiteboard.get_board(board_id)
+    assert after["status"] == "active"
+    assert [c["status"] for c in after["cards"]] == ["completed", "pending"]

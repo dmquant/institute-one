@@ -42,7 +42,7 @@ export interface InstituteSettings {
 }
 
 export const DEFAULT_SETTINGS: InstituteSettings = {
-	baseUrl: "http://127.0.0.1:8100",
+	baseUrl: "http://127.0.0.1:8110",
 	vaultSubfolder: "Institute",
 	defaultAnalyst: "",
 	insertStyle: "callout",

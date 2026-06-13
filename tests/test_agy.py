@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 
 from app.config import get_settings
-from app.hands.agy_hand import AgyHand, agy_data_root, capture_artifacts, parse_conversation_id
+from app.hands.agy_hand import AgyHand, AgyOpusHand, agy_data_root, capture_artifacts, parse_conversation_id
 from app.hands.rate_limit import detect_rate_limit
 from app.hands.registry import DEFAULT_FALLBACK_CHAINS
+from app.hands import build_hands
 
 
 def test_available_requires_flag_and_binary(monkeypatch):
@@ -19,6 +20,12 @@ def test_available_requires_flag_and_binary(monkeypatch):
     monkeypatch.setattr(get_settings(), "enable_agy", True)
     monkeypatch.setattr("app.hands.agy_hand.resolve_cli_path", lambda name: None)
     assert hand.available() is False
+
+
+def test_build_hands_registers_agy_opus():
+    names = [hand.name for hand in build_hands(get_settings())]
+    assert "agy" in names
+    assert "agy-opus" in names
 
 
 def test_conversation_id_parse(tmp_path: Path):
@@ -78,6 +85,99 @@ def test_agy_rate_limit_uses_gemini_signatures():
     assert detect_rate_limit("agy", "perfectly normal output") is None
 
 
+def test_agy_session_limit_is_quota_signature():
+    for text in (
+        "You've hit your session limit. Try again later.",
+        "Plan usage limit reached for this session.",
+        "Daily limit reached.",
+    ):
+        info = detect_rate_limit("agy", text)
+        assert info is not None
+        assert info.reason == "quota_exhausted"
+
+
+def test_claude_session_limit_is_quota_signature():
+    info = detect_rate_limit("claude", "You've hit your session limit · resets 2:30pm (Asia/Tokyo)")
+    assert info is not None
+    assert info.reason == "quota_exhausted"
+
+
+def test_codex_session_and_quota_limits_are_quota_signatures():
+    for text in (
+        "You've hit your session limit · resets 2:30pm (Asia/Tokyo)",
+        "usage limit reached for this account",
+        "quota exhausted",
+        "insufficient_quota",
+    ):
+        info = detect_rate_limit("codex", text)
+        assert info is not None
+        assert info.reason == "quota_exhausted"
+
+
 def test_agy_in_fallback_chains():
-    assert DEFAULT_FALLBACK_CHAINS["agy"][0] == "gemini"
+    assert DEFAULT_FALLBACK_CHAINS["claude"][:3] == ["agy-opus", "agy", "codex"]
+    assert DEFAULT_FALLBACK_CHAINS["agy"][:3] == ["agy-opus", "codex", "claude"]
+    assert DEFAULT_FALLBACK_CHAINS["agy-opus"][:2] == ["agy", "codex"]
     assert DEFAULT_FALLBACK_CHAINS["gemini"][0] == "agy"
+
+
+async def test_agy_model_flag_precedes_print(tmp_path: Path, monkeypatch):
+    seen: dict[str, list[str]] = {}
+
+    async def fake_run_subprocess(cmd, cwd, timeout_s, on_chunk=None, stdin_data=None):
+        seen["cmd"] = cmd
+        return "OK", "", 0
+
+    monkeypatch.setattr("app.hands.agy_hand.resolve_cli_path", lambda name: "/bin/agy")
+    monkeypatch.setattr("app.hands.agy_hand.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("app.hands.agy_hand.capture_artifacts", lambda *args, **kwargs: ([], ""))
+
+    hand = AgyHand(get_settings())
+    result = await hand.execute(
+        "Return OK", tmp_path, model="Claude Sonnet 4.6 (Thinking)", timeout_s=45
+    )
+
+    assert result.exit_code == 0
+    cmd = seen["cmd"]
+    assert cmd[0] == "/bin/agy"
+    assert cmd[-2:] == ["--print", "Return OK"]
+    assert cmd[cmd.index("--model") + 1] == "Claude Sonnet 4.6 (Thinking)"
+    assert cmd.index("--model") < cmd.index("--print")
+
+
+async def test_agy_opus_hand_uses_default_opus_model(tmp_path: Path, monkeypatch):
+    seen: dict[str, list[str]] = {}
+
+    async def fake_run_subprocess(cmd, cwd, timeout_s, on_chunk=None, stdin_data=None):
+        seen["cmd"] = cmd
+        return "OK", "", 0
+
+    monkeypatch.setattr("app.hands.agy_hand.resolve_cli_path", lambda name: "/bin/agy")
+    monkeypatch.setattr("app.hands.agy_hand.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("app.hands.agy_hand.capture_artifacts", lambda *args, **kwargs: ([], ""))
+    monkeypatch.setattr(get_settings(), "agy_opus_model", "Claude Opus 4.6 (Thinking)")
+
+    hand = AgyOpusHand(get_settings())
+    result = await hand.execute("Return OK", tmp_path, timeout_s=45)
+
+    assert hand.name == "agy-opus"
+    assert result.exit_code == 0
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "Claude Opus 4.6 (Thinking)"
+    assert cmd.index("--model") < cmd.index("--print")
+
+
+async def test_agy_empty_success_is_treated_as_quota_exhausted(tmp_path: Path, monkeypatch):
+    async def fake_run_subprocess(cmd, cwd, timeout_s, on_chunk=None, stdin_data=None):
+        return "", "", 0
+
+    monkeypatch.setattr("app.hands.agy_hand.resolve_cli_path", lambda name: "/bin/agy")
+    monkeypatch.setattr("app.hands.agy_hand.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("app.hands.agy_hand.capture_artifacts", lambda *args, **kwargs: ([], ""))
+
+    hand = AgyOpusHand(get_settings())
+    result = await hand.execute("Return OK", tmp_path, timeout_s=45)
+
+    assert result.exit_code == 1
+    assert result.rate_limit is not None
+    assert result.rate_limit.reason == "quota_exhausted"

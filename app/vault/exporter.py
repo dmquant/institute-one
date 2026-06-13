@@ -15,7 +15,9 @@ from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..institute import claim_audit, evidence
 from ..institute.prompts import extract_summary, work_date
+from ..institute.quality import evidence_warnings, quality_callout
 from .writer import get_writer
 
 log = logging.getLogger("institute.exporter")
@@ -168,11 +170,37 @@ async def _export_research(
     if footer:
         parts.append(footer)
 
+    raw_body = "\n\n".join(parts)
+    audit = claim_audit.audit_text(raw_body)
+    callout = claim_audit.claim_audit_callout(audit)
+    body = f"{callout}\n\n{raw_body}" if callout else raw_body
     rel = f"Research/{_slug(topic)}/{work_date()} 深度报告.md"
-    frontmatter = {"type": "research", "topic": topic, "run_id": run_id, "session": session_id}
+    frontmatter = {
+        "type": "research",
+        "topic": topic,
+        "run_id": run_id,
+        "session": session_id,
+        **audit.frontmatter(),
+    }
     written = await get_writer().write_note(
-        rel, frontmatter, "\n\n".join(parts),
+        rel, frontmatter, body,
         artifact_kind="research", artifact_id=str(run_id or topic or "research"),
+    )
+    await _ingest_evidence_safe(
+        raw_body,
+        artifact_kind="research",
+        artifact_id=str(run_id or topic or "research"),
+        artifact_path=written or rel,
+        topic=topic,
+        work_date=work_date(),
+    )
+    await _audit_claims_safe(
+        raw_body,
+        artifact_kind="research",
+        artifact_id=str(run_id or topic or "research"),
+        artifact_path=written or rel,
+        topic=topic,
+        work_date=work_date(),
     )
     if written:
         log.info("vault export: %s", written)
@@ -254,9 +282,36 @@ async def _on_workflow(event: bus.Event) -> None:
             log.warning("nothing to export for %s run %s", wf_id, run_id)
             return
         rel = f"{folder}/{work_date()} {title}.md"
-        await get_writer().write_note(
-            rel, {"type": wf_id, "run_id": run_id}, text,
+        warnings = evidence_warnings(text)
+        audit = claim_audit.audit_text(text)
+        callouts = [c for c in (quality_callout(warnings), claim_audit.claim_audit_callout(audit)) if c]
+        body = "\n\n".join([*callouts, text])
+        written = await get_writer().write_note(
+            rel,
+            {
+                "type": wf_id,
+                "run_id": run_id,
+                "quality_warnings": warnings,
+                **audit.frontmatter(),
+            },
+            body,
             artifact_kind=wf_id, artifact_id=str(run_id or wf_id),
+        )
+        await _ingest_evidence_safe(
+            text,
+            artifact_kind=wf_id,
+            artifact_id=str(run_id or wf_id),
+            artifact_path=written or rel,
+            topic=title,
+            work_date=work_date(),
+        )
+        await _audit_claims_safe(
+            text,
+            artifact_kind=wf_id,
+            artifact_id=str(run_id or wf_id),
+            artifact_path=written or rel,
+            topic=title,
+            work_date=work_date(),
         )
         log.info("vault export: %s", rel)
     except Exception:
@@ -291,6 +346,8 @@ async def _on_board(event: bus.Event) -> None:
         parts = [f"# {topic}"]
         if question:
             parts.append(f"> {question}")
+        card_texts: list[str] = []
+        card_evidence: list[dict[str, str]] = []
         for n, card in enumerate(sorted(cards, key=lambda c: _get(c, "idx") or 0), start=1):
             analyst_id = str(_get(card, "analyst_id") or "")
             analyst = get_analyst(analyst_id) if analyst_id else None
@@ -300,14 +357,63 @@ async def _on_board(event: bus.Event) -> None:
             output_file = _get(card, "output_file")
             text = _read_text(ws / str(output_file)) if ws and output_file else None
             text = (text or str(_get(card, "summary") or "")).strip() or "（无产出）"
+            card_texts.append(text)
+            card_evidence.append({
+                "id": str(_get(card, "id") or f"{board_id}:{idx}"),
+                "idx": str(idx),
+                "analyst_id": analyst_id,
+                "text": text,
+            })
             parts.append(f"## card-{idx:02d} · {who}\n\n{text}")
 
+        from ..institute.whiteboard import closure_block_from_texts  # lazy: avoid exporter/domain cycle
+
+        parts.append(
+            closure_block_from_texts(topic, question, card_texts, card_count=len(cards))
+        )
+
         rel = f"Whiteboard/{wd} {_slug(topic)}.md"
-        frontmatter = {"type": "whiteboard", "board_id": board_id, "cards": len(cards)}
-        await get_writer().write_note(
-            rel, frontmatter, "\n\n".join(parts),
+        raw_body = "\n\n".join(parts)
+        audit = claim_audit.audit_text(raw_body)
+        callout = claim_audit.claim_audit_callout(audit)
+        body = f"{callout}\n\n{raw_body}" if callout else raw_body
+        frontmatter = {
+            "type": "whiteboard",
+            "board_id": board_id,
+            "cards": len(cards),
+            **audit.frontmatter(),
+        }
+        written = await get_writer().write_note(
+            rel, frontmatter, body,
             artifact_kind="whiteboard", artifact_id=board_id,
         )
+        await _audit_claims_safe(
+            raw_body,
+            artifact_kind="whiteboard",
+            artifact_id=board_id,
+            artifact_path=written or rel,
+            topic=topic,
+            work_date=wd,
+        )
+        for card_ev in card_evidence:
+            await _ingest_evidence_safe(
+                card_ev["text"],
+                artifact_kind="whiteboard_card",
+                artifact_id=card_ev["id"],
+                artifact_path=f"{written or rel}#card-{card_ev['idx'].zfill(2)}",
+                topic=topic,
+                analyst_id=card_ev["analyst_id"],
+                work_date=wd,
+            )
+            await _audit_claims_safe(
+                card_ev["text"],
+                artifact_kind="whiteboard_card",
+                artifact_id=card_ev["id"],
+                artifact_path=f"{written or rel}#card-{card_ev['idx'].zfill(2)}",
+                topic=topic,
+                analyst_id=card_ev["analyst_id"],
+                work_date=wd,
+            )
         log.info("vault export: %s", rel)
     except Exception:
         log.exception("whiteboard export failed for %s", event.ref_id)
@@ -336,18 +442,80 @@ async def _on_analyst_daily(event: bus.Event) -> None:
         analyst = get_analyst(analyst_id)
         who = analyst.name if analyst else analyst_id
         rel = f"Analysts/{_slug(analyst_id)}/{date} 日报.md"
+        quality = p.get("quality") if isinstance(p.get("quality"), dict) else {}
+        warnings = list(quality.get("warnings") or []) if isinstance(quality, dict) else []
+        audit = claim_audit.audit_text(text)
+        callouts = [c for c in (quality_callout(warnings), claim_audit.claim_audit_callout(audit)) if c]
+        body = "\n\n".join([*callouts, text.strip()])
         frontmatter = {
             "type": "analyst-daily", "analyst": analyst_id, "analyst_name": who,
             "task": p.get("task_id"),
             "followup_topics": p.get("whiteboard_topics"), "followup_mails": p.get("mailbox_threads"),
+            "quality_warnings": warnings,
+            **audit.frontmatter(),
         }
-        await get_writer().write_note(
-            rel, frontmatter, text.strip(),
+        written = await get_writer().write_note(
+            rel, frontmatter, body,
             artifact_kind="analyst-daily", artifact_id=f"{analyst_id}:{date}",
+        )
+        await _ingest_evidence_safe(
+            text,
+            artifact_kind="analyst-daily",
+            artifact_id=f"{analyst_id}:{date}",
+            artifact_path=written or rel,
+            topic=who,
+            analyst_id=analyst_id,
+            work_date=date,
+        )
+        await _audit_claims_safe(
+            text,
+            artifact_kind="analyst-daily",
+            artifact_id=f"{analyst_id}:{date}",
+            artifact_path=written or rel,
+            topic=who,
+            analyst_id=analyst_id,
+            work_date=date,
         )
         log.info("vault export: %s", rel)
     except Exception:
         log.exception("analyst daily export failed for %s", event.ref_id)
+
+
+async def _ingest_evidence_safe(text: str, **kwargs: Any) -> None:
+    try:
+        n = await evidence.ingest_text(text, **kwargs)
+        if n:
+            log.info(
+                "evidence ingest: %s links for %s %s",
+                n,
+                kwargs.get("artifact_kind"),
+                kwargs.get("artifact_id"),
+            )
+    except Exception:  # noqa: BLE001 - evidence indexing must not block exports
+        log.exception(
+            "evidence ingest failed for %s %s",
+            kwargs.get("artifact_kind"),
+            kwargs.get("artifact_id"),
+        )
+
+
+async def _audit_claims_safe(text: str, **kwargs: Any) -> None:
+    try:
+        report = await claim_audit.audit_and_store_text(text, **kwargs)
+        if report.total:
+            log.info(
+                "claim audit: %s claims for %s %s (%s)",
+                report.total,
+                kwargs.get("artifact_kind"),
+                kwargs.get("artifact_id"),
+                report.counts(),
+            )
+    except Exception:  # noqa: BLE001 - claim triage must not block exports
+        log.exception(
+            "claim audit failed for %s %s",
+            kwargs.get("artifact_kind"),
+            kwargs.get("artifact_id"),
+        )
 
 
 # ---- wiring ------------------------------------------------------------------

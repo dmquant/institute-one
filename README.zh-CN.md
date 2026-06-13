@@ -1,6 +1,6 @@
 # institute-one · 单机 AI 研究所
 
-**一台机器、一个 Python 进程、一个 SQLite 文件、一个 Obsidian 仓库。** 一支 AI 分析师团队在你自己的电脑上写晨报、上白板辩论、回信箱、跑深度研究——用的是你已经在付费的 agent CLI（Claude Code / Codex / Gemini）。
+**一台机器、一个 Python 进程、一个 SQLite 文件、一个 Obsidian 仓库。** 一支 AI 分析师团队在你自己的电脑上写晨报、上白板辩论、回信箱、跑深度研究——用的是你已经在付费的 agent CLI（Claude Code / Codex / Antigravity）。
 
 [English README →](./README.md)
 
@@ -40,7 +40,7 @@
 │              分析师日报 · 白板 · 信箱 · 深度研究 · 档案(FTS5检索)   │
 │  router/     executor — `tasks` 审计主轴：submit()/spawn()、        │
 │              全局信号量 + 每手互斥锁、重启孤儿回收                  │
-│  hands/      claude · codex · gemini · opencode CLI（子进程，       │
+│  hands/      claude · codex · agy · opencode CLI（子进程，          │
 │              登录 shell 环境捕获）· ollama (HTTP) · 直连 API 兜底 ·  │
 │              每 CLI 限额签名解析 · 持久冷却 · 回退链 · 熔断器        │
 │  vault/      VaultWriter（原子写入、sha256 台账、managed:institute  │
@@ -72,14 +72,24 @@ npm install -g @anthropic-ai/claude-code && claude        # 完成一次登录
 # Codex CLI
 npm install -g @openai/codex && codex                     # 登录
 
-# Gemini CLI
-npm install -g @google/gemini-cli && gemini               # 登录
+# Antigravity CLI
+curl -fsSL https://antigravity.google/cli/install.sh | bash && agy
 
 # 验证非交互调用没问题：
-claude -p "你好" ; codex exec "你好" ; echo "你好" | gemini
+claude -p "你好" ; codex exec "你好" ; agy --print "你好"
 ```
 
 手（hand）从登录 shell 的 PATH 自动探测；任何一只可用 `INSTITUTE_ENABLE_<名字>=false` 关闭。一只 CLI 都没有？内置 `echo` 手保证系统可测试。
+
+未指定 hand 的任务可以走虚拟池：设置 `INSTITUTE_DEFAULT_HAND=pool` 和
+`INSTITUTE_HAND_POOL=claude,agy-opus,agy,codex` 后，系统会在当前可用的 CLI hand 中随机
+挑选；某只 hand 撞到 session/quota limit 后进入 `rate_limits.json` 冷却期，
+冷却期间自动从池里排除。`agy-opus` 是固定使用 `Claude Opus 4.6 (Thinking)` 的
+Antigravity CLI hand。
+
+低成本本地任务单独走 cheap route：设置 `INSTITUTE_CHEAP_HAND=ollama` 与
+`INSTITUTE_CHEAP_MODEL=qwen3.6:35b-a3b`。这个 route 用于 handoff、压缩、格式整理等
+低风险脏活；不要把 `ollama` 放进 `INSTITUTE_HAND_POOL`，除非你希望本地模型参与主判断。
 
 ### 1. 安装与配置
 
@@ -135,25 +145,27 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ./scripts/stop.sh                          # 停止
 tail -f ~/.institute-one/logs/server.log   # 日志
 .venv/bin/python -m pytest tests -q        # 33 个测试，跑在 echo 手上
+.venv/bin/python scripts/export_judgement_bridge.py --date 2026-06-12
 ```
 
 - **暂停一切新开工**：把 `admin_state` 的 `maintenance` 设为 `{"paused": true}` —— 开板/扫队任务跳过，进行中的自然收尾。
-- **额度撞墙**：每 CLI 的限额签名会被识别，冷却写入 `~/.institute-one/rate_limits.json`（从不自动缩短），任务沿 `claude ↔ codex ↔ gemini → *-api` 回退。手动解除：`POST /api/hands/{name}/cooldown/clear`。
-- **一只 CLI 同时只跑一个任务**（每手互斥锁）。并行度来自多只手；分析师日报自动在 claude/codex/gemini 间轮转。
+- **额度撞墙**：每 CLI 的限额签名会被识别，冷却写入 `~/.institute-one/rate_limits.json`（从不自动缩短），任务沿 `claude ↔ codex ↔ agy → *-api` 回退。手动解除：`POST /api/hands/{name}/cooldown/clear`。
+- **一只 CLI 同时只跑一个任务**（每手互斥锁）。并行度来自多只手；分析师日报自动在 claude/agy-opus/agy/codex 间轮转。
 - **备份**：每晚（SGT 03:00–05:00）SQLite 备份到 `~/.institute-one/backups/`；仓库本身就是所有成果的人类可读副本。
 - **仓库安全**：笔记带 `managed: institute` 标记；你手改过的笔记绝不会被覆盖——更新会以 `…（institute update <日期>）.md` 并行副本出现；`POST /api/vault/doctor` 报告漂移。
+- **judgement_engine bridge**：`scripts/export_judgement_bridge.py` 只向 judgement_engine staging 写候选审查队列，不自动晋升 canonical 对象。
 - **重启安全但有代价**：启动时未完成任务标记为「重启孤儿」，各循环从持久行自愈——但仍建议在队列空闲时重启（`GET /api/tasks/queue`）。
 
 ## 路线图——你可以自己「vibe」出来
 
-v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研究所设计的 MVP 切片（约 25%）。其余部分已经全部规划、落地核实，并且**专门写成可由你 + AI 编程 agent 自行实现的形态**：**[`ROADMAP.md`](./ROADMAP.md)** 把每个剩余特性拆成自包含的里程碑——标注它实现提案的哪一节、从哪个前身项目移植、要动哪些文件，关键项还附带可直接粘贴给 Claude Code / Codex / Gemini 的提示词。选一个未勾选项，让 agent 开工，审查 diff，保持 `pytest -q` 全绿，打勾。
+v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研究所设计的 MVP 切片（约 25%）。其余部分已经全部规划、落地核实，并且**专门写成可由你 + AI 编程 agent 自行实现的形态**：**[`ROADMAP.md`](./ROADMAP.md)** 把每个剩余特性拆成自包含的里程碑——标注它实现提案的哪一节、从哪个前身项目移植、要动哪些文件，关键项还附带可直接粘贴给 Claude Code / Codex / Antigravity 的提示词。选一个未勾选项，让 agent 开工，审查 diff，保持 `pytest -q` 全绿，打勾。
 
 ```mermaid
 flowchart LR
     V01["v0.1 ✅<br/>主轴 · 5条循环 · 仓库<br/>SPA · 插件 · MCP"]
     P0["0 🔧 加固<br/>14项已核实修复"]
     P1A["1a 向量检索<br/>sqlite-vec + bge-m3"]
-    P1B["1b 行情数据<br/>FMP/Stooq/新浪"]
+    P1B["1b 行情数据<br/>IBKR K线 + FMP/SEC"]
     P2["2 记忆与质量<br/>分析师记忆 · 手权重"]
     P3["3 事实核查 v2<br/>+ 写作时查证"]
     P4["4 产业链图谱<br/>仓库即图谱"]

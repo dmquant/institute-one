@@ -16,6 +16,8 @@ from typing import Any
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..router.tiering import route_for_tier
+from . import evidence
 from . import sessions
 from .analysts import get_analyst
 from .prompts import (
@@ -173,14 +175,31 @@ async def _drive(run_id: str) -> None:
             if analyst is None:
                 await _finish_run(run_id, "failed", error=f"step {step.get('id')}: no analyst available")
                 return
+            evidence_block = ""
+            topic = str(variables.get("TOPIC") or "").strip()
+            if topic:
+                try:
+                    evidence_block = await evidence.evidence_context(topic, limit=10)
+                except Exception as exc:  # noqa: BLE001 - evidence lookup must not block workflows
+                    log.warning("evidence context unavailable for workflow %s: %s", run_id, exc)
             full_prompt = build_analyst_prompt(
                 analyst, prompt,
-                context_blocks=[previous_steps_block(prior)],
+                context_blocks=[b for b in (evidence_block, previous_steps_block(prior)) if b],
                 output_file=step.get("output_file"),
             )
+            step_tier = step.get("tier")
+            explicit_hand = step.get("hand")
+            explicit_model = step.get("model")
+            cheap_step = str(step_tier or "").strip().lower() in {"cheap", "local", "cheap_local"}
+            route = route_for_tier(
+                settings,
+                step_tier,
+                fallback_hand=explicit_hand or (None if cheap_step else analyst.hand),
+                fallback_model=explicit_model or (None if cheap_step else analyst.model),
+            )
             task = await executor.submit(
-                analyst.hand or settings.default_hand, full_prompt,
-                source=run["source"], model=analyst.model,
+                route.hand, full_prompt,
+                source=run["source"], model=route.model,
                 session_id=session["id"], parent_run_id=run_id, workspace=workspace,
                 timeout_s=step.get("timeout_s") or settings.default_timeout_s,
             )
@@ -195,6 +214,7 @@ async def _drive(run_id: str) -> None:
                 "step_id": step.get("id", f"step-{i + 1}"), "title": title,
                 "task_id": task.id, "status": task.status,
                 "summary": summary, "output_file": output_file,
+                "tier": step.get("tier"), "requested_hand": route.hand,
             })
             prior.append((title, summary))
 

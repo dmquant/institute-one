@@ -10,11 +10,11 @@ Ported from agent-route-node's battle-tested agy_hand. The quirks that matter
   executor's per-hand mutex (suspenders) — the lock also scopes the scratch
   artifact scan to exactly one run.
 - ``--print <prompt>`` is value-taking and must be the LAST flag; everything
-  else goes before it or agy swallows a flag as the prompt.
+    else goes before it or agy swallows a flag as the prompt.
 - Print mode ignores cwd for file ops: pass ``--add-dir <workspace>``.
 - stdin must be /dev/null or agy's startup read blocks forever.
-- No per-call ``--model`` in print mode (unknown flag, non-zero exit) — a
-  requested model is logged, not forwarded.
+- Per-call ``--model`` is supported in current agy releases; it must be placed
+  before ``--print``.
 - Agentic runs write artifacts OUTSIDE the workspace:
   brain/<conversation-id>/*.md (conversation id parsed from --log-file) is
   copied into ``workspace/agy_artifacts/`` with the walkthrough inlined into
@@ -35,7 +35,7 @@ from pathlib import Path
 
 from ..config import Settings
 from . import INLINE_PROMPT_MAX, PROMPT_FILE, finalize_cli_result, snapshot_workspace
-from .base import Hand, HandResult, OnChunk, resolve_cli_path, run_subprocess
+from .base import Hand, HandResult, OnChunk, RateLimitInfo, resolve_cli_path, run_subprocess
 
 log = logging.getLogger("institute.hands.agy")
 
@@ -123,6 +123,7 @@ def capture_artifacts(workspace: Path, conv_id: str | None, started_at: float) -
 class AgyHand(Hand):
     name = "agy"
     hand_type = "cli"
+    default_model_attr: str | None = None
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -143,9 +144,6 @@ class AgyHand(Hand):
         await self._ensure_git(workspace)
         before = snapshot_workspace(workspace)
 
-        if model:
-            log.info("agy ignores per-call model (requested %s); set it in agy's own config", model)
-
         # long prompts go through the workspace file (argv stays short)
         prompt_file: Path | None = None
         if len(prompt) >= INLINE_PROMPT_MAX:
@@ -164,8 +162,13 @@ class AgyHand(Hand):
             "--add-dir", str(workspace),
             "--print-timeout", f"{timeout_s}s",
             "--log-file", str(log_path),
-            "--print", prompt_arg,  # MUST stay last (value-taking flag)
         ]
+        effective_model = model
+        if effective_model is None and self.default_model_attr:
+            effective_model = getattr(self.settings, self.default_model_attr)
+        if effective_model:
+            cmd += ["--model", effective_model]
+        cmd += ["--print", prompt_arg]  # MUST stay last (value-taking flag)
 
         if on_chunk and _AGY_LOCK.locked():
             on_chunk({"type": "status", "text": "agy busy — queued (agy runs serially)"})
@@ -197,6 +200,14 @@ class AgyHand(Hand):
         for rel in captured:
             if rel not in result.artifacts:
                 result.artifacts.append(rel)
+        if code == 0 and not result.output.strip() and not result.artifacts:
+            raw = "agy returned exit code 0 with no stdout, stderr, or artifacts"
+            return HandResult(
+                output=raw,
+                exit_code=1,
+                rate_limit=RateLimitInfo("quota_exhausted", raw=raw),
+                artifacts=[],
+            )
         return result
 
     async def _ensure_git(self, workspace: Path) -> None:
@@ -211,3 +222,10 @@ class AgyHand(Hand):
             await proc.wait()
         except Exception:  # noqa: BLE001 - best effort
             pass
+
+
+class AgyOpusHand(AgyHand):
+    """Antigravity CLI pinned to Claude Opus for the main hand pool."""
+
+    name = "agy-opus"
+    default_model_attr = "agy_opus_model"

@@ -1,7 +1,7 @@
 """The Hand abstraction.
 
 A hand is anything that takes a prompt and returns output: a CLI agent run as a
-subprocess inside a workspace directory (claude/codex/gemini/opencode), a local
+subprocess inside a workspace directory (claude/codex/agy/opencode), a local
 HTTP service (ollama), or a direct provider API (anthropic/openai/google).
 
 Design notes carried over from the previous system:
@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -87,13 +88,18 @@ class EchoHand(Hand):
 
     async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None) -> HandResult:
         artifacts: list[str] = []
+        targets: list[str] = []
         for line in prompt.splitlines():
             if line.startswith("WRITE_FILE: "):
-                fname = line.split("WRITE_FILE: ", 1)[1].strip()
-                target = workspace / fname
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(prompt, encoding="utf-8")
-                artifacts.append(fname)
+                targets.append(line.split("WRITE_FILE: ", 1)[1].strip())
+        targets.extend(re.findall(r"DONE:\s*([^\s]+\.md)", prompt))
+        for fname in targets:
+            if not fname or fname in artifacts:
+                continue
+            target = workspace / fname
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(prompt, encoding="utf-8")
+            artifacts.append(fname)
         out = f"[echo] {prompt[:4000]}"
         if on_chunk:
             on_chunk({"type": "stdout", "text": out})

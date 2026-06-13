@@ -22,7 +22,9 @@ from ..config import get_settings
 from ..hands.registry import get_registry
 from ..router import executor
 from .analysts import Analyst, get_analyst, roster
+from . import daily_memory
 from .prompts import build_analyst_prompt, work_date
+from .quality import check_expected_markdown, evidence_warnings
 from .research import parse_followups
 
 log = logging.getLogger("institute.analyst_daily")
@@ -31,7 +33,8 @@ SOURCE = "analyst-daily"
 SKIP_CATEGORIES = {"ops"}          # editors compile; they don't file field reports
 MAX_TOPICS_PER_DAILY = 2
 MAX_MAILS_PER_DAILY = 1
-ROTATION_HANDS = ("claude", "codex", "gemini")
+ROTATION_HANDS = ("claude", "codex", "agy")
+MAX_ATTEMPTS_PER_DAILY = 4
 
 _background: set[asyncio.Task] = set()
 
@@ -87,8 +90,21 @@ def _catalog_excluding(analyst_id: str) -> str:
 def _daily_task(analyst: Analyst, filename: str) -> str:
     return (
         f"撰写你今天的《观察日报》。围绕你的覆盖领域（{analyst.focus}），"
-        "写 3–5 条今天最重要的观察或变化。每一条包含：事实（必须给出来源链接或出处）、"
-        "你的判断（明确标注为观点）、对市场或具体标的的影响。文末加一节「明日关注」（1–3 条）。\n\n"
+        "写 3–5 条今天最重要的新增观察或变化。novelty gate 规则："
+        "同一主题如果相对近期记忆没有新增事实、新数据、新政策动作、新价格/量能反应、"
+        "新来源或明确概率变化，就不要放在主观察里，降级到「持续监控（无新增）」。\n\n"
+        "固定结构：\n"
+        "## 今日新增观察\n"
+        "每条主观察用三级标题，且必须包含这些字段：\n"
+        "new_delta: 相对近期记忆具体新增了什么\n"
+        "status: main\n"
+        "事实: 必须给出来源链接或出处，并写明发布时间或数据时间点\n"
+        "判断: 明确标注为观点\n"
+        "影响: 对市场或具体标的的影响\n\n"
+        "## 持续监控（无新增）\n"
+        "只放同题延续但今天没有足够新增事实的主题；每条写 `status: monitor`，"
+        "并说明为什么只是 standing monitor。它们不计入 3–5 条主观察。\n\n"
+        "文末加一节「明日关注」（1–3 条）。\n\n"
         "然后提出后续跟进（这是日报的固定动作）：\n"
         f"1. 【白板议题】0–{MAX_TOPICS_PER_DAILY} 个值得多位分析师协作辩论的开放性问题（只提真正有分歧或跨领域的问题，没有就留空）。\n"
         f"2. 【信箱追问】0–{MAX_MAILS_PER_DAILY} 个需要某位**其他**分析师单独回答的追问（不要写给自己）。分析师从名册选择（用 id）：\n"
@@ -109,6 +125,26 @@ def _pick_hand(analyst: Analyst, index: int) -> str:
     if available:
         return available[index % len(available)]
     return get_settings().default_hand
+
+
+def _candidate_hands(first: str) -> list[str]:
+    """Available hands to try for a business-level retry."""
+    from ..hands.registry import DEFAULT_FALLBACK_CHAINS
+
+    registry = get_registry()
+    ordered: list[str] = []
+    for name in [first, *DEFAULT_FALLBACK_CHAINS.get(first, []), get_settings().default_hand]:
+        if name and name not in ordered:
+            ordered.append(name)
+    available = [name for name in ordered if registry.is_available(name)]
+    return available or [first]
+
+
+async def _mark_task_invalid(task_id: str, error: str) -> None:
+    await db.execute(
+        "UPDATE tasks SET status='failed', error=?, finished_at=? WHERE id=? AND status='completed'",
+        (error[:1000], bus.now_iso(), task_id),
+    )
 
 
 # ---- follow-up application ---------------------------------------------------
@@ -162,20 +198,65 @@ async def run_one(analyst_id: str, *, force: bool = False, rotation_index: int =
     session = await _today_session()
     ws = Path(session["workspace_dir"])
     filename = f"{analyst.id}.md"
-    prompt = build_analyst_prompt(analyst, _daily_task(analyst, filename), output_file=filename)
-
-    task = await executor.submit(
-        _pick_hand(analyst, rotation_index), prompt,
-        source=SOURCE, model=analyst.model, session_id=session["id"], workspace=ws,
+    recent_context = await daily_memory.render_recent_context(analyst.id)
+    prompt = build_analyst_prompt(
+        analyst,
+        _daily_task(analyst, filename),
+        context_blocks=[recent_context] if recent_context else None,
+        output_file=filename,
     )
 
-    if task.status != "completed":
+    first_hand = _pick_hand(analyst, rotation_index)
+    attempts: list[dict[str, Any]] = []
+    task = None
+    quality = None
+    for hand_name in _candidate_hands(first_hand)[:MAX_ATTEMPTS_PER_DAILY]:
+        task = await executor.submit(
+            hand_name, prompt,
+            source=SOURCE, model=analyst.model, session_id=session["id"], workspace=ws,
+        )
+        attempt = {"task_id": task.id, "requested_hand": hand_name, "hand": task.hand, "status": task.status}
+        attempts.append(attempt)
+
+        if task.status != "completed":
+            continue
+
+        quality = check_expected_markdown(ws / filename)
+        if quality.ok:
+            break
+        err = "; ".join(quality.errors)
+        await _mark_task_invalid(task.id, err)
+        attempt["status"] = "failed"
+        attempt["error"] = err
+        await bus.emit("analyst_daily.invalid_output", "analyst", analyst_id, {
+            "date": work_date(), "session_id": session["id"], "task_id": task.id,
+            "file": filename, "errors": quality.errors,
+        })
+
+    if task is None or task.status != "completed" or quality is None or not quality.ok:
         await _mark(analyst_id, "failed")
         await bus.emit("analyst_daily.failed", "analyst", analyst_id, {
-            "date": work_date(), "session_id": session["id"], "task_id": task.id,
-            "status": task.status, "error": task.error,
+            "date": work_date(), "session_id": session["id"], "task_id": task.id if task else None,
+            "status": task.status if task else "failed", "error": task.error if task else "no task",
+            "attempts": attempts,
         })
-        return {"analyst_id": analyst_id, "status": task.status, "task_id": task.id}
+        return {
+            "analyst_id": analyst_id,
+            "status": task.status if task else "failed",
+            "task_id": task.id if task else None,
+            "attempts": attempts,
+        }
+
+    text = (ws / filename).read_text(encoding="utf-8", errors="replace")
+    quality.warnings.extend(evidence_warnings(text, require_followups=True))
+    observations = daily_memory.extract_observations(text)
+    quality.warnings.extend(daily_memory.novelty_warnings(text, observations))
+    quality.warnings.extend(await daily_memory.cheap_novelty_audit(
+        analyst, text, recent_context, workspace=ws,
+    ))
+    observations = await daily_memory.store_daily_observations(
+        analyst.id, work_date(), text, source_task_id=task.id,
+    )
 
     n_topics, n_mails = 0, 0
     try:
@@ -187,11 +268,23 @@ async def run_one(analyst_id: str, *, force: bool = False, rotation_index: int =
     await bus.emit("analyst_daily.completed", "analyst", analyst_id, {
         "date": work_date(), "session_id": session["id"], "task_id": task.id,
         "file": filename, "whiteboard_topics": n_topics, "mailbox_threads": n_mails,
+        "attempts": attempts, "quality": quality.to_payload(),
+        "observations": {
+            "total": len(observations),
+            "main": sum(1 for o in observations if o.status == "main"),
+            "monitor": sum(1 for o in observations if o.status in {"monitor", "repeat"}),
+        },
     })
     log.info("analyst daily done: %s (+%d topics, +%d mails)", analyst_id, n_topics, n_mails)
     return {
         "analyst_id": analyst_id, "status": "completed", "task_id": task.id,
         "whiteboard_topics": n_topics, "mailbox_threads": n_mails,
+        "attempts": attempts, "quality": quality.to_payload(),
+        "observations": {
+            "total": len(observations),
+            "main": sum(1 for o in observations if o.status == "main"),
+            "monitor": sum(1 for o in observations if o.status in {"monitor", "repeat"}),
+        },
     }
 
 
