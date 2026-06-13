@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Stop the institute-one server: pidfile first, pkill fallback.
-PIDFILE="$HOME/.institute-one/server.pid"
+cd "$(dirname "$0")/.."
+
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+HOME_DIR="${INSTITUTE_HOME:-$HOME/.institute-one}"
+PIDFILE="$HOME_DIR/server.pid"
 
 if [ -f "$PIDFILE" ]; then
   PID="$(cat "$PIDFILE")"

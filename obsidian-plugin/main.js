@@ -57,6 +57,22 @@ function withTimeout(p, ms, what) {
     );
   });
 }
+function assertLoopbackUrl(raw) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`\u540E\u7AEF\u5730\u5740\u4E0D\u662F\u6709\u6548 URL\uFF1A${raw}`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`\u540E\u7AEF\u5730\u5740\u534F\u8BAE\u4E0D\u5141\u8BB8\uFF1A${parsed.protocol}`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  const loopback = host === "localhost" || host === "::1" || host.startsWith("127.");
+  if (!loopback) {
+    throw new Error(`\u4E3A\u907F\u514D\u6CC4\u9732 vault \u5185\u5BB9\uFF0CInstitute \u63D2\u4EF6\u53EA\u5141\u8BB8\u8FDE\u63A5\u672C\u673A\u56DE\u73AF\u5730\u5740\uFF1A${parsed.hostname}`);
+  }
+}
 function exportSlug(text, maxLen = 80) {
   let s = String(text ?? "").trim().replace(/[\\/:*?"<>|#^[\]\u0000-\u001f]+/g, "-");
   s = s.replace(/\s+/g, " ");
@@ -133,7 +149,9 @@ var InstituteApi = class {
     this.getBaseUrl = getBaseUrl;
   }
   baseUrl() {
-    return this.getBaseUrl().replace(/\/+$/, "");
+    const url = this.getBaseUrl().replace(/\/+$/, "");
+    assertLoopbackUrl(url);
+    return url;
   }
   /** JSON request with a hard timeout (default 10s). Never uses fetch. */
   async request(path, opts = {}) {
@@ -927,7 +945,7 @@ var VaultDoctorModal = class extends import_obsidian3.Modal {
 
 // src/main.ts
 var DEFAULT_SETTINGS = {
-  baseUrl: "http://127.0.0.1:8100",
+  baseUrl: "http://127.0.0.1:8110",
   vaultSubfolder: "Institute",
   defaultAnalyst: "",
   insertStyle: "callout",

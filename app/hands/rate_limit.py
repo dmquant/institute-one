@@ -67,7 +67,11 @@ def _detect_claude(text: str) -> RateLimitInfo | None:
         return RateLimitInfo("quota_exhausted", retry_after_s=retry, raw=_raw_line(text, m.start()))
 
     lowered = text.lower()
-    for needle, reason in (("usage limit reached", "quota_exhausted"), ("rate_limit_error", "rate_limit")):
+    for needle, reason in (
+        ("usage limit reached", "quota_exhausted"),
+        ("session limit", "quota_exhausted"),
+        ("rate_limit_error", "rate_limit"),
+    ):
         idx = lowered.find(needle)
         if idx >= 0:
             return RateLimitInfo(reason, raw=_raw_line(text, idx))
@@ -104,10 +108,18 @@ def _detect_codex(text: str) -> RateLimitInfo | None:
         return RateLimitInfo("rate_limit", retry_after_s=max(1, int(m.group(1))), raw=_raw_line(tail, m.start()))
 
     lowered = tail.lower()
-    for needle in ("rate_limit_exceeded", "too many requests"):
+    for needle, reason in (
+        ("rate_limit_exceeded", "rate_limit"),
+        ("too many requests", "rate_limit"),
+        ("session limit", "quota_exhausted"),
+        ("usage limit", "quota_exhausted"),
+        ("quota exhausted", "quota_exhausted"),
+        ("quota_exhausted", "quota_exhausted"),
+        ("insufficient_quota", "quota_exhausted"),
+    ):
         idx = lowered.find(needle)
         if idx >= 0:
-            return RateLimitInfo("rate_limit", raw=_raw_line(tail, idx))
+            return RateLimitInfo(reason, raw=_raw_line(tail, idx))
     return None
 
 
@@ -140,6 +152,30 @@ def _detect_gemini(text: str) -> RateLimitInfo | None:
     return None
 
 
+# ---- antigravity -----------------------------------------------------------
+
+def _detect_agy(text: str) -> RateLimitInfo | None:
+    info = _detect_gemini(text)
+    if info is not None:
+        return info
+
+    lowered = text.lower()
+    for needle, reason in (
+        ("session limit", "quota_exhausted"),
+        ("usage limit", "quota_exhausted"),
+        ("plan usage limit", "quota_exhausted"),
+        ("daily limit", "quota_exhausted"),
+        ("quota exhausted", "quota_exhausted"),
+        ("quota_exhausted", "quota_exhausted"),
+        ("rate limit", "rate_limit"),
+        ("too many requests", "rate_limit"),
+    ):
+        idx = lowered.find(needle)
+        if idx >= 0:
+            return RateLimitInfo(reason, raw=_raw_line(text, idx))
+    return None
+
+
 # ---- opencode (wraps the other providers) ----------------------------------
 
 def _detect_opencode(text: str) -> RateLimitInfo | None:
@@ -165,7 +201,8 @@ _DETECTORS = {
     "claude": _detect_claude,
     "codex": _detect_codex,
     "gemini": _detect_gemini,
-    "agy": _detect_gemini,  # agy is gemini-powered: same quota signatures
+    "agy": _detect_agy,
+    "agy-opus": _detect_agy,
     "opencode": _detect_opencode,
     "claude-api": _detect_api,
     "openai-api": _detect_api,

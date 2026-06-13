@@ -1,4 +1,4 @@
-"""Ollama hand: local HTTP generation via /api/generate (non-streaming)."""
+"""Ollama hand: local HTTP chat generation (non-streaming)."""
 from __future__ import annotations
 
 import logging
@@ -37,12 +37,15 @@ class OllamaHand(Hand):
     ) -> HandResult:
         body = {
             "model": model or self.settings.ollama_model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            # Qwen3.6 can return an empty visible response unless native chat
+            # thinking is explicitly disabled. Older Ollama models ignore this.
+            "think": False,
         }
         try:
             async with httpx.AsyncClient(timeout=timeout_s) as client:
-                resp = await client.post(f"{self._base_url}/api/generate", json=body)
+                resp = await client.post(f"{self._base_url}/api/chat", json=body)
         except httpx.HTTPError as exc:
             return HandResult(output=f"ollama request failed: {exc}", exit_code=1)
 
@@ -51,7 +54,7 @@ class OllamaHand(Hand):
                 output=f"ollama HTTP {resp.status_code}: {resp.text[:4000]}", exit_code=1
             )
         try:
-            text = resp.json().get("response", "")
+            text = resp.json().get("message", {}).get("content", "")
         except ValueError:
             return HandResult(output=f"ollama returned non-JSON: {resp.text[:4000]}", exit_code=1)
 

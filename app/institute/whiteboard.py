@@ -21,7 +21,11 @@ from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..hands.base import RateLimitInfo
+from ..hands.registry import get_registry
 from ..router import executor
+from ..router.tiering import route_for_tier
+from . import evidence
 from .analysts import get_analyst, roster
 from .prompts import (
     build_analyst_prompt,
@@ -36,6 +40,15 @@ log = logging.getLogger("institute.whiteboard")
 MAX_ACTIVE_BOARDS = 2
 DEFAULT_MAX_CARDS = 5
 HANDOFF_TIMEOUT_S = 300
+INVALID_OUTPUT_COOLDOWN_S = 5 * 3600
+INVALID_OUTPUT_COOLDOWN_HANDS = {"agy", "agy-opus"}
+STOP_CONDITIONS_HEADING = "## 停止条件"
+EVIDENCE_MONITOR_HEADING = "## 需监控的新证据清单"
+CONVERGENCE_PROTOCOL = f"""\
+【白板收束协议】白板不是无限延伸的推理链。最终必须把讨论收束成：
+1. {STOP_CONDITIONS_HEADING}：说明在当前公开信息下，哪些问题已经只能停在概率判断/情景分布，继续推理不会增加信息量；列出会改变判断的触发条件。
+2. {EVIDENCE_MONITOR_HEADING}：列出后续需要监控的新事实、新数据、新公告、新价格/财报/产业证据；每项写明它会验证或推翻哪一个关键判断。\
+"""
 
 # Cards being driven by THIS process. A 'running' card not in here was orphaned
 # by a restart (executor.recover_orphans already failed its task).
@@ -257,9 +270,18 @@ async def _run_card(board: dict[str, Any], card: dict[str, Any]) -> None:
             pa = get_analyst(p["analyst_id"])
             pairs.append((f"card {p['idx']} · {pa.name if pa else p['analyst_id']}", p["summary"] or ""))
         context = previous_steps_block(pairs)
+        try:
+            evidence_block = await evidence.evidence_context(
+                f"{board['topic']} {board['question'] or ''}",
+                limit=8,
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence lookup must not block cards
+            log.warning("evidence context unavailable for board %s: %s", board_id, exc)
+            evidence_block = ""
 
         output_file = f"card-{idx:02d}-{analyst.id}.md"
         question = card["question"] or board["question"] or board["topic"]
+        final_card = idx >= int(board["max_cards"])
         task_text = (
             "白板协作任务（多位分析师接力研讨）。\n"
             f"主题：{board['topic']}\n"
@@ -268,9 +290,16 @@ async def _run_card(board: dict[str, Any], card: dict[str, Any]) -> None:
             "协作要求：先明确表态你同意或反驳前面哪位同事的哪一个观点（你是第一张卡片则直接给出开局判断），"
             "再展开你自己的分析，最后以「## 核心结论」收尾。"
         )
+        if final_card:
+            task_text += (
+                "\n\n你是本白板的最后一张卡片。除「## 核心结论」外，必须在文末额外写出：\n"
+                f"{STOP_CONDITIONS_HEADING}\n"
+                f"{EVIDENCE_MONITOR_HEADING}\n\n"
+                f"{CONVERGENCE_PROTOCOL}"
+            )
         prompt = build_analyst_prompt(
             analyst, task_text,
-            context_blocks=[context] if context else None,
+            context_blocks=[b for b in (evidence_block, context) if b],
             output_file=output_file,
         )
         task = await executor.submit(
@@ -280,24 +309,52 @@ async def _run_card(board: dict[str, Any], card: dict[str, Any]) -> None:
         )
 
         if task.status == "completed":
-            content = task.output
+            content = ""
+            error = ""
+            out_path = ws / output_file
             try:
-                out_path = ws / output_file
-                if out_path.exists():
+                if not out_path.is_file() or out_path.stat().st_size <= 0:
+                    error = f"missing or empty expected output file: {output_file}"
+                else:
                     content = out_path.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001
-                log.warning("could not read %s; using task output", output_file)
-            summary = extract_summary(content or "")
-            n = await db.execute(
-                "UPDATE whiteboard_cards SET status='completed', summary=?, output_file=?, task_id=?, finished_at=? "
-                "WHERE id=? AND status='running'",
-                (summary, output_file, task.id, bus.now_iso(), card_id),
-            )
-            if n:
-                await bus.emit(
-                    "whiteboard.card_completed", "card", card_id,
-                    {"board_id": board_id, "idx": idx, "analyst_id": analyst.id},
+            except Exception as exc:  # noqa: BLE001
+                error = f"could not read expected output file {output_file}: {exc}"
+
+            summary = extract_summary(content or "") if not error else ""
+            if not summary.strip():
+                error = error or f"empty summary from expected output file: {output_file}"
+
+            if error:
+                _cooldown_invalid_output_hand(task.hand, error)
+                await db.execute(
+                    "UPDATE tasks SET status='failed', error=?, finished_at=? "
+                    "WHERE id=? AND status='completed'",
+                    (error[:1000], bus.now_iso(), task.id),
                 )
+                n = await db.execute(
+                    "UPDATE whiteboard_cards SET status='failed', task_id=?, finished_at=? "
+                    "WHERE id=? AND status='running'",
+                    (task.id, bus.now_iso(), card_id),
+                )
+                if n:
+                    await bus.emit(
+                        "whiteboard.card_invalid_output", "card", card_id,
+                        {
+                            "board_id": board_id, "idx": idx, "analyst_id": analyst.id,
+                            "task_id": task.id, "error": error,
+                        },
+                    )
+            else:
+                n = await db.execute(
+                    "UPDATE whiteboard_cards SET status='completed', summary=?, output_file=?, task_id=?, finished_at=? "
+                    "WHERE id=? AND status='running'",
+                    (summary, output_file, task.id, bus.now_iso(), card_id),
+                )
+                if n:
+                    await bus.emit(
+                        "whiteboard.card_completed", "card", card_id,
+                        {"board_id": board_id, "idx": idx, "analyst_id": analyst.id},
+                    )
         else:
             # a failed card still counts toward max_cards; the board continues
             await db.execute(
@@ -321,6 +378,24 @@ async def _run_card(board: dict[str, Any], card: dict[str, Any]) -> None:
             log.exception("could not mark card %s failed", card_id)
     finally:
         _active_cards.discard(card_id)
+
+
+def _cooldown_invalid_output_hand(hand_name: str | None, error: str) -> None:
+    if hand_name not in INVALID_OUTPUT_COOLDOWN_HANDS:
+        return
+    try:
+        registry = get_registry()
+        registry.mark_rate_limited(
+            hand_name,
+            RateLimitInfo(
+                "invalid_output",
+                retry_after_s=INVALID_OUTPUT_COOLDOWN_S,
+                raw=error[:1000],
+            ),
+        )
+        registry.record_result(hand_name, ok=False, rate_limited=True)
+    except Exception:  # noqa: BLE001 - output validation must not crash the board
+        log.warning("could not cooldown hand %s after invalid whiteboard output", hand_name, exc_info=True)
 
 
 # ---- handoff (constrained pick) -------------------------------------------
@@ -385,9 +460,11 @@ async def _handoff(board: dict[str, Any]) -> None:
 
     stop = False
     try:
+        route = route_for_tier(settings, "cheap")
         task = await executor.submit(
-            settings.default_hand, prompt,
-            source="whiteboard", session_id=board["session_id"], timeout_s=HANDOFF_TIMEOUT_S,
+            route.hand, prompt,
+            source="whiteboard-handoff", model=route.model,
+            session_id=board["session_id"], timeout_s=HANDOFF_TIMEOUT_S,
         )
         if task.status != "completed":
             raise ValueError(f"handoff task {task.id} ended {task.status}")
@@ -404,6 +481,10 @@ async def _handoff(board: dict[str, Any]) -> None:
 
     if stop:
         log.info("board %s: handoff says stop after %d cards", board["id"], len(cards))
+        await db.execute(
+            "UPDATE whiteboard_boards SET max_cards=?, updated_at=? WHERE id=? AND status='active'",
+            (len(cards), bus.now_iso(), board["id"]),
+        )
         return
 
     exists = await db.query_one(
@@ -424,15 +505,22 @@ async def _handoff(board: dict[str, Any]) -> None:
 # ---- finalize --------------------------------------------------------------
 
 async def _finalize(board: dict[str, Any]) -> None:
+    cards = await db.query(
+        "SELECT * FROM whiteboard_cards WHERE board_id = ? ORDER BY idx", (board["id"],)
+    )
+    if _has_unfinished_cards(cards):
+        log.info("board %s not finalized: pending/running cards remain", board["id"])
+        return
+    if _needs_more_cards(board, cards):
+        log.info("board %s not finalized: only %d/%d cards exist", board["id"], len(cards), board["max_cards"])
+        return
+
     claimed = await db.execute(
         "UPDATE whiteboard_boards SET status='completed', updated_at=? WHERE id=? AND status='active'",
         (bus.now_iso(), board["id"]),
     )
     if not claimed:
         return
-    cards = await db.query(
-        "SELECT * FROM whiteboard_cards WHERE board_id = ? ORDER BY idx", (board["id"],)
-    )
     try:
         ws = await _board_workspace(board)
         lines = [
@@ -451,6 +539,7 @@ async def _finalize(board: dict[str, Any]) -> None:
             summary = (c["summary"] or "").replace("\n", " ").replace("|", "\\|")[:200]
             file_ref = f" → [{c['output_file']}]({c['output_file']})" if c["output_file"] else ""
             lines.append(f"| {c['idx']} | {name} | {c['status']} | {summary}{file_ref} |")
+        lines.extend(["", _closure_block(board, cards, ws)])
         (ws / "_board.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception:  # noqa: BLE001
         log.exception("could not write _board.md for board %s", board["id"])
@@ -467,6 +556,91 @@ async def _finalize(board: dict[str, Any]) -> None:
         {"topic": board["topic"], "session_id": board["session_id"], "cards": len(cards)},
     )
     log.info("board %s completed with %d cards", board["id"], len(cards))
+
+
+def _has_unfinished_cards(cards: list[dict[str, Any]]) -> bool:
+    return any(c["status"] in ("pending", "running") for c in cards)
+
+
+def _needs_more_cards(board: dict[str, Any], cards: list[dict[str, Any]]) -> bool:
+    if not cards:
+        return True
+    return max(c["idx"] for c in cards) < int(board["max_cards"])
+
+
+def closure_block_from_texts(
+    topic: str,
+    question: str,
+    card_texts: list[str],
+    *,
+    card_count: int,
+) -> str:
+    """Return the mandatory whiteboard convergence protocol.
+
+    Prefer analyst-written final sections. If the model omitted them, produce a
+    conservative fallback that states the stop reason without inventing facts.
+    """
+    extracted = _extract_closure_sections(card_texts)
+    if extracted:
+        return extracted
+    q = question or "原始问题未单独填写，围绕主题收束"
+    return (
+        f"{STOP_CONDITIONS_HEADING}\n"
+        f"- 当前白板已完成 {card_count} 张卡片；在没有新增事实、数据或一手证据前，继续让模型互相推理只会重复既有假设。\n"
+        f"- 本轮停止在主题「{topic}」与问题「{q}」的情景判断层面；后续应等待能改变关键变量的新证据，再重启白板。\n"
+        "- 如果新证据只是在重复已讨论观点，不构成重启条件；只有改变事实基座、概率权重或可执行结论的证据才触发重启。\n"
+        "\n"
+        f"{EVIDENCE_MONITOR_HEADING}\n"
+        "- 官方公告、监管文件、财报/经营数据、价格与成交数据：用于确认基本事实和估值输入是否变化。\n"
+        "- 产业链订单、产能、招标、招聘、专利、客户/供应商披露：用于验证需求、供给和技术路径是否出现边际变化。\n"
+        "- 可信反证：任何直接削弱本轮核心假设的数据、事件或一手材料，都应优先进入下一轮白板，而不是继续扩写旧逻辑。\n"
+        "- 监控项需在下一轮研究中绑定来源和时间戳；没有可追溯来源的传闻只能作为线索。"
+    )
+
+
+def _closure_block(board: dict[str, Any], cards: list[dict[str, Any]], ws: Path) -> str:
+    texts: list[str] = []
+    for card in cards:
+        output_file = card.get("output_file")
+        text = ""
+        if output_file:
+            try:
+                path = ws / str(output_file)
+                if path.is_file():
+                    text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                log.warning("could not read %s for closure extraction", output_file)
+        texts.append(text or str(card.get("summary") or ""))
+    return closure_block_from_texts(
+        str(board.get("topic") or ""),
+        str(board.get("question") or ""),
+        texts,
+        card_count=len(cards),
+    )
+
+
+def _extract_closure_sections(texts: list[str]) -> str:
+    for text in reversed(texts):
+        if not text:
+            continue
+        stop = _extract_section(text, STOP_CONDITIONS_HEADING)
+        monitor = _extract_section(text, EVIDENCE_MONITOR_HEADING)
+        if stop and monitor:
+            return f"{STOP_CONDITIONS_HEADING}\n{stop}\n\n{EVIDENCE_MONITOR_HEADING}\n{monitor}"
+    return ""
+
+
+def _extract_section(text: str, heading: str) -> str:
+    start = text.find(heading)
+    if start == -1:
+        return ""
+    seg = text[start + len(heading):].strip()
+    for marker in ("\n## ", "\n# "):
+        hit = seg.find(marker)
+        if hit != -1:
+            seg = seg[:hit].strip()
+            break
+    return seg
 
 
 # ---- queries ---------------------------------------------------------------

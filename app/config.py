@@ -26,17 +26,26 @@ class Settings(BaseSettings):
     # Obsidian vault export. None disables the vault layer entirely.
     # Point at the *subtree the institute owns*, e.g. ~/Obsidian/Main/Institute
     vault_dir: Path | None = None
+    # Candidate-only bridge output. Set this to a judgement_engine staging path
+    # if you use that optional integration; it never writes canonical objects.
+    judgement_bridge_dir: Path | None = None
 
     # Execution
     max_concurrent: int = 3
     default_hand: str = "claude"
+    # Virtual router hand. When default_hand=pool, unspecified tasks are
+    # randomly assigned among currently available hands in this comma list.
+    hand_pool: str = "claude,agy,codex"
+    # Cheap/local work is routed here explicitly by task-tier logic. Keep this
+    # separate from hand_pool so local models do not take analyst judgment tasks.
+    cheap_hand: str = "ollama"
+    cheap_model: str | None = None
     default_timeout_s: int = 1800
     output_cap_bytes: int = 200_000  # tasks.output column cap
 
     # Hand enable flags (CLI hands are additionally gated on the binary existing)
     enable_claude: bool = True
     enable_codex: bool = True
-    enable_gemini: bool = True
     enable_agy: bool = True       # Google Antigravity CLI (gemini successor)
     enable_opencode: bool = True
     enable_ollama: bool = False
@@ -45,8 +54,8 @@ class Settings(BaseSettings):
     # Per-hand default models (None -> the CLI's own default)
     claude_model: str | None = None
     codex_model: str | None = None
-    gemini_model: str | None = None
     opencode_model: str | None = None
+    agy_opus_model: str = "Claude Opus 4.6 (Thinking)"
     ollama_model: str = "llama3.2"
     ollama_host: str = "http://localhost:11434"
 
@@ -57,6 +66,20 @@ class Settings(BaseSettings):
     anthropic_api_model: str = "claude-sonnet-4-6"
     openai_api_model: str = "gpt-5.2"
     google_api_model: str = "gemini-2.5-pro"
+
+    # Market/financial data. FMP is optional; SEC EDGAR is free but requires a User-Agent.
+    # Prices deliberately avoid paid per-request snapshots; IBKR uses recent historical bars.
+    price_provider: str = "none"  # none | ibkr
+    ibkr_host: str = "127.0.0.1"
+    ibkr_port: int = 4001
+    ibkr_client_id: int = 61
+    ibkr_connect_timeout_s: float = 8.0
+    ibkr_history_duration: str = "10 D"
+    ibkr_history_bar_size: str = "1 day"
+    ibkr_history_what_to_show: str = "TRADES"
+    ibkr_history_use_rth: bool = True
+    fmp_api_key: str | None = None
+    sec_user_agent: str = "institute-one/0.1 local-research contact@example.com"
 
     # Scheduler (cron-ish times, SGT). Set to "" to disable a job.
     briefing_time: str = "08:30"        # 晨会简报

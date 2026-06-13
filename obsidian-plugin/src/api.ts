@@ -173,6 +173,26 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 	});
 }
 
+function assertLoopbackUrl(raw: string): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error(`后端地址不是有效 URL：${raw}`);
+	}
+	if (!["http:", "https:"].includes(parsed.protocol)) {
+		throw new Error(`后端地址协议不允许：${parsed.protocol}`);
+	}
+	const host = parsed.hostname.toLowerCase();
+	const loopback =
+		host === "localhost" ||
+		host === "::1" ||
+		host.startsWith("127.");
+	if (!loopback) {
+		throw new Error(`为避免泄露 vault 内容，Institute 插件只允许连接本机回环地址：${parsed.hostname}`);
+	}
+}
+
 /**
  * Mirrors the backend exporter slug (app/vault/exporter.py:_slug):
  * keep CJK, replace path-hostile chars with "-", collapse whitespace,
@@ -275,7 +295,9 @@ export class InstituteApi {
 	constructor(private getBaseUrl: () => string) {}
 
 	baseUrl(): string {
-		return this.getBaseUrl().replace(/\/+$/, "");
+		const url = this.getBaseUrl().replace(/\/+$/, "");
+		assertLoopbackUrl(url);
+		return url;
 	}
 
 	/** JSON request with a hard timeout (default 10s). Never uses fetch. */

@@ -41,7 +41,7 @@ The recursion: **dailies and research emit follow-ups → topics open boards, qu
 │               archive (FTS5 search)                                    │
 │  router/      executor — the `tasks` audit spine: submit()/spawn(),    │
 │               global semaphore + per-hand mutex, orphan recovery       │
-│  hands/       claude · codex · gemini · opencode CLIs (subprocess,     │
+│  hands/       claude · codex · agy · opencode CLIs (subprocess,        │
 │               login-shell env capture) · ollama (HTTP) · direct-API    │
 │               fallbacks · per-CLI rate-limit parsers · persistent      │
 │               cooldowns · fallback chains · circuit breaker            │
@@ -75,11 +75,11 @@ npm install -g @anthropic-ai/claude-code && claude        # complete login once
 # Codex CLI
 npm install -g @openai/codex && codex                     # login
 
-# Gemini CLI
-npm install -g @google/gemini-cli && gemini               # login
+# Antigravity CLI
+curl -fsSL https://antigravity.google/cli/install.sh | bash && agy
 
 # verify each works non-interactively:
-claude -p "say hi" ; codex exec "say hi" ; echo "say hi" | gemini
+claude -p "say hi" ; codex exec "say hi" ; agy --print "say hi"
 ```
 
 Hands are auto-detected from your login-shell PATH; each can be disabled with `INSTITUTE_ENABLE_<NAME>=false`. No CLI at all? The built-in `echo` hand keeps the system testable.
@@ -138,25 +138,29 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
 .venv/bin/python -m pytest tests -q        # 33 tests, run on the echo hand
+.venv/bin/python scripts/export_judgement_bridge.py --date 2026-06-12
 ```
 
 - **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.
-- **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), tasks fall back along `claude ↔ codex ↔ gemini → *-api`. Clear manually: `POST /api/hands/{name}/cooldown/clear`.
-- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically.
+- **Default hand pool**: set `INSTITUTE_DEFAULT_HAND=pool` and `INSTITUTE_HAND_POOL=claude,agy-opus,agy,codex` to randomly spread unspecified tasks across the currently available CLI hands. `agy-opus` is Antigravity CLI pinned to `Claude Opus 4.6 (Thinking)`.
+- **Cheap/local route**: set `INSTITUTE_CHEAP_HAND=ollama` and `INSTITUTE_CHEAP_MODEL=qwen3.6:35b-a3b` for low-risk chores such as routing, compression, and formatting. Keep `ollama` out of `INSTITUTE_HAND_POOL` unless you want local models to write analyst judgments.
+- **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), cooled-down hands are excluded from `pool`, and named tasks fall back along `claude ↔ codex ↔ agy → *-api`. Clear manually: `POST /api/hands/{name}/cooldown/clear`.
+- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; `pool` and analyst dailies spread work across claude/agy-opus/agy/codex automatically.
 - **Backups**: nightly SQLite backup to `~/.institute-one/backups/` (03:00–05:00 SGT); the vault is a human-readable second copy of every product.
 - **Vault safety**: notes carry `managed: institute`; if you hand-edit a note the institute never clobbers it — updates arrive as `… (institute update <date>).md` siblings; `POST /api/vault/doctor` reports drift.
+- **Judgement bridge**: `scripts/export_judgement_bridge.py` writes a candidate-only review queue into judgement_engine staging; it never promotes canonical vault objects.
 - **Restarts are safe but not free**: in-flight tasks are marked `orphaned by restart` at boot and domain loops re-drive from durable rows — still, prefer restarting when the queue is idle (`GET /api/tasks/queue`).
 
 ## Roadmap — and you can vibe it yourself
 
-v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md). The rest is mapped, grounded, and **written to be built by you with an AI coding agent**: **[`ROADMAP.md`](./ROADMAP.md)** breaks every remaining feature into self-contained milestones — each grounded in the proposal section it implements, the legacy source it ports from, and the files to touch; keystone items carry a ready-to-paste prompt for Claude Code / Codex / Gemini. Pick a box, prompt your agent, review the diff, keep `pytest -q` green, tick it off.
+v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md). The rest is mapped, grounded, and **written to be built by you with an AI coding agent**: **[`ROADMAP.md`](./ROADMAP.md)** breaks every remaining feature into self-contained milestones — each grounded in the proposal section it implements, the legacy source it ports from, and the files to touch; keystone items carry a ready-to-paste prompt for Claude Code / Codex / Antigravity. Pick a box, prompt your agent, review the diff, keep `pytest -q` green, tick it off.
 
 ```mermaid
 flowchart LR
     V01["v0.1 ✅<br/>spine · 5 loops · vault<br/>SPA · plugin · MCP"]
     P0["0 🔧 Hardening<br/>14 verified fixes"]
     P1A["1a Embeddings<br/>sqlite-vec + bge-m3"]
-    P1B["1b Market data<br/>FMP/Stooq/Sina"]
+    P1B["1b Market data<br/>IBKR bars + FMP/SEC"]
     P2["2 Memory & quality<br/>analyst memory · hand weights"]
     P3["3 Fact-check v2<br/>+ claim-check"]
     P4["4 Chain graph<br/>vault = graph"]

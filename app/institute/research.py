@@ -19,6 +19,7 @@ from typing import Any
 from .. import bus, db
 from ..config import get_settings
 from . import archive
+from . import marketdata
 from .prompts import work_date
 
 log = logging.getLogger("institute.research")
@@ -126,11 +127,17 @@ async def _run_item(item_id: str, topic: str) -> None:
     from . import workflows  # deferred: keeps this module importable standalone
 
     try:
+        try:
+            data_bundle = marketdata.bundle_markdown(await marketdata.get_bundle(topic))
+        except Exception as exc:  # noqa: BLE001 - data enrichment must not block research
+            log.warning("market data bundle unavailable for %s: %s", topic, exc)
+            data_bundle = f"## 本地数据包\n\n本地 marketdata 暂不可用：{str(exc)[:300]}。"
         run = _as_dict(await workflows.run_workflow_and_wait(
             "research",
             variables={
                 "TOPIC": topic, "WORK_DATE": work_date(),
                 "ANALYST_CATALOG": _analyst_catalog(),
+                "DATA_BUNDLE": data_bundle,
             },
             source="research",
         ))

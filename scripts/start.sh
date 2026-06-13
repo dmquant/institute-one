@@ -3,20 +3,31 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
 PORT="${INSTITUTE_PORT:-8100}"
-HOME_DIR="$HOME/.institute-one"
+HOST="${INSTITUTE_HOST:-127.0.0.1}"
+HOME_DIR="${INSTITUTE_HOME:-$HOME/.institute-one}"
 mkdir -p "$HOME_DIR/logs"
 
 if [ -f "$HOME_DIR/server.pid" ] && kill -0 "$(cat "$HOME_DIR/server.pid")" 2>/dev/null; then
-  echo "already running (pid $(cat "$HOME_DIR/server.pid"))"
-  exit 0
+  PID="$(cat "$HOME_DIR/server.pid")"
+  STAT="$(ps -p "$PID" -o stat= 2>/dev/null | tr -d ' ')"
+  if [ -n "$STAT" ] && [[ "$STAT" != Z* ]]; then
+    echo "already running (pid $PID)"
+    exit 0
+  fi
+  rm -f "$HOME_DIR/server.pid"
 fi
 
-nohup uvicorn app.main:app --host 127.0.0.1 --port "$PORT" \
-  > "$HOME_DIR/logs/server.log" 2>&1 &
-echo $! > "$HOME_DIR/server.pid"
+.venv/bin/python scripts/_daemon_start.py "$HOST" "$PORT" "$HOME_DIR/logs/server.log" "$HOME_DIR/server.pid"
 
-echo "started (pid $(cat "$HOME_DIR/server.pid"), port $PORT, log $HOME_DIR/logs/server.log)"
+echo "started (pid $(cat "$HOME_DIR/server.pid"), host $HOST, port $PORT, log $HOME_DIR/logs/server.log)"

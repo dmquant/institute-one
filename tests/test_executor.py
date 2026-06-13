@@ -70,6 +70,22 @@ class AlwaysRateLimitedHand(Hand):
         )
 
 
+class PoolAHand(Hand):
+    name = "pool-a"
+    hand_type = "cli"
+
+    async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None):
+        return HandResult(output="pool-a", exit_code=0)
+
+
+class PoolBHand(Hand):
+    name = "pool-b"
+    hand_type = "cli"
+
+    async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None):
+        return HandResult(output="pool-b", exit_code=0)
+
+
 async def test_fallback_to_echo_and_cooldown(tmp_path, monkeypatch):
     registry = get_registry()
     registry.register(AlwaysRateLimitedHand())
@@ -91,3 +107,40 @@ async def test_fallback_to_echo_and_cooldown(tmp_path, monkeypatch):
     registry.clear_cooldown("flaky")
     assert registry.cooling_until("flaky") is None
     assert registry.is_available("flaky")
+
+
+async def test_pool_randomly_selects_available_member(tmp_path, monkeypatch):
+    registry = get_registry()
+    registry.register(PoolAHand())
+    registry.register(PoolBHand())
+    monkeypatch.setattr(registry.settings, "hand_pool", "pool-a,pool-b")
+    monkeypatch.setattr(registry_mod.random, "shuffle", lambda items: items.reverse())
+
+    task = await executor.submit("pool", "spread work", source="test", workspace=tmp_path)
+
+    assert task.status == "completed"
+    assert task.requested_hand == "pool"
+    assert task.hand == "pool-b"
+    assert task.tried == ["pool", "pool-b"]
+    snap = {s["name"]: s for s in registry.status_snapshot()}
+    assert snap["pool"]["available"] is True
+    assert snap["pool"]["fallback_chain"] == ["pool-a", "pool-b"]
+
+
+async def test_pool_excludes_cooling_member(tmp_path, monkeypatch):
+    registry = get_registry()
+    registry.register(PoolAHand())
+    registry.register(PoolBHand())
+    monkeypatch.setattr(registry.settings, "hand_pool", "pool-a,pool-b")
+    monkeypatch.setattr(registry_mod.random, "shuffle", lambda items: items.reverse())
+    registry.mark_rate_limited(
+        "pool-b",
+        RateLimitInfo(reason="session_limit", retry_after_s=120, raw="session limit"),
+    )
+
+    task = await executor.submit("pool", "avoid cooled hand", source="test", workspace=tmp_path)
+
+    assert task.status == "completed"
+    assert task.requested_hand == "pool"
+    assert task.hand == "pool-a"
+    assert task.tried == ["pool", "pool-b", "pool-a"]
