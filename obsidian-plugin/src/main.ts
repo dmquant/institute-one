@@ -25,6 +25,7 @@ import {
 } from "./api";
 import { InstituteDashboardView, VIEW_TYPE_DASHBOARD } from "./dashboard";
 import { AskModal, MailModal, PickModal, PromptModal, VaultDoctorModal } from "./modals";
+import { RoadmapView, VIEW_TYPE_ROADMAP } from "./roadmap";
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -39,6 +40,8 @@ export interface InstituteSettings {
 	insertStyle: "callout" | "plain";
 	/** Dashboard poll interval in seconds (min 5). */
 	pollIntervalS: number;
+	/** Local roadmap progress overrides before the backend roadmap API exists. */
+	roadmapStatusOverrides: Record<string, string>;
 }
 
 export const DEFAULT_SETTINGS: InstituteSettings = {
@@ -47,6 +50,7 @@ export const DEFAULT_SETTINGS: InstituteSettings = {
 	defaultAnalyst: "",
 	insertStyle: "callout",
 	pollIntervalS: 10,
+	roadmapStatusOverrides: {},
 };
 
 // ---------------------------------------------------------------------------
@@ -68,13 +72,21 @@ export default class InstituteOnePlugin extends Plugin {
 
 		// ---- dashboard view ------------------------------------------------
 		this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new InstituteDashboardView(leaf, this));
+		this.registerView(VIEW_TYPE_ROADMAP, (leaf) => new RoadmapView(leaf, this));
 		this.addRibbonIcon("gauge", "Institute 仪表盘", () => void this.activateDashboard());
+		this.addRibbonIcon("columns-3", "Institute 路线图", () => void this.activateRoadmap());
 
 		// ---- commands ----------------------------------------------------
 		this.addCommand({
 			id: "open-dashboard",
 			name: "Institute: 打开仪表盘",
 			callback: () => void this.activateDashboard(),
+		});
+
+		this.addCommand({
+			id: "open-roadmap",
+			name: "Institute: 打开路线图",
+			callback: () => void this.activateRoadmap(),
 		});
 
 		this.addCommand({
@@ -173,6 +185,19 @@ export default class InstituteOnePlugin extends Plugin {
 		const leaf = workspace.getRightLeaf(false);
 		if (!leaf) return;
 		await leaf.setViewState({ type: VIEW_TYPE_DASHBOARD, active: true });
+		await workspace.revealLeaf(leaf);
+	}
+
+	async activateRoadmap(): Promise<void> {
+		const { workspace } = this.app;
+		const existing = workspace.getLeavesOfType(VIEW_TYPE_ROADMAP);
+		if (existing.length > 0) {
+			await workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: VIEW_TYPE_ROADMAP, active: true });
 		await workspace.revealLeaf(leaf);
 	}
 
@@ -632,6 +657,9 @@ export default class InstituteOnePlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 		if (!Number.isFinite(this.settings.pollIntervalS) || this.settings.pollIntervalS < 5) {
 			this.settings.pollIntervalS = DEFAULT_SETTINGS.pollIntervalS;
+		}
+		if (!this.settings.roadmapStatusOverrides) {
+			this.settings.roadmapStatusOverrides = {};
 		}
 	}
 

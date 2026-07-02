@@ -29,7 +29,7 @@ __export(main_exports, {
   default: () => InstituteOnePlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 
 // src/api.ts
 var import_obsidian = require("obsidian");
@@ -341,6 +341,7 @@ var InstituteDashboardView = class extends import_obsidian2.ItemView {
     actions.style.flexWrap = "wrap";
     this.actionButton(actions, "\u63D0\u95EE", () => this.plugin.openAskModal());
     this.actionButton(actions, "\u6DF1\u5EA6\u7814\u7A76", () => this.plugin.openResearchPrompt());
+    this.actionButton(actions, "\u8DEF\u7EBF\u56FE", () => void this.plugin.activateRoadmap());
     this.actionButton(actions, "\u6253\u5F00\u64CD\u4F5C\u53F0", () => this.plugin.openOperatorUi());
     void this.refresh();
     const everyMs = Math.max(5, this.plugin.settings.pollIntervalS || 10) * 1e3;
@@ -925,15 +926,1039 @@ var VaultDoctorModal = class extends import_obsidian3.Modal {
   }
 };
 
+// src/roadmap.ts
+var import_obsidian4 = require("obsidian");
+
+// ../roadmap/backlog.json
+var backlog_default = {
+  version: 1,
+  columns: ["inbox", "ready", "in_progress", "review", "verify", "done", "parked"],
+  phases: [
+    "M0 Research Hand Policy",
+    "M1 Thesis Registry",
+    "M2 Securities & Stock Map",
+    "M3 Thesis-Aware Research Queue",
+    "M4 Market Data & PIT Store",
+    "M5 Forecast Ledger",
+    "M6 Alpha & Paper Book",
+    "M7 Roadmap Control Plane"
+  ],
+  cards: [
+    {
+      id: "M0-001",
+      title: "Research hand config and constrained fallback",
+      type: "feature",
+      phase: "M0 Research Hand Policy",
+      status: "done",
+      priority: "P0",
+      risk: "medium",
+      summary: "Default deep research to codex and agy, and constrain research fallback to the configured research hand chain.",
+      design_links: ["design/local-thesis-alpha/01-local-architecture.md", "design/local-thesis-alpha/05-implementation-roadmap.md"],
+      expected_files: ["app/config.py", "app/institute/workflows.py", "app/router/executor.py", "app/hands/registry.py"],
+      dependencies: [],
+      acceptance: [
+        "INSTITUTE_RESEARCH_HANDS defaults to codex,agy",
+        "research workflow steps rotate through the configured research hands",
+        "research fallback does not use non-research hands"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"]
+    },
+    {
+      id: "M0-002",
+      title: "Test research workflow uses configured hands only",
+      type: "test",
+      phase: "M0 Research Hand Policy",
+      status: "done",
+      priority: "P0",
+      risk: "low",
+      summary: "Add a focused workflow test with fake codex and agy hands to prove research uses only the configured research hand list.",
+      design_links: ["design/local-thesis-alpha/05-implementation-roadmap.md"],
+      expected_files: ["tests/conftest.py", "tests/test_workflows.py"],
+      dependencies: ["M0-001"],
+      acceptance: [
+        "tests can override research hands to echo",
+        "focused test asserts requested and actual hands are limited to codex/agy"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_workflows.py -q"]
+    },
+    {
+      id: "M1-000",
+      title: "Document and validate market-thesis-data import contract",
+      type: "docs",
+      phase: "M1 Thesis Registry",
+      status: "done",
+      priority: "P0",
+      risk: "low",
+      summary: "Treat market-thesis-data as the bootstrap source for the local thesis registry and document import mappings, validation, and warnings.",
+      design_links: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      expected_files: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      dependencies: [],
+      acceptance: [
+        "bundle counts and schema are documented",
+        "lane/thesis/stock/edge field mappings are documented",
+        "import validation and warning policy are documented"
+      ],
+      verification: ["python3 -m json.tool market-thesis-data/manifest.json", "python3 -m json.tool market-thesis-data/bundle.json"]
+    },
+    {
+      id: "M1-001",
+      title: "Add thesis and market import schema migration",
+      type: "schema",
+      phase: "M1 Thesis Registry",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",
+      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
+      expected_files: ["migrations/*.sql", "tests/test_theses.py", "tests/test_market_thesis_import.py"],
+      dependencies: ["M0-001", "M1-000"],
+      acceptance: [
+        "migration is additive",
+        "thesis lifecycle status is represented",
+        "version table can preserve view history",
+        "import batch and import item provenance are represented"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_theses.py -q", ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q", ".venv/bin/python -m compileall app -q"]
+    },
+    {
+      id: "M1-002",
+      title: "Implement thesis domain module and API",
+      type: "feature",
+      phase: "M1 Thesis Registry",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
+      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md"],
+      expected_files: ["app/institute/theses.py", "app/api/theses.py", "app/main.py", "tests/test_theses.py"],
+      dependencies: ["M1-001"],
+      acceptance: [
+        "GET /api/theses returns tree data",
+        "POST /api/theses creates candidate or active thesis",
+        "PATCH /api/theses/{id} updates projection fields",
+        "tests cover create, update, duplicate slug, and tree listing"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_theses.py -q"]
+    },
+    {
+      id: "M1-003",
+      title: "Import market-thesis-data bundle",
+      type: "feature",
+      phase: "M1 Thesis Registry",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe.",
+      design_links: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      expected_files: ["app/institute/theses.py", "app/institute/market_thesis_import.py", "tests/test_market_thesis_import.py"],
+      dependencies: ["M1-001", "M1-002", "M2-001"],
+      acceptance: [
+        "dry-run validates schema and reports counts/warnings",
+        "apply import inserts lanes, theses, securities, and thesis-stock edges",
+        "import preserves practical metadata",
+        "import is idempotent"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"]
+    },
+    {
+      id: "M2-001",
+      title: "Add security master schema",
+      type: "schema",
+      phase: "M2 Securities & Stock Map",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
+      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
+      expected_files: ["migrations/*.sql", "tests/test_securities.py"],
+      dependencies: ["M1-001"],
+      acceptance: [
+        "canonical ids support CN_A, HK, and US suffixes",
+        "aliases can map Chinese names and unsuffixed tickers",
+        "thesis-security edge stores role, exposure, confidence, and rationale",
+        "market-thesis-data markets normalize into local market and instrument_type"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_securities.py -q"]
+    },
+    {
+      id: "M3-001",
+      title: "Extend research queue for thesis-aware tasks",
+      type: "schema",
+      phase: "M3 Thesis-Aware Research Queue",
+      status: "inbox",
+      priority: "P1",
+      risk: "high",
+      summary: "Add thesis_id, security_id, question, output_type, priority_reason, and cooldown fields while preserving current research behavior and supporting imported market-thesis-data theses.",
+      design_links: ["design/local-thesis-alpha/03-infinite-research-loop.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
+      expected_files: ["migrations/*.sql", "app/institute/research.py", "tests/test_research.py"],
+      dependencies: ["M1-002", "M2-001"],
+      acceptance: [
+        "old topic-only enqueue still works",
+        "structured enqueue stores thesis/security/question",
+        "dedup uses thesis, security, and normalized question",
+        "imported practical.actionCode can seed research candidates"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_research.py -q"]
+    },
+    {
+      id: "M4-001",
+      title: "Add market calendar, bars, and benchmark schema",
+      type: "schema",
+      phase: "M4 Market Data & PIT Store",
+      status: "inbox",
+      priority: "P1",
+      risk: "high",
+      summary: "Add local point-in-time market data tables for trading calendar, price bars, benchmarks, and corporate actions.",
+      design_links: ["design/local-thesis-alpha/06-market-data-pit.md"],
+      expected_files: ["migrations/*.sql", "app/institute/market_data.py", "tests/test_market_data.py"],
+      dependencies: ["M2-001"],
+      acceptance: [
+        "tables carry valid_time/as_known_at where required",
+        "benchmark marks are separate from securities",
+        "calendar can represent closed and suspended days"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_market_data.py -q"]
+    },
+    {
+      id: "M5-001",
+      title: "Add forecast and settlement schema",
+      type: "schema",
+      phase: "M5 Forecast Ledger",
+      status: "inbox",
+      priority: "P1",
+      risk: "medium",
+      summary: "Create forecasts and forecast_settlements tables with deterministic settlement rule fields.",
+      design_links: ["design/local-thesis-alpha/04-alpha-portfolio-loop.md"],
+      expected_files: ["migrations/*.sql", "app/institute/forecasts.py", "tests/test_forecasts.py"],
+      dependencies: ["M1-002", "M4-001"],
+      acceptance: [
+        "forecast requires thesis, claim, horizon, direction, and settlement_rule",
+        "settlement can record hit/miss/partial/invalid",
+        "invalid benchmark fails closed"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_forecasts.py -q"]
+    },
+    {
+      id: "M7-001",
+      title: "Add roadmap schema and seed import",
+      type: "schema",
+      phase: "M7 Roadmap Control Plane",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
+      design_links: ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
+      expected_files: ["migrations/*.sql", "app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      dependencies: [],
+      acceptance: [
+        "seed import upserts cards by id",
+        "schema supports coding sessions and evidence",
+        "dependencies validate known ids",
+        "status/type/priority values are validated"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+    },
+    {
+      id: "M7-003",
+      title: "Build Kanban board UI",
+      type: "ui",
+      phase: "M7 Roadmap Control Plane",
+      status: "inbox",
+      priority: "P2",
+      risk: "medium",
+      summary: "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
+      design_links: ["roadmap/01-portal-design.md"],
+      expected_files: ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/main.ts", "obsidian-plugin/src/dashboard.ts", "obsidian-plugin/tsconfig.json"],
+      dependencies: ["M7-001"],
+      acceptance: [
+        "plugin view displays cards grouped by status",
+        "filters by phase/type/priority",
+        "card detail panel shows checklists, dependencies, expected files, verification commands, and prompt",
+        "operator can export a markdown-backed Kanban note"
+      ],
+      verification: ["cd obsidian-plugin && npm run build"]
+    },
+    {
+      id: "M7-005",
+      title: "Add coding session tracking",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "ready",
+      priority: "P1",
+      risk: "medium",
+      summary: "Implement coding sessions as first-class records tied to roadmap cards, commands, touched files, and completion summaries.",
+      design_links: ["roadmap/05-global-coding-process.md", "roadmap/06-agent-protocol.md", "roadmap/02-data-model.md"],
+      expected_files: ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
+      dependencies: ["M7-001"],
+      acceptance: [
+        "card can start a coding session",
+        "session records actor, goal, planned files, touched files, status, and summary",
+        "session commands can be attached as evidence",
+        "card cannot move to review without a session summary unless operator overrides"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+    },
+    {
+      id: "M7-006",
+      title: "Add global coding process and release gate views",
+      type: "ui",
+      phase: "M7 Roadmap Control Plane",
+      status: "inbox",
+      priority: "P1",
+      risk: "medium",
+      summary: "Add UI views that show active coding sessions, open decisions, release gates, and evidence readiness beyond the Kanban board.",
+      design_links: ["roadmap/05-global-coding-process.md", "roadmap/01-portal-design.md"],
+      expected_files: ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/api.ts", "app/api/roadmap.py"],
+      dependencies: ["M7-001", "M7-003", "M7-005"],
+      acceptance: [
+        "roadmap view exposes sessions, decisions, and release gates",
+        "release readiness is computed from card status and evidence",
+        "blocked process items are visible without opening each card"
+      ],
+      verification: ["cd obsidian-plugin && npm run build"]
+    },
+    {
+      id: "M7-007",
+      title: "Generate agent prompts from roadmap cards",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "inbox",
+      priority: "P2",
+      risk: "low",
+      summary: "Generate deterministic coding-agent prompts from card metadata, constraints, acceptance criteria, and verification commands.",
+      design_links: ["roadmap/06-agent-protocol.md"],
+      expected_files: ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
+      dependencies: ["M7-001"],
+      acceptance: [
+        "prompt includes card id, title, design links, expected files, acceptance criteria, verification commands, and constraints",
+        "operator can copy the generated prompt",
+        "prompt generation is deterministic for the same card state"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+    }
+  ]
+};
+
+// src/roadmap.ts
+var VIEW_TYPE_ROADMAP = "institute-roadmap";
+var ROADMAP = backlog_default;
+var STATUS_ZH = {
+  inbox: "\u6536\u4EF6\u7BB1",
+  ready: "\u5C31\u7EEA",
+  in_progress: "\u8FDB\u884C\u4E2D",
+  review: "\u8BC4\u5BA1",
+  verify: "\u9A8C\u8BC1",
+  done: "\u5B8C\u6210",
+  parked: "\u6682\u505C"
+};
+var STATUS_EN = {
+  inbox: "Inbox",
+  ready: "Ready",
+  in_progress: "In Progress",
+  review: "Review",
+  verify: "Verify",
+  done: "Done",
+  parked: "Parked"
+};
+var ACTIVE_STATUSES = /* @__PURE__ */ new Set(["in_progress", "review", "verify"]);
+var RoadmapView = class extends import_obsidian4.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.query = "";
+    this.phase = "all";
+    this.priority = "all";
+    this.status = "all";
+    this.type = "all";
+    this.selectedId = ROADMAP.cards[0]?.id ?? "";
+    this.plugin = plugin;
+    this.navigation = false;
+  }
+  getViewType() {
+    return VIEW_TYPE_ROADMAP;
+  }
+  getDisplayText() {
+    return "Institute \u8DEF\u7EBF\u56FE";
+  }
+  getIcon() {
+    return "columns-3";
+  }
+  async onOpen() {
+    ensureRoadmapStyles();
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("institute-roadmap");
+    const head = root.createDiv({ cls: "ir-head" });
+    const title = head.createDiv();
+    title.createEl("h2", { text: "\u8DEF\u7EBF\u56FE\u6267\u884C" });
+    title.createDiv({
+      cls: "ir-subtitle",
+      text: `roadmap/backlog.json v${ROADMAP.version} \xB7 Obsidian Kanban-compatible`
+    });
+    const actions = head.createDiv({ cls: "ir-actions" });
+    this.button(actions, "\u5237\u65B0", "\u91CD\u65B0\u6E32\u67D3\u5F53\u524D\u8DEF\u7EBF\u56FE", () => this.render());
+    this.button(
+      actions,
+      "\u5BFC\u51FA Kanban \u7B14\u8BB0",
+      "\u5199\u5165 Obsidian Kanban \u517C\u5BB9 Markdown",
+      () => void this.exportKanbanNote()
+    );
+    this.summaryEl = root.createDiv({ cls: "ir-summary" });
+    this.buildFilters(root);
+    this.boardEl = root.createDiv({ cls: "ir-board" });
+    this.detailEl = root.createDiv({ cls: "ir-detail" });
+    this.gatesEl = root.createDiv({ cls: "ir-gates" });
+    this.render();
+  }
+  async onClose() {
+    this.contentEl.empty();
+  }
+  buildFilters(root) {
+    const filters = root.createDiv({ cls: "ir-filters" });
+    const search = filters.createEl("input");
+    search.type = "search";
+    search.placeholder = "\u641C\u7D22\u5361\u7247\u3001\u6587\u4EF6\u3001\u9A8C\u6536\u9879...";
+    search.addEventListener("input", () => {
+      this.query = search.value.trim().toLowerCase();
+      this.renderBoard();
+    });
+    this.select(filters, "\u9636\u6BB5", ["all", ...ROADMAP.phases], (v) => {
+      this.phase = v;
+      this.renderBoard();
+    });
+    this.select(filters, "\u72B6\u6001", ["all", ...ROADMAP.columns], (v) => {
+      this.status = v;
+      this.renderBoard();
+    });
+    this.select(filters, "\u4F18\u5148\u7EA7", ["all", "P0", "P1", "P2", "P3"], (v) => {
+      this.priority = v;
+      this.renderBoard();
+    });
+    this.select(filters, "\u7C7B\u578B", ["all", ...unique(ROADMAP.cards.map((c) => c.type))], (v) => {
+      this.type = v;
+      this.renderBoard();
+    });
+  }
+  render() {
+    this.renderSummary();
+    this.renderBoard();
+    this.renderDetail();
+    this.renderGates();
+  }
+  renderSummary() {
+    const cards = this.cards();
+    const byId = mapById(cards);
+    const done = cards.filter((c) => c.status === "done").length;
+    const active = cards.filter((c) => ACTIVE_STATUSES.has(c.status)).length;
+    const ready = cards.filter((c) => c.status === "ready" && !isBlocked(c, byId)).length;
+    const blocked = cards.filter((c) => isBlocked(c, byId)).length;
+    const completion = cards.length ? Math.round(done / cards.length * 100) : 0;
+    this.summaryEl.empty();
+    this.stat(this.summaryEl, String(cards.length), "\u603B\u5361\u7247");
+    this.stat(this.summaryEl, `${completion}%`, "\u5B8C\u6210\u5EA6");
+    this.stat(this.summaryEl, String(active), "\u6D3B\u8DC3");
+    this.stat(this.summaryEl, String(ready), "\u53EF\u5F00\u5DE5");
+    this.stat(this.summaryEl, String(blocked), "\u4F9D\u8D56\u963B\u585E");
+  }
+  renderBoard() {
+    const cards = this.filteredCards();
+    const byId = mapById(this.cards());
+    this.boardEl.empty();
+    for (const status of ROADMAP.columns) {
+      const laneCards = cards.filter((c) => c.status === status);
+      const col = this.boardEl.createDiv({ cls: "ir-column" });
+      col.addEventListener("dragover", (ev) => ev.preventDefault());
+      col.addEventListener("drop", (ev) => {
+        ev.preventDefault();
+        const id = ev.dataTransfer?.getData("text/plain") ?? "";
+        const card = this.cards().find((c) => c.id === id);
+        if (card) void this.moveCard(card, status);
+      });
+      const h = col.createDiv({ cls: "ir-column-head" });
+      h.createSpan({ text: STATUS_ZH[status] });
+      h.createSpan({ cls: "ir-count", text: String(laneCards.length) });
+      if (!laneCards.length) {
+        col.createDiv({ cls: "ir-empty", text: "\u65E0\u5361\u7247" });
+        continue;
+      }
+      for (const card of laneCards.sort(cardSort)) {
+        const blocked = isBlocked(card, byId);
+        const el = col.createDiv({
+          cls: `ir-card status-${card.status}${blocked ? " is-blocked" : ""}${this.selectedId === card.id ? " is-selected" : ""}`
+        });
+        el.draggable = true;
+        el.addEventListener("dragstart", (ev) => {
+          ev.dataTransfer?.setData("text/plain", card.id);
+        });
+        el.addEventListener("click", () => {
+          this.selectedId = card.id;
+          this.renderBoard();
+          this.renderDetail();
+        });
+        const meta = el.createDiv({ cls: "ir-card-meta" });
+        meta.createSpan({ cls: "ir-id", text: card.id });
+        meta.createSpan({ cls: `ir-pill priority-${card.priority.toLowerCase()}`, text: card.priority });
+        meta.createSpan({ cls: "ir-pill", text: card.type });
+        if (blocked) meta.createSpan({ cls: "ir-pill blocked", text: "blocked" });
+        el.createDiv({ cls: "ir-card-title", text: card.title });
+        el.createDiv({ cls: "ir-card-summary", text: card.summary });
+        const foot = el.createDiv({ cls: "ir-card-foot" });
+        foot.createSpan({ text: card.phase.split(" ")[0] });
+        foot.createSpan({ text: `${card.acceptance.length} checks` });
+        foot.createSpan({ text: `${card.verification.length} verify` });
+      }
+    }
+  }
+  renderDetail() {
+    const cards = this.cards();
+    const byId = mapById(cards);
+    const card = cards.find((c) => c.id === this.selectedId) ?? cards[0];
+    this.detailEl.empty();
+    if (!card) {
+      this.detailEl.createDiv({ cls: "ir-empty", text: "\u6CA1\u6709\u8DEF\u7EBF\u56FE\u5361\u7247\u3002" });
+      return;
+    }
+    this.selectedId = card.id;
+    const blocked = isBlocked(card, byId);
+    const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
+    const title = top.createDiv();
+    title.createEl("h3", { text: `${card.id} \xB7 ${card.title}` });
+    title.createDiv({ cls: "ir-subtitle", text: `${card.phase} \xB7 ${card.type} \xB7 ${card.priority} \xB7 risk ${card.risk}` });
+    const moves = top.createDiv({ cls: "ir-status-actions" });
+    for (const status of ROADMAP.columns) {
+      const btn = this.button(
+        moves,
+        STATUS_EN[status],
+        `\u79FB\u52A8\u5230 ${STATUS_ZH[status]}`,
+        () => void this.moveCard(card, status)
+      );
+      btn.disabled = card.status === status;
+    }
+    const body = this.detailEl.createDiv({ cls: "ir-detail-grid" });
+    const main = body.createDiv();
+    this.block(main, "\u6458\u8981", [card.summary]);
+    this.block(main, "\u9A8C\u6536\u6807\u51C6", card.acceptance);
+    this.block(main, "\u9A8C\u8BC1\u547D\u4EE4", card.verification, "code");
+    this.block(main, "\u9884\u671F\u6587\u4EF6", card.expected_files, "code");
+    this.block(main, "\u8BBE\u8BA1\u94FE\u63A5", card.design_links, "code");
+    const side = body.createDiv();
+    this.dependencyBlock(side, card, byId);
+    this.block(side, "\u6267\u884C\u63D0\u793A", [agentPrompt(card)], "pre");
+    if (blocked) {
+      side.createDiv({
+        cls: "ir-warning",
+        text: "\u8BE5\u5361\u7247\u5B58\u5728\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u79FB\u52A8\u5230 Done\u3002"
+      });
+    }
+  }
+  renderGates() {
+    const cards = this.cards();
+    this.gatesEl.empty();
+    this.gatesEl.createEl("h3", { text: "Release Gates" });
+    const gates = [
+      { name: "Release A", desc: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
+      { name: "Release B", desc: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
+      { name: "Release C", desc: "Roadmap Control Plane", prefixes: ["M7"] }
+    ];
+    const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
+    for (const gate of gates) {
+      const scoped = cards.filter((c) => gate.prefixes.some((p) => c.phase.startsWith(p)));
+      const done = scoped.filter((c) => c.status === "done").length;
+      const pct = scoped.length ? Math.round(done / scoped.length * 100) : 0;
+      const box = wrap.createDiv({ cls: "ir-gate" });
+      box.createDiv({ cls: "ir-gate-name", text: gate.name });
+      box.createDiv({ cls: "ir-gate-desc", text: gate.desc });
+      box.createDiv({ cls: "ir-progress" }).createDiv({
+        cls: "ir-progress-bar",
+        attr: { style: `width: ${pct}%` }
+      });
+      box.createDiv({ cls: "ir-gate-meta", text: `${done}/${scoped.length} cards \xB7 ${pct}%` });
+    }
+  }
+  async moveCard(card, status) {
+    const byId = mapById(this.cards());
+    if (status === "done" && isBlocked(card, byId)) {
+      new import_obsidian4.Notice(`Institute Roadmap: ${card.id} \u4ECD\u6709\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u6807\u8BB0 Done\u3002`, 6e3);
+      return;
+    }
+    const overrides = { ...this.plugin.settings.roadmapStatusOverrides ?? {} };
+    const seed = ROADMAP.cards.find((c) => c.id === card.id);
+    if (seed?.status === status) {
+      delete overrides[card.id];
+    } else {
+      overrides[card.id] = status;
+    }
+    this.plugin.settings.roadmapStatusOverrides = overrides;
+    await this.plugin.saveSettings();
+    this.selectedId = card.id;
+    this.render();
+  }
+  cards() {
+    const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
+    return ROADMAP.cards.map((card) => ({
+      ...card,
+      status: normalizeStatus(overrides[card.id]) ?? card.status
+    }));
+  }
+  filteredCards() {
+    return this.cards().filter((card) => {
+      if (this.status !== "all" && card.status !== this.status) return false;
+      if (this.priority !== "all" && card.priority !== this.priority) return false;
+      if (this.phase !== "all" && card.phase !== this.phase) return false;
+      if (this.type !== "all" && card.type !== this.type) return false;
+      if (!this.query) return true;
+      const haystack = [
+        card.id,
+        card.title,
+        card.summary,
+        card.phase,
+        card.type,
+        card.priority,
+        card.risk,
+        ...card.design_links,
+        ...card.expected_files,
+        ...card.acceptance,
+        ...card.verification
+      ].join(" ").toLowerCase();
+      return haystack.includes(this.query);
+    });
+  }
+  async exportKanbanNote() {
+    const rel = "Roadmap/Implementation Kanban.md";
+    const path = (0, import_obsidian4.normalizePath)(this.plugin.subPath(rel));
+    const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    if (folder) await this.ensureFolder(folder);
+    const content = buildKanbanMarkdown(this.cards());
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    let file;
+    if (existing instanceof import_obsidian4.TFile) {
+      await this.app.vault.modify(existing, content);
+      file = existing;
+    } else if (existing instanceof import_obsidian4.TFolder) {
+      new import_obsidian4.Notice(`Institute Roadmap: ${path} \u662F\u6587\u4EF6\u5939\uFF0C\u65E0\u6CD5\u5199\u5165\u3002`, 8e3);
+      return;
+    } else {
+      file = await this.app.vault.create(path, content);
+    }
+    await this.app.workspace.getLeaf(true).openFile(file);
+    new import_obsidian4.Notice(`Institute Roadmap: \u5DF2\u5199\u5165 ${path}`, 6e3);
+  }
+  async ensureFolder(path) {
+    let current = "";
+    for (const part of (0, import_obsidian4.normalizePath)(path).split("/").filter(Boolean)) {
+      current = current ? `${current}/${part}` : part;
+      const existing = this.app.vault.getAbstractFileByPath(current);
+      if (existing instanceof import_obsidian4.TFolder) continue;
+      if (existing) throw new Error(`${current} exists and is not a folder`);
+      await this.app.vault.createFolder(current);
+    }
+  }
+  stat(parent, value, label) {
+    const box = parent.createDiv({ cls: "ir-stat" });
+    box.createDiv({ cls: "ir-stat-value", text: value });
+    box.createDiv({ cls: "ir-stat-label", text: label });
+  }
+  block(parent, title, rows, mode = "text") {
+    const box = parent.createDiv({ cls: "ir-block" });
+    box.createEl("h4", { text: title });
+    if (!rows.length) {
+      box.createDiv({ cls: "ir-empty", text: "\u65E0" });
+      return;
+    }
+    if (mode === "pre") {
+      box.createEl("pre", { text: rows.join("\n\n") });
+      return;
+    }
+    const list = box.createEl("ul");
+    for (const row of rows) {
+      const li = list.createEl("li");
+      if (mode === "code") li.createEl("code", { text: row });
+      else li.setText(row);
+    }
+  }
+  dependencyBlock(parent, card, byId) {
+    const box = parent.createDiv({ cls: "ir-block" });
+    box.createEl("h4", { text: "\u4F9D\u8D56" });
+    if (!card.dependencies.length) {
+      box.createDiv({ cls: "ir-empty", text: "\u65E0" });
+      return;
+    }
+    for (const dep of card.dependencies) {
+      const target = byId.get(dep);
+      const ok = target?.status === "done";
+      const row = box.createDiv({ cls: `ir-dep ${ok ? "ok" : "blocked"}` });
+      row.createSpan({ text: dep });
+      row.createSpan({ text: target ? STATUS_ZH[target.status] : "\u7F3A\u5931" });
+    }
+  }
+  button(parent, text, title, onClick) {
+    const btn = parent.createEl("button", { text });
+    btn.setAttribute("title", title);
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+  select(parent, label, values, onChange) {
+    const wrap = parent.createDiv({ cls: "ir-select" });
+    wrap.createSpan({ text: label });
+    const sel = wrap.createEl("select");
+    for (const value of values) {
+      const text = value === "all" ? "\u5168\u90E8" : normalizeStatus(value) ? STATUS_ZH[normalizeStatus(value)] : value;
+      sel.createEl("option", { text, value });
+    }
+    sel.addEventListener("change", () => onChange(sel.value));
+  }
+};
+function normalizeStatus(value) {
+  return ROADMAP.columns.includes(value) ? value : null;
+}
+function mapById(cards) {
+  return new Map(cards.map((card) => [card.id, card]));
+}
+function isBlocked(card, byId) {
+  return card.dependencies.some((id) => byId.get(id)?.status !== "done");
+}
+function cardSort(a, b) {
+  const phase = ROADMAP.phases.indexOf(a.phase) - ROADMAP.phases.indexOf(b.phase);
+  if (phase !== 0) return phase;
+  const priority = a.priority.localeCompare(b.priority);
+  if (priority !== 0) return priority;
+  return a.id.localeCompare(b.id);
+}
+function unique(items) {
+  return [...new Set(items)];
+}
+function agentPrompt(card) {
+  return [
+    `Implement roadmap card ${card.id}: ${card.title}`,
+    "",
+    `Phase: ${card.phase}`,
+    `Summary: ${card.summary}`,
+    `Design links: ${card.design_links.join(", ") || "none"}`,
+    `Expected files: ${card.expected_files.join(", ") || "none"}`,
+    `Dependencies: ${card.dependencies.join(", ") || "none"}`,
+    "",
+    "Acceptance criteria:",
+    ...card.acceptance.map((item) => `- ${item}`),
+    "",
+    "Verification:",
+    ...card.verification.map((item) => `- ${item}`),
+    "",
+    "Constraints: local-only infrastructure, no git push, keep design/ ignored, preserve unrelated user changes."
+  ].join("\n");
+}
+function buildKanbanMarkdown(cards) {
+  const byId = mapById(cards);
+  const lines = [
+    "---",
+    "kanban-plugin: board",
+    "institute-roadmap-source: roadmap/backlog.json",
+    `updated: ${(/* @__PURE__ */ new Date()).toISOString()}`,
+    "---",
+    "",
+    "# Institute One Implementation Roadmap",
+    "",
+    "> Generated by the Institute One Obsidian plugin. The native roadmap view is the local control surface; this note is compatible with markdown-backed Kanban plugins.",
+    ""
+  ];
+  for (const status of ROADMAP.columns) {
+    lines.push(`## ${STATUS_EN[status]}`, "");
+    const lane = cards.filter((card) => card.status === status).sort(cardSort);
+    if (!lane.length) {
+      lines.push("");
+      continue;
+    }
+    for (const card of lane) {
+      const checked = status === "done" ? "x" : " ";
+      const tags = [
+        `#${card.priority.toLowerCase()}`,
+        `#${card.type}`,
+        `#risk-${card.risk}`,
+        `#${card.phase.split(" ")[0].toLowerCase()}`
+      ].join(" ");
+      lines.push(`- [${checked}] **${card.id}** ${card.title} ${tags}`);
+      lines.push(`  - phase: ${card.phase}`);
+      if (isBlocked(card, byId)) {
+        const deps = card.dependencies.filter((id) => byId.get(id)?.status !== "done").join(", ");
+        lines.push(`  - blocked by: ${deps}`);
+      }
+      if (card.verification[0]) lines.push(`  - verify: \`${card.verification[0]}\``);
+    }
+    lines.push("");
+  }
+  lines.push(
+    "%% kanban:settings",
+    '{"kanban-plugin":"board","lane-width":300,"show-checkboxes":true}',
+    "%%",
+    ""
+  );
+  return lines.join("\n");
+}
+function ensureRoadmapStyles() {
+  if (document.getElementById("institute-roadmap-style")) return;
+  const style = document.createElement("style");
+  style.id = "institute-roadmap-style";
+  style.textContent = `
+.institute-roadmap {
+	padding: 12px;
+	font-size: 13px;
+	--ir-border: var(--background-modifier-border);
+	--ir-panel: var(--background-secondary);
+	--ir-panel-2: var(--background-primary);
+	--ir-muted: var(--text-muted);
+}
+.ir-head, .ir-detail-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 12px;
+}
+.ir-head h2, .ir-detail h3, .ir-gates h3 {
+	margin: 0;
+	font-size: 18px;
+}
+.ir-subtitle {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin-top: 2px;
+}
+.ir-actions, .ir-status-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.ir-summary {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(88px, 1fr));
+	gap: 8px;
+	margin-bottom: 12px;
+}
+.ir-stat {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px 10px;
+}
+.ir-stat-value {
+	font-family: var(--font-monospace);
+	font-weight: 700;
+	font-size: 18px;
+}
+.ir-stat-label {
+	color: var(--text-muted);
+	font-size: 11px;
+}
+.ir-filters {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	align-items: center;
+	margin-bottom: 12px;
+}
+.ir-filters input {
+	min-width: min(280px, 100%);
+}
+.ir-select {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	color: var(--text-muted);
+	font-size: 12px;
+}
+.ir-board {
+	display: grid;
+	grid-auto-flow: column;
+	grid-auto-columns: minmax(250px, 300px);
+	gap: 10px;
+	overflow-x: auto;
+	padding-bottom: 10px;
+	margin-bottom: 14px;
+}
+.ir-column {
+	min-height: 220px;
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px;
+}
+.ir-column-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	font-weight: 700;
+	margin-bottom: 8px;
+}
+.ir-count {
+	color: var(--text-muted);
+	font-family: var(--font-monospace);
+	font-size: 11px;
+}
+.ir-card {
+	border: 1px solid var(--ir-border);
+	border-left: 3px solid var(--color-blue);
+	background: var(--ir-panel-2);
+	border-radius: 8px;
+	padding: 8px;
+	margin-bottom: 8px;
+	cursor: pointer;
+}
+.ir-card.is-selected {
+	outline: 2px solid var(--text-accent);
+}
+.ir-card.is-blocked {
+	border-left-color: var(--color-orange);
+}
+.ir-card.status-done {
+	border-left-color: var(--color-green);
+}
+.ir-card.status-parked {
+	border-left-color: var(--text-faint);
+}
+.ir-card-meta, .ir-card-foot {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px;
+	align-items: center;
+	color: var(--text-muted);
+	font-size: 11px;
+}
+.ir-id {
+	font-family: var(--font-monospace);
+	color: var(--text-normal);
+	font-weight: 700;
+}
+.ir-pill {
+	border: 1px solid var(--ir-border);
+	border-radius: 999px;
+	padding: 0 6px;
+	font-family: var(--font-monospace);
+}
+.ir-pill.priority-p0, .ir-pill.blocked {
+	color: var(--color-red);
+}
+.ir-pill.priority-p1 {
+	color: var(--color-orange);
+}
+.ir-card-title {
+	font-weight: 650;
+	margin-top: 6px;
+	line-height: 1.35;
+}
+.ir-card-summary {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin: 5px 0 6px;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+.ir-detail, .ir-gates {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 12px;
+	margin-bottom: 12px;
+}
+.ir-detail-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+	gap: 14px;
+}
+.ir-block {
+	margin-bottom: 12px;
+}
+.ir-block h4 {
+	margin: 0 0 5px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-block ul {
+	margin: 0;
+	padding-left: 18px;
+}
+.ir-block li {
+	margin: 3px 0;
+}
+.ir-block code, .ir-block pre {
+	font-family: var(--font-monospace);
+	font-size: 12px;
+	white-space: pre-wrap;
+}
+.ir-block pre {
+	max-height: 260px;
+	overflow: auto;
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	padding: 8px;
+	background: var(--background-primary);
+}
+.ir-dep {
+	display: flex;
+	justify-content: space-between;
+	gap: 10px;
+	border-bottom: 1px solid var(--ir-border);
+	padding: 3px 0;
+	font-family: var(--font-monospace);
+}
+.ir-dep.ok {
+	color: var(--color-green);
+}
+.ir-dep.blocked, .ir-warning {
+	color: var(--color-orange);
+}
+.ir-warning {
+	border: 1px solid rgba(var(--color-orange-rgb), 0.45);
+	border-radius: 8px;
+	padding: 8px;
+}
+.ir-gate-grid {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 10px;
+}
+.ir-gate {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	padding: 9px;
+	background: var(--background-primary);
+}
+.ir-gate-name {
+	font-weight: 700;
+}
+.ir-gate-desc, .ir-gate-meta, .ir-empty {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+.ir-progress {
+	height: 6px;
+	background: var(--background-modifier-border);
+	border-radius: 999px;
+	margin: 8px 0;
+	overflow: hidden;
+}
+.ir-progress-bar {
+	height: 100%;
+	background: var(--color-green);
+}
+@media (max-width: 900px) {
+	.ir-summary, .ir-gate-grid, .ir-detail-grid {
+		grid-template-columns: 1fr;
+	}
+}
+`;
+  document.head.appendChild(style);
+}
+
 // src/main.ts
 var DEFAULT_SETTINGS = {
   baseUrl: "http://127.0.0.1:8100",
   vaultSubfolder: "Institute",
   defaultAnalyst: "",
   insertStyle: "callout",
-  pollIntervalS: 10
+  pollIntervalS: 10,
+  roadmapStatusOverrides: {}
 };
-var InstituteOnePlugin = class extends import_obsidian4.Plugin {
+var InstituteOnePlugin = class extends import_obsidian5.Plugin {
   constructor() {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
@@ -945,11 +1970,18 @@ var InstituteOnePlugin = class extends import_obsidian4.Plugin {
     this.api = new InstituteApi(() => this.settings.baseUrl);
     this.addSettingTab(new InstituteSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new InstituteDashboardView(leaf, this));
+    this.registerView(VIEW_TYPE_ROADMAP, (leaf) => new RoadmapView(leaf, this));
     this.addRibbonIcon("gauge", "Institute \u4EEA\u8868\u76D8", () => void this.activateDashboard());
+    this.addRibbonIcon("columns-3", "Institute \u8DEF\u7EBF\u56FE", () => void this.activateRoadmap());
     this.addCommand({
       id: "open-dashboard",
       name: "Institute: \u6253\u5F00\u4EEA\u8868\u76D8",
       callback: () => void this.activateDashboard()
+    });
+    this.addCommand({
+      id: "open-roadmap",
+      name: "Institute: \u6253\u5F00\u8DEF\u7EBF\u56FE",
+      callback: () => void this.activateRoadmap()
     });
     this.addCommand({
       id: "ask",
@@ -1037,6 +2069,18 @@ var InstituteOnePlugin = class extends import_obsidian4.Plugin {
     await leaf.setViewState({ type: VIEW_TYPE_DASHBOARD, active: true });
     await workspace.revealLeaf(leaf);
   }
+  async activateRoadmap() {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_ROADMAP);
+    if (existing.length > 0) {
+      await workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({ type: VIEW_TYPE_ROADMAP, active: true });
+    await workspace.revealLeaf(leaf);
+  }
   // ---- roster cache ----------------------------------------------------------
   async getRoster(maxAgeMs = 10 * 6e4) {
     const now = Date.now();
@@ -1058,12 +2102,12 @@ var InstituteOnePlugin = class extends import_obsidian4.Plugin {
   async runAsk(prompt, analyst, editor) {
     prompt = prompt.trim();
     if (!prompt) {
-      new import_obsidian4.Notice("Institute: \u95EE\u9898\u4E3A\u7A7A\u3002");
+      new import_obsidian5.Notice("Institute: \u95EE\u9898\u4E3A\u7A7A\u3002");
       return;
     }
     const who = analyst ? `${analyst.emoji} ${analyst.name}` : "Institute";
     const started = Date.now();
-    const notice = new import_obsidian4.Notice(`Institute: ${who} \u601D\u8003\u4E2D\u2026 0s`, 0);
+    const notice = new import_obsidian5.Notice(`Institute: ${who} \u601D\u8003\u4E2D\u2026 0s`, 0);
     const tick = window.setInterval(() => {
       const s = Math.round((Date.now() - started) / 1e3);
       notice.setMessage(`Institute: ${who} \u601D\u8003\u4E2D\u2026 ${s}s`);
@@ -1096,7 +2140,7 @@ ${text}
       window.setTimeout(() => notice.hide(), 5e3);
     } catch (e) {
       notice.hide();
-      new import_obsidian4.Notice(`Institute: \u63D0\u95EE\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u63D0\u95EE\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
     } finally {
       window.clearInterval(tick);
     }
@@ -1110,10 +2154,10 @@ ${text}
       }
     }
     const base = `${todayStr()} ${fileSlug(prompt)}`;
-    let path = (0, import_obsidian4.normalizePath)(`${folder}/${base}.md`);
+    let path = (0, import_obsidian5.normalizePath)(`${folder}/${base}.md`);
     let n = 1;
     while (this.app.vault.getAbstractFileByPath(path)) {
-      path = (0, import_obsidian4.normalizePath)(`${folder}/${base} ${++n}.md`);
+      path = (0, import_obsidian5.normalizePath)(`${folder}/${base} ${++n}.md`);
     }
     const quoted = prompt.replace(/\n/g, "\n> ");
     const header = analyst ? `> [!question] \u63D0\u95EE\uFF08\u5206\u6790\u5E08\uFF1A${analyst.emoji} ${analyst.name}\uFF09` : "> [!question] \u63D0\u95EE";
@@ -1144,29 +2188,29 @@ ${output}
   async queueResearch(topic) {
     topic = topic.trim();
     if (!topic) {
-      new import_obsidian4.Notice("Institute: \u4E3B\u9898\u4E3A\u7A7A\u3002");
+      new import_obsidian5.Notice("Institute: \u4E3B\u9898\u4E3A\u7A7A\u3002");
       return;
     }
     try {
       const res = await this.api.enqueueResearch(topic);
       if (res.refused === "cooldown") {
-        new import_obsidian4.Notice(
+        new import_obsidian5.Notice(
           `Institute: \u300C${topic}\u300D\u88AB\u62D2 \u2014 \u51B7\u5374\u4E2D\uFF08\u4E0A\u6B21\u5B8C\u6210\u4E8E ${res.last_completed_at ?? "\u6700\u8FD1"}\uFF09\u3002`,
           8e3
         );
       } else if (res.deduped) {
-        new import_obsidian4.Notice(
+        new import_obsidian5.Notice(
           `Institute: \u300C${topic}\u300D\u5DF2\u5728\u961F\u5217\u4E2D\uFF08\u72B6\u6001\uFF1A${researchStatusZh(res.status ?? "pending")}\uFF0Cid\uFF1A${res.id ?? "?"}\uFF09\u3002`,
           8e3
         );
       } else {
-        new import_obsidian4.Notice(
+        new import_obsidian5.Notice(
           `Institute: \u5DF2\u6392\u961F\u6DF1\u5EA6\u7814\u7A76\u300C${topic}\u300D\uFF08id\uFF1A${res.id ?? "?"}\uFF09\u3002\u5B8C\u6210\u540E\u53EF\u5728\u4EEA\u8868\u76D8\u6253\u5F00\u62A5\u544A\u3002`,
           6e3
         );
       }
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u6DF1\u5EA6\u7814\u7A76\u6392\u961F\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u6DF1\u5EA6\u7814\u7A76\u6392\u961F\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
     }
   }
   async showResearchQueue() {
@@ -1174,11 +2218,11 @@ ${output}
     try {
       items = await this.api.researchQueue();
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u65E0\u6CD5\u83B7\u53D6\u7814\u7A76\u961F\u5217 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u65E0\u6CD5\u83B7\u53D6\u7814\u7A76\u961F\u5217 \u2014 ${errMsg(e)}`, 8e3);
       return;
     }
     if (!items.length) {
-      new import_obsidian4.Notice("Institute: \u7814\u7A76\u961F\u5217\u4E3A\u7A7A\u3002");
+      new import_obsidian5.Notice("Institute: \u7814\u7A76\u961F\u5217\u4E3A\u7A7A\u3002");
       return;
     }
     new PickModal(
@@ -1192,7 +2236,7 @@ ${output}
         if (it.status === "completed") {
           void this.openResearchNote(it.topic, sgtDate(it.finished_at));
         } else {
-          new import_obsidian4.Notice(
+          new import_obsidian5.Notice(
             `Institute: \u300C${it.topic}\u300D\u72B6\u6001\uFF1A${researchStatusZh(it.status)}${it.error ? ` \u2014 ${it.error.slice(0, 120)}` : ""}`,
             6e3
           );
@@ -1224,17 +2268,17 @@ ${output}
   async addWhiteboardTopic(topic, question) {
     topic = topic.trim();
     if (!topic) {
-      new import_obsidian4.Notice("Institute: \u8BAE\u9898\u4E3A\u7A7A\u3002");
+      new import_obsidian5.Notice("Institute: \u8BAE\u9898\u4E3A\u7A7A\u3002");
       return;
     }
     try {
       const row = await this.api.addWhiteboardTopic(topic, question.trim());
-      new import_obsidian4.Notice(
+      new import_obsidian5.Notice(
         `Institute: \u300C${topic}\u300D\u5DF2\u52A0\u5165\u767D\u677F\u8BAE\u9898\u6C60\uFF08#${row.id ?? "?"}\uFF0C\u72B6\u6001\uFF1A${row.status ?? "pending"}\uFF09\u3002`,
         6e3
       );
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u52A0\u5165\u8BAE\u9898\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u52A0\u5165\u8BAE\u9898\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
     }
   }
   // ---- 导出研究 / 仓库体检 -----------------------------------------------------------
@@ -1243,11 +2287,11 @@ ${output}
     try {
       items = await this.api.researchQueue("completed");
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u65E0\u6CD5\u83B7\u53D6\u5DF2\u5B8C\u6210\u7814\u7A76 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u65E0\u6CD5\u83B7\u53D6\u5DF2\u5B8C\u6210\u7814\u7A76 \u2014 ${errMsg(e)}`, 8e3);
       return;
     }
     if (!items.length) {
-      new import_obsidian4.Notice("Institute: \u6CA1\u6709\u5DF2\u5B8C\u6210\u7684\u7814\u7A76\u53EF\u5BFC\u51FA\u3002");
+      new import_obsidian5.Notice("Institute: \u6CA1\u6709\u5DF2\u5B8C\u6210\u7684\u7814\u7A76\u53EF\u5BFC\u51FA\u3002");
       return;
     }
     new PickModal(
@@ -1259,25 +2303,25 @@ ${output}
     ).open();
   }
   async doExportResearch(item) {
-    const notice = new import_obsidian4.Notice(`Institute: \u6B63\u5728\u5BFC\u51FA\u300C${item.topic}\u300D\u2026`, 0);
+    const notice = new import_obsidian5.Notice(`Institute: \u6B63\u5728\u5BFC\u51FA\u300C${item.topic}\u300D\u2026`, 0);
     try {
       const res = await this.api.exportResearch(item.id);
       notice.hide();
-      new import_obsidian4.Notice(`Institute: \u5DF2\u5BFC\u51FA ${res.exported}`, 6e3);
+      new import_obsidian5.Notice(`Institute: \u5DF2\u5BFC\u51FA ${res.exported}`, 6e3);
       await this.openVaultRel(res.exported);
     } catch (e) {
       notice.hide();
-      new import_obsidian4.Notice(`Institute: \u5BFC\u51FA\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u5BFC\u51FA\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
     }
   }
   async vaultDoctorCommand() {
-    const notice = new import_obsidian4.Notice("Institute: \u4ED3\u5E93\u4F53\u68C0\u4E2D\u2026", 0);
+    const notice = new import_obsidian5.Notice("Institute: \u4ED3\u5E93\u4F53\u68C0\u4E2D\u2026", 0);
     let report;
     try {
       report = await this.api.vaultDoctor();
     } catch (e) {
       notice.hide();
-      new import_obsidian4.Notice(`Institute: \u4F53\u68C0\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u4F53\u68C0\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
       return;
     }
     let conflicts = [];
@@ -1296,11 +2340,11 @@ ${output}
     try {
       hits = await this.api.archiveSearch(query, 15);
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u68C0\u7D22\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u68C0\u7D22\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
       return;
     }
     if (!hits.length) {
-      new import_obsidian4.Notice(`Institute: \u6CA1\u6709\u627E\u5230\u4E0E\u300C${query}\u300D\u76F8\u5173\u7684\u6863\u6848\u3002`, 6e3);
+      new import_obsidian5.Notice(`Institute: \u6CA1\u6709\u627E\u5230\u4E0E\u300C${query}\u300D\u76F8\u5173\u7684\u6863\u6848\u3002`, 6e3);
       return;
     }
     const plain = (s) => s.replace(/<\/?b>/g, "").replace(/\s+/g, " ").trim();
@@ -1310,7 +2354,7 @@ ${output}
       (h) => `${plain(h.snippet)} \u2014 ${h.path}`,
       (h) => {
         if (!editor) {
-          new import_obsidian4.Notice("Institute: \u6CA1\u6709\u6D3B\u52A8\u7684\u7F16\u8F91\u5668\uFF0C\u65E0\u6CD5\u63D2\u5165\u5F15\u7528\u3002", 6e3);
+          new import_obsidian5.Notice("Institute: \u6CA1\u6709\u6D3B\u52A8\u7684\u7F16\u8F91\u5668\uFF0C\u65E0\u6CD5\u63D2\u5165\u5F15\u7528\u3002", 6e3);
           return;
         }
         const text = `> \u5F15\u7528\uFF1A${plain(h.snippet)}
@@ -1328,7 +2372,7 @@ ${output}
     try {
       roster = await this.getRoster();
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u65E0\u6CD5\u52A0\u8F7D\u5206\u6790\u5E08\u540D\u518C \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u65E0\u6CD5\u52A0\u8F7D\u5206\u6790\u5E08\u540D\u518C \u2014 ${errMsg(e)}`, 8e3);
       return;
     }
     try {
@@ -1337,7 +2381,7 @@ ${output}
     }
     const items = roster.filter((a) => a.category !== "ops");
     if (!items.length) {
-      new import_obsidian4.Notice("Institute: \u540D\u518C\u4E2D\u6CA1\u6709\u53EF\u8FD0\u884C\u65E5\u62A5\u7684\u5206\u6790\u5E08\u3002");
+      new import_obsidian5.Notice("Institute: \u540D\u518C\u4E2D\u6CA1\u6709\u53EF\u8FD0\u884C\u65E5\u62A5\u7684\u5206\u6790\u5E08\u3002");
       return;
     }
     const mark = (id) => {
@@ -1355,12 +2399,12 @@ ${output}
   async runOneDaily(a) {
     try {
       await this.api.runAnalystDaily(a.id);
-      new import_obsidian4.Notice(
+      new import_obsidian5.Notice(
         `Institute: \u5DF2\u542F\u52A8 ${a.emoji} ${a.name} \u7684\u65E5\u62A5\uFF08\u540E\u53F0\u8FD0\u884C\uFF0C\u5B8C\u6210\u540E\u81EA\u52A8\u5BFC\u51FA\uFF09\u3002`,
         6e3
       );
     } catch (e) {
-      new import_obsidian4.Notice(`Institute: \u542F\u52A8\u65E5\u62A5\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      new import_obsidian5.Notice(`Institute: \u542F\u52A8\u65E5\u62A5\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
     }
   }
   // ---- vault note opening -------------------------------------------------------------
@@ -1368,11 +2412,11 @@ ${output}
   // maps that root into this Obsidian vault (default "Institute").
   subPath(rel) {
     const sub = this.settings.vaultSubfolder.trim().replace(/^\/+|\/+$/g, "");
-    return (0, import_obsidian4.normalizePath)(sub ? `${sub}/${rel}` : rel);
+    return (0, import_obsidian5.normalizePath)(sub ? `${sub}/${rel}` : rel);
   }
   async openFileAt(path) {
-    const f = this.app.vault.getAbstractFileByPath((0, import_obsidian4.normalizePath)(path));
-    if (f instanceof import_obsidian4.TFile) {
+    const f = this.app.vault.getAbstractFileByPath((0, import_obsidian5.normalizePath)(path));
+    if (f instanceof import_obsidian5.TFile) {
       await this.app.workspace.getLeaf().openFile(f);
       return true;
     }
@@ -1385,11 +2429,11 @@ ${output}
    */
   async openBestMatch(folderRel, fragments, fallbackAny = false) {
     const folder = this.app.vault.getAbstractFileByPath(
-      (0, import_obsidian4.normalizePath)(this.subPath(folderRel))
+      (0, import_obsidian5.normalizePath)(this.subPath(folderRel))
     );
-    if (!(folder instanceof import_obsidian4.TFolder)) return false;
+    if (!(folder instanceof import_obsidian5.TFolder)) return false;
     const files = folder.children.filter(
-      (c) => c instanceof import_obsidian4.TFile && c.extension === "md"
+      (c) => c instanceof import_obsidian5.TFile && c.extension === "md"
     );
     let pool = files.filter((f) => fragments.every((s) => s && f.name.includes(s)));
     if (!pool.length && fallbackAny) pool = files;
@@ -1400,7 +2444,7 @@ ${output}
   }
   async openVaultRel(rel) {
     if (await this.openFileAt(this.subPath(rel))) return;
-    new import_obsidian4.Notice(
+    new import_obsidian5.Notice(
       `Institute: \u5728 vault \u4E2D\u627E\u4E0D\u5230 ${this.subPath(rel)} \u2014 \u8BF7\u68C0\u67E5\u300CVault \u5B50\u76EE\u5F55\u300D\u8BBE\u7F6E\u3002`,
       7e3
     );
@@ -1409,19 +2453,19 @@ ${output}
     const folder = `Research/${exportSlug(topic)}`;
     if (date && await this.openFileAt(this.subPath(`${folder}/${date} \u6DF1\u5EA6\u62A5\u544A.md`))) return;
     if (await this.openBestMatch(folder, ["\u6DF1\u5EA6\u62A5\u544A"], true)) return;
-    new import_obsidian4.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
+    new import_obsidian5.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
   }
   async openAnalystDailyNote(analystId, date) {
     const folder = `Analysts/${exportSlug(analystId)}`;
     if (date && await this.openFileAt(this.subPath(`${folder}/${date} \u65E5\u62A5.md`))) return;
     if (await this.openBestMatch(folder, date ? [date] : ["\u65E5\u62A5"], true)) return;
-    new import_obsidian4.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
+    new import_obsidian5.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
   }
   async openWhiteboardNote(topic, date) {
     const slug = exportSlug(topic);
     if (date && await this.openFileAt(this.subPath(`Whiteboard/${date} ${slug}.md`))) return;
     if (await this.openBestMatch("Whiteboard", [slug.slice(0, 16)])) return;
-    new import_obsidian4.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
+    new import_obsidian5.Notice("Institute: \u7B14\u8BB0\u5C1A\u672A\u5BFC\u51FA\u3002", 5e3);
   }
   // ---- Status bar ----------------------------------------------------------
   async refreshStatus() {
@@ -1459,6 +2503,9 @@ ${output}
     if (!Number.isFinite(this.settings.pollIntervalS) || this.settings.pollIntervalS < 5) {
       this.settings.pollIntervalS = DEFAULT_SETTINGS.pollIntervalS;
     }
+    if (!this.settings.roadmapStatusOverrides) {
+      this.settings.roadmapStatusOverrides = {};
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -1476,7 +2523,7 @@ function firstContentLine(body) {
   }
   return "";
 }
-var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
+var InstituteSettingTab = class extends import_obsidian5.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -1484,14 +2531,14 @@ var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian4.Setting(containerEl).setName("\u540E\u7AEF\u5730\u5740 (base URL)").setDesc("Institute One \u540E\u7AEF\u8FD0\u884C\u7684\u5730\u5740\u3002").addText(
+    new import_obsidian5.Setting(containerEl).setName("\u540E\u7AEF\u5730\u5740 (base URL)").setDesc("Institute One \u540E\u7AEF\u8FD0\u884C\u7684\u5730\u5740\u3002").addText(
       (t) => t.setPlaceholder(DEFAULT_SETTINGS.baseUrl).setValue(this.plugin.settings.baseUrl).onChange(async (v) => {
         this.plugin.settings.baseUrl = v.trim().replace(/\/+$/, "") || DEFAULT_SETTINGS.baseUrl;
         await this.plugin.saveSettings();
         void this.plugin.refreshStatus();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Vault \u5B50\u76EE\u5F55").setDesc(
+    new import_obsidian5.Setting(containerEl).setName("Vault \u5B50\u76EE\u5F55").setDesc(
       "\u540E\u7AEF\u5BFC\u51FA\u7B14\u8BB0\u6240\u5728\u7684 vault \u5B50\u76EE\u5F55\uFF08\u5BF9\u5E94\u540E\u7AEF\u7684 vault_dir\uFF09\u3002\u7559\u7A7A\u8868\u793A vault \u6839\u76EE\u5F55\u3002"
     ).addText(
       (t) => t.setPlaceholder(DEFAULT_SETTINGS.vaultSubfolder).setValue(this.plugin.settings.vaultSubfolder).onChange(async (v) => {
@@ -1499,7 +2546,7 @@ var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("\u9ED8\u8BA4\u5206\u6790\u5E08").setDesc("\u63D0\u95EE/\u5199\u4FE1\u65F6\u9884\u9009\u7684\u5206\u6790\u5E08\uFF08\u63D0\u95EE\u540E\u4F1A\u81EA\u52A8\u8BB0\u4F4F\u4E0A\u6B21\u9009\u62E9\uFF09\u3002").addDropdown((dd) => {
+    new import_obsidian5.Setting(containerEl).setName("\u9ED8\u8BA4\u5206\u6790\u5E08").setDesc("\u63D0\u95EE/\u5199\u4FE1\u65F6\u9884\u9009\u7684\u5206\u6790\u5E08\uFF08\u63D0\u95EE\u540E\u4F1A\u81EA\u52A8\u8BB0\u4F4F\u4E0A\u6B21\u9009\u62E9\uFF09\u3002").addDropdown((dd) => {
       dd.addOption("", "\uFF08\u9ED8\u8BA4\u6267\u884C\u624B\uFF0C\u65E0\u4EBA\u683C\uFF09");
       dd.setValue("");
       dd.onChange(async (v) => {
@@ -1516,7 +2563,7 @@ var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
       }).catch(() => {
       });
     });
-    new import_obsidian4.Setting(containerEl).setName("\u56DE\u7B54\u63D2\u5165\u6837\u5F0F").setDesc("\u63D0\u95EE\u7684\u56DE\u7B54\u4EE5 callout \u5F15\u7528\u5757\u8FD8\u662F\u7EAF\u6587\u672C\u63D2\u5165\u3002").addDropdown((dd) => {
+    new import_obsidian5.Setting(containerEl).setName("\u56DE\u7B54\u63D2\u5165\u6837\u5F0F").setDesc("\u63D0\u95EE\u7684\u56DE\u7B54\u4EE5 callout \u5F15\u7528\u5757\u8FD8\u662F\u7EAF\u6587\u672C\u63D2\u5165\u3002").addDropdown((dd) => {
       dd.addOption("callout", "Callout \u5F15\u7528\u5757\uFF08\u63A8\u8350\uFF09");
       dd.addOption("plain", "\u7EAF\u6587\u672C");
       dd.setValue(this.plugin.settings.insertStyle);
@@ -1525,7 +2572,7 @@ var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
         await this.plugin.saveSettings();
       });
     });
-    new import_obsidian4.Setting(containerEl).setName("\u4EEA\u8868\u76D8\u8F6E\u8BE2\u95F4\u9694\uFF08\u79D2\uFF09").setDesc("\u4EEA\u8868\u76D8\u53EF\u89C1\u65F6\u7684\u81EA\u52A8\u5237\u65B0\u95F4\u9694\uFF0C\u6700\u5C0F 5 \u79D2\u3002\u91CD\u65B0\u6253\u5F00\u4EEA\u8868\u76D8\u540E\u751F\u6548\u3002").addText(
+    new import_obsidian5.Setting(containerEl).setName("\u4EEA\u8868\u76D8\u8F6E\u8BE2\u95F4\u9694\uFF08\u79D2\uFF09").setDesc("\u4EEA\u8868\u76D8\u53EF\u89C1\u65F6\u7684\u81EA\u52A8\u5237\u65B0\u95F4\u9694\uFF0C\u6700\u5C0F 5 \u79D2\u3002\u91CD\u65B0\u6253\u5F00\u4EEA\u8868\u76D8\u540E\u751F\u6548\u3002").addText(
       (t) => t.setPlaceholder(String(DEFAULT_SETTINGS.pollIntervalS)).setValue(String(this.plugin.settings.pollIntervalS)).onChange(async (v) => {
         const n = parseInt(v, 10);
         this.plugin.settings.pollIntervalS = Number.isFinite(n) ? Math.max(5, n) : DEFAULT_SETTINGS.pollIntervalS;
@@ -1546,6 +2593,6 @@ var InstituteSettingTab = class extends import_obsidian4.PluginSettingTab {
     ]) {
       ul.createEl("li", { text: line });
     }
-    new import_obsidian4.Setting(containerEl).setName("Vault \u7B14\u8BB0\u5E03\u5C40").setDesc(desc).setDisabled(true);
+    new import_obsidian5.Setting(containerEl).setName("Vault \u7B14\u8BB0\u5E03\u5C40").setDesc(desc).setDisabled(true);
   }
 };

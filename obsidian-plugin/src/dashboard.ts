@@ -130,6 +130,7 @@ export class InstituteDashboardView extends ItemView {
 		actions.style.flexWrap = "wrap";
 		this.actionButton(actions, "提问", () => this.plugin.openAskModal());
 		this.actionButton(actions, "深度研究", () => this.plugin.openResearchPrompt());
+		this.actionButton(actions, "路线图", () => void this.plugin.activateRoadmap());
 		this.actionButton(actions, "打开操作台", () => this.plugin.openOperatorUi());
 
 		// auto-poll while visible; registerInterval is cleared when the view unloads
