@@ -8,6 +8,8 @@ How to use: pick an unchecked item (respect the dependency arrows in §0), paste
 
 Status: ☑ done · ◔ partial · ☐ open. Effort: S < half a day · M ≈ a day · L ≈ days (with an AI agent doing the typing).
 
+Execution tracking: day-to-day work now also flows through the roadmap control plane in [`roadmap/`](./roadmap/) — `roadmap/backlog.json` is the execution-level card board (phases M0–M7; every non-trivial change goes design → card → session → diff → verification → review → release gate → done), viewable as a Kanban in the Obsidian plugin ("Institute: 打开路线图"). This file remains the long-horizon feature map toward the proposal; the two coexist.
+
 ---
 
 ## 0. The map

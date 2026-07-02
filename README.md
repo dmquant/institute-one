@@ -36,21 +36,21 @@ The recursion: **dailies and research emit follow-ups → topics open boards, qu
 ┌────────────────────────────────────────────────────────────────────────┐
 │  app/  (FastAPI + asyncio, TZ=Asia/Singapore)                          │
 │                                                                        │
-│  institute/   analysts · workflows engine · scheduler · daily ·       │
+│  institute/   analysts · workflows engine · scheduler · daily ·        │
 │               analyst_daily · whiteboard · mailbox · research ·        │
 │               archive (FTS5 search)                                    │
 │  router/      executor — the `tasks` audit spine: submit()/spawn(),    │
 │               global semaphore + per-hand mutex, orphan recovery       │
-│  hands/       claude · codex · gemini · opencode CLIs (subprocess,     │
-│               login-shell env capture) · ollama (HTTP) · direct-API    │
-│               fallbacks · per-CLI rate-limit parsers · persistent      │
-│               cooldowns · fallback chains · circuit breaker            │
+│  hands/       claude · codex · gemini · agy · opencode CLIs            │
+│               (subprocess, login-shell env capture) · ollama (HTTP) ·  │
+│               direct-API fallbacks · per-CLI rate-limit parsers ·      │
+│               persistent cooldowns · fallback chains · circuit breaker │
 │  vault/       VaultWriter (atomic writes, sha256 ledger, managed:      │
 │               institute marker, never-clobber conflict siblings)       │
 │  api/         REST · SSE event stream · /api/mcp (MCP JSON-RPC)        │
 │  bus.py       every event → events table + SSE + vault exporter        │
 │                                                                        │
-│  frontend/dist  React operator SPA, served at /                       │
+│  frontend/dist  React operator SPA, served at /                        │
 └────────────────────────────────────────────────────────────────────────┘
   Disk:  ~/.institute-one/{institute.db, workspaces/, archive/, logs/,
          backups/, rate_limits.json}
@@ -82,7 +82,7 @@ npm install -g @google/gemini-cli && gemini               # login
 claude -p "say hi" ; codex exec "say hi" ; echo "say hi" | gemini
 ```
 
-Hands are auto-detected from your login-shell PATH; each can be disabled with `INSTITUTE_ENABLE_<NAME>=false`. No CLI at all? The built-in `echo` hand keeps the system testable.
+Hands are auto-detected from your login-shell PATH (including `agy`, the Google Antigravity CLI, if you have it); each can be disabled with `INSTITUTE_ENABLE_<NAME>=false`. No CLI at all? The built-in `echo` hand keeps the system testable.
 
 ### 1. Install & configure
 
@@ -110,7 +110,7 @@ curl -s -X POST localhost:8100/api/ask -H 'content-type: application/json' \
 ./scripts/install-plugin.sh /path/to/YourVault
 ```
 
-Then in Obsidian: **Settings → Community plugins → enable “Institute One”**. You get a live dashboard sidebar, *Ask the Institute*, *Queue deep research*, vault export/doctor, archive search, mailbox, and analyst-daily triggers — all against `127.0.0.1:8100`. Vault **reading** needs no plugin at all: notes appear under `Institute/` as plain Markdown with Dataview-friendly frontmatter.
+Then in Obsidian: **Settings → Community plugins → enable “Institute One”**. You get a live dashboard sidebar, *Ask the Institute*, *Queue deep research*, vault export/doctor, archive search, mailbox, analyst-daily triggers, and a roadmap Kanban view (*Institute: 打开路线图*) — all against `127.0.0.1:8100`. Vault **reading** needs no plugin at all: notes appear under `Institute/` as plain Markdown with Dataview-friendly frontmatter.
 
 ### 4. (Optional) MCP for Claude Code / Claude Desktop
 
@@ -137,12 +137,12 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
-.venv/bin/python -m pytest tests -q        # 33 tests, run on the echo hand
+.venv/bin/python -m pytest tests -q        # 39 tests, run on the echo hand
 ```
 
 - **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.
-- **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), tasks fall back along `claude ↔ codex ↔ gemini → *-api`. Clear manually: `POST /api/hands/{name}/cooldown/clear`.
-- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically.
+- **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), tasks fall back along `claude ↔ codex ↔ gemini → *-api` (`gemini` and `agy` chain into each other first). Clear manually: `POST /api/hands/{name}/cooldown/clear`.
+- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically. Deep-research steps round-robin the configured research hands (`INSTITUTE_RESEARCH_HANDS`, default `codex,agy`), and their rate-limit fallback stays inside that chain.
 - **Backups**: nightly SQLite backup to `~/.institute-one/backups/` (03:00–05:00 SGT); the vault is a human-readable second copy of every product.
 - **Vault safety**: notes carry `managed: institute`; if you hand-edit a note the institute never clobbers it — updates arrive as `… (institute update <date>).md` siblings; `POST /api/vault/doctor` reports drift.
 - **Restarts are safe but not free**: in-flight tasks are marked `orphaned by restart` at boot and domain loops re-drive from durable rows — still, prefer restarting when the queue is idle (`GET /api/tasks/queue`).
@@ -150,6 +150,28 @@ tail -f ~/.institute-one/logs/server.log   # logs
 ## Roadmap — and you can vibe it yourself
 
 v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md). The rest is mapped, grounded, and **written to be built by you with an AI coding agent**: **[`ROADMAP.md`](./ROADMAP.md)** breaks every remaining feature into self-contained milestones — each grounded in the proposal section it implements, the legacy source it ports from, and the files to touch; keystone items carry a ready-to-paste prompt for Claude Code / Codex / Gemini. Pick a box, prompt your agent, review the diff, keep `pytest -q` green, tick it off.
+
+There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M7), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. The Obsidian plugin renders it as a roadmap Kanban view (command *Institute: 打开路线图*) and can export the board as a Markdown note. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
+
+The execution track so far (statuses from `backlog.json`, 2026-07-02 — 3 done · 6 ready · 6 inbox of 15 seed cards):
+
+```mermaid
+flowchart LR
+    M0["M0 ☑ Research hands<br/>codex+agy round-robin"]
+    M1["M1 ◔ Thesis registry<br/>1/4 done"]
+    M2["M2 ☐ Securities & stock map"]
+    M3["M3 ☐ Thesis-aware research"]
+    M4["M4 ☐ Market data & PIT store"]
+    M5["M5 ☐ Forecast ledger"]
+    M6["M6 ☐ Alpha & paper book"]
+    M7["M7 ◔ Control plane<br/>plugin Kanban ✅ · backend API next"]
+    M0 --> M1 --> M2
+    M1 & M2 --> M3
+    M2 --> M4 --> M5 --> M6
+    M1 --> M5
+```
+
+And the long-horizon dependency map to the full proposal:
 
 ```mermaid
 flowchart LR

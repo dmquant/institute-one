@@ -33,23 +33,23 @@
 
 ```
         一台机器 · 一个进程 · 127.0.0.1:8100 · 回环地址免鉴权
-┌────────────────────────────────────────────────────────────────────┐
-│  app/  (FastAPI + asyncio, TZ=Asia/Singapore)                      │
-│                                                                    │
-│  institute/  分析师名册 · 工作流引擎 · 调度器 · 晨报/日报 ·         │
-│              分析师日报 · 白板 · 信箱 · 深度研究 · 档案(FTS5检索)   │
-│  router/     executor — `tasks` 审计主轴：submit()/spawn()、        │
-│              全局信号量 + 每手互斥锁、重启孤儿回收                  │
-│  hands/      claude · codex · gemini · opencode CLI（子进程，       │
+┌──────────────────────────────────────────────────────────────────────┐
+│  app/  (FastAPI + asyncio, TZ=Asia/Singapore)                        │
+│                                                                      │
+│  institute/  分析师名册 · 工作流引擎 · 调度器 · 晨报/日报 ·          │
+│              分析师日报 · 白板 · 信箱 · 深度研究 · 档案(FTS5检索)    │
+│  router/     executor — `tasks` 审计主轴：submit()/spawn()、         │
+│              全局信号量 + 每手互斥锁、重启孤儿回收                   │
+│  hands/      claude · codex · gemini · agy · opencode CLI（子进程，  │
 │              登录 shell 环境捕获）· ollama (HTTP) · 直连 API 兜底 ·  │
 │              每 CLI 限额签名解析 · 持久冷却 · 回退链 · 熔断器        │
-│  vault/      VaultWriter（原子写入、sha256 台账、managed:institute  │
-│              标记、绝不覆盖人工编辑——冲突写并行副本）               │
-│  api/        REST · SSE 事件流 · /api/mcp (MCP JSON-RPC)           │
-│  bus.py      每个事件 → events 表 + SSE + 仓库导出器                │
-│                                                                    │
-│  frontend/dist  React 操作台 SPA，挂载在 /                         │
-└────────────────────────────────────────────────────────────────────┘
+│  vault/      VaultWriter（原子写入、sha256 台账、managed:institute   │
+│              标记、绝不覆盖人工编辑——冲突写并行副本）                │
+│  api/        REST · SSE 事件流 · /api/mcp (MCP JSON-RPC)             │
+│  bus.py      每个事件 → events 表 + SSE + 仓库导出器                 │
+│                                                                      │
+│  frontend/dist  React 操作台 SPA，挂载在 /                           │
+└──────────────────────────────────────────────────────────────────────┘
   磁盘:  ~/.institute-one/{institute.db, workspaces/, archive/, logs/,
         backups/, rate_limits.json}
   仓库:  $INSTITUTE_VAULT_DIR（如 <你的Vault>/Institute）——可重建的投影；
@@ -79,7 +79,7 @@ npm install -g @google/gemini-cli && gemini               # 登录
 claude -p "你好" ; codex exec "你好" ; echo "你好" | gemini
 ```
 
-手（hand）从登录 shell 的 PATH 自动探测；任何一只可用 `INSTITUTE_ENABLE_<名字>=false` 关闭。一只 CLI 都没有？内置 `echo` 手保证系统可测试。
+手（hand）从登录 shell 的 PATH 自动探测（若已安装 `agy`，即 Google Antigravity CLI，同样会被探测到）；任何一只可用 `INSTITUTE_ENABLE_<名字>=false` 关闭。一只 CLI 都没有？内置 `echo` 手保证系统可测试。
 
 ### 1. 安装与配置
 
@@ -107,7 +107,7 @@ curl -s -X POST localhost:8100/api/ask -H 'content-type: application/json' \
 ./scripts/install-plugin.sh /path/to/你的Vault
 ```
 
-然后在 Obsidian：**设置 → 第三方插件 → 启用 “Institute One”**。你会得到：实时仪表盘侧边栏、向研究所提问、排队深度研究、仓库导出/体检、档案检索、写信给分析师、触发分析师日报——全部直连 `127.0.0.1:8100`。**只读仓库内容完全不需要插件**：笔记以纯 Markdown + Dataview 友好 frontmatter 出现在 `Institute/` 下。
+然后在 Obsidian：**设置 → 第三方插件 → 启用 “Institute One”**。你会得到：实时仪表盘侧边栏、向研究所提问、排队深度研究、仓库导出/体检、档案检索、写信给分析师、触发分析师日报、以及路线图看板视图（*Institute: 打开路线图*）——全部直连 `127.0.0.1:8100`。**只读仓库内容完全不需要插件**：笔记以纯 Markdown + Dataview 友好 frontmatter 出现在 `Institute/` 下。
 
 ### 4.（可选）给 Claude Code / Claude Desktop 配 MCP
 
@@ -134,12 +134,12 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # 停止
 tail -f ~/.institute-one/logs/server.log   # 日志
-.venv/bin/python -m pytest tests -q        # 33 个测试，跑在 echo 手上
+.venv/bin/python -m pytest tests -q        # 39 个测试，跑在 echo 手上
 ```
 
 - **暂停一切新开工**：把 `admin_state` 的 `maintenance` 设为 `{"paused": true}` —— 开板/扫队任务跳过，进行中的自然收尾。
-- **额度撞墙**：每 CLI 的限额签名会被识别，冷却写入 `~/.institute-one/rate_limits.json`（从不自动缩短），任务沿 `claude ↔ codex ↔ gemini → *-api` 回退。手动解除：`POST /api/hands/{name}/cooldown/clear`。
-- **一只 CLI 同时只跑一个任务**（每手互斥锁）。并行度来自多只手；分析师日报自动在 claude/codex/gemini 间轮转。
+- **额度撞墙**：每 CLI 的限额签名会被识别，冷却写入 `~/.institute-one/rate_limits.json`（从不自动缩短），任务沿 `claude ↔ codex ↔ gemini → *-api` 回退（`gemini` 与 `agy` 会优先互为回退）。手动解除：`POST /api/hands/{name}/cooldown/clear`。
+- **一只 CLI 同时只跑一个任务**（每手互斥锁）。并行度来自多只手；分析师日报自动在 claude/codex/gemini 间轮转。深度研究各步骤则在配置的研究手（`INSTITUTE_RESEARCH_HANDS`，默认 `codex,agy`）之间轮转，其限额回退也只在该链条内进行。
 - **备份**：每晚（SGT 03:00–05:00）SQLite 备份到 `~/.institute-one/backups/`；仓库本身就是所有成果的人类可读副本。
 - **仓库安全**：笔记带 `managed: institute` 标记；你手改过的笔记绝不会被覆盖——更新会以 `…（institute update <日期>）.md` 并行副本出现；`POST /api/vault/doctor` 报告漂移。
 - **重启安全但有代价**：启动时未完成任务标记为「重启孤儿」，各循环从持久行自愈——但仍建议在队列空闲时重启（`GET /api/tasks/queue`）。
@@ -147,6 +147,28 @@ tail -f ~/.institute-one/logs/server.log   # 日志
 ## 路线图——你可以自己「vibe」出来
 
 v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研究所设计的 MVP 切片（约 25%）。其余部分已经全部规划、落地核实，并且**专门写成可由你 + AI 编程 agent 自行实现的形态**：**[`ROADMAP.md`](./ROADMAP.md)** 把每个剩余特性拆成自包含的里程碑——标注它实现提案的哪一节、从哪个前身项目移植、要动哪些文件，关键项还附带可直接粘贴给 Claude Code / Codex / Gemini 的提示词。选一个未勾选项，让 agent 开工，审查 diff，保持 `pytest -q` 全绿，打勾。
+
+此外，[`roadmap/`](./roadmap/) 里还有一个执行层的**路线图控制平面**：设计文档加一块机器可读的卡片看板（`backlog.json`，阶段 M0–M7），所有非平凡改动都按 设计 → 卡片 → 编码会话 → diff → 验证 → 评审 → 发布门禁 → 完成 的流程推进。Obsidian 插件会把它渲染成路线图看板视图（命令 *Institute: 打开路线图*），并可将看板导出为 Markdown 笔记。`ROADMAP.md` 仍是长线特性地图；`roadmap/` 负责单张卡片的落地执行。
+
+当前执行进度（状态取自 `backlog.json`，2026-07-02——15 张种子卡片中 3 张完成 · 6 张就绪 · 6 张待定）：
+
+```mermaid
+flowchart LR
+    M0["M0 ☑ 研究手策略<br/>codex+agy 轮转"]
+    M1["M1 ◔ 论点注册表<br/>1/4 完成"]
+    M2["M2 ☐ 证券主档与股票映射"]
+    M3["M3 ☐ 论点感知研究队列"]
+    M4["M4 ☐ 行情数据与 PIT 存储"]
+    M5["M5 ☐ 预测台账"]
+    M6["M6 ☐ Alpha 与纸面账本"]
+    M7["M7 ◔ 控制平面<br/>插件看板 ✅ · 后端 API 待建"]
+    M0 --> M1 --> M2
+    M1 & M2 --> M3
+    M2 --> M4 --> M5 --> M6
+    M1 --> M5
+```
+
+通往完整提案的长线依赖图：
 
 ```mermaid
 flowchart LR
