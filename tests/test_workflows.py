@@ -67,6 +67,38 @@ class GatedHand(Hand):
         return HandResult(output="late finish", exit_code=0)
 
 
+class RecordingHand(Hand):
+    hand_type = "cli"
+
+    def __init__(self, name: str):
+        self.name = name
+        self.calls = 0
+
+    async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None):
+        self.calls += 1
+        return HandResult(output=f"{self.name} done", exit_code=0)
+
+
+async def test_research_workflow_uses_configured_research_hands(monkeypatch):
+    await workflows.reconcile_from_disk()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "research_hands", "codex,agy")
+    codex = RecordingHand("codex")
+    agy = RecordingHand("agy")
+    get_registry().register(codex)
+    get_registry().register(agy)
+
+    run = await workflows.run_workflow_and_wait("research", variables={"TOPIC": "AI"}, source="test")
+
+    assert run["status"] == "completed"
+    tasks = await executor.list_tasks(parent_run_id=run["id"], limit=20)
+    assert len(tasks) == 7
+    assert {t["requested_hand"] for t in tasks} <= {"codex", "agy"}
+    assert {t["hand"] for t in tasks} <= {"codex", "agy"}
+    assert codex.calls > 0
+    assert agy.calls > 0
+
+
 async def test_cancel_run_stops_between_steps(monkeypatch):
     await workflows.reconcile_from_disk()
     gated = GatedHand()

@@ -20,10 +20,11 @@ atexit.register(shutil.rmtree, _TMP_ROOT, True)
 
 os.environ["INSTITUTE_HOME"] = str(_TMP_ROOT / "home")
 os.environ["INSTITUTE_VAULT_DIR"] = str(_TMP_ROOT / "vault")
-for _flag in ("CLAUDE", "CODEX", "GEMINI", "OPENCODE", "OLLAMA"):
+for _flag in ("CLAUDE", "CODEX", "GEMINI", "OPENCODE", "OLLAMA", "AGY"):
     os.environ[f"INSTITUTE_ENABLE_{_flag}"] = "false"
 os.environ["INSTITUTE_ENABLE_ECHO"] = "true"
 os.environ["INSTITUTE_DEFAULT_HAND"] = "echo"
+os.environ["INSTITUTE_RESEARCH_HANDS"] = "echo"
 
 from app import config  # noqa: E402
 

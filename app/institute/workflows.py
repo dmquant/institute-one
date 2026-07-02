@@ -143,6 +143,19 @@ async def _finish_run(run_id: str, status: str, *, error: str | None = None) -> 
     )
 
 
+def _workflow_hand_policy(
+    workflow_id: str,
+    step: dict[str, Any],
+    analyst_hand: str | None,
+    step_index: int,
+) -> tuple[str, tuple[str, ...] | None]:
+    settings = get_settings()
+    if workflow_id == "research":
+        hands = settings.research_hand_names
+        return str(step.get("hand") or hands[step_index % len(hands)]), hands
+    return str(step.get("hand") or analyst_hand or settings.default_hand), None
+
+
 async def _drive(run_id: str) -> None:
     """Run all steps in order. Must never raise (spawned via create_task)."""
     settings = get_settings()
@@ -178,11 +191,13 @@ async def _drive(run_id: str) -> None:
                 context_blocks=[previous_steps_block(prior)],
                 output_file=step.get("output_file"),
             )
+            hand, fallback_chain = _workflow_hand_policy(run["workflow_id"], step, analyst.hand, i)
             task = await executor.submit(
-                analyst.hand or settings.default_hand, full_prompt,
+                hand, full_prompt,
                 source=run["source"], model=analyst.model,
                 session_id=session["id"], parent_run_id=run_id, workspace=workspace,
                 timeout_s=step.get("timeout_s") or settings.default_timeout_s,
+                fallback_chain=fallback_chain,
             )
 
             output_file = step.get("output_file")

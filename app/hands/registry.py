@@ -127,14 +127,22 @@ class HandRegistry:
 
     def resolve(self, name: str, *, allow_fallback: bool = True) -> tuple[Hand | None, list[str]]:
         """Pick the hand to run. Returns (hand_or_None, tried_names)."""
-        tried: list[str] = []
         candidates = [name] + (DEFAULT_FALLBACK_CHAINS.get(name, []) if allow_fallback else [])
+        return self.resolve_chain(candidates)
+
+    def resolve_chain(self, candidates: list[str]) -> tuple[Hand | None, list[str]]:
+        """Pick the first available hand from an explicit fallback chain."""
+        tried: list[str] = []
         for cand in candidates:
+            if cand in tried:
+                continue
             tried.append(cand)
             if self.is_available(cand):
                 return self._hands[cand], tried
         # last resort: accept a degraded hand rather than fail outright
         for cand in candidates:
+            if cand not in tried:
+                tried.append(cand)
             if self.is_available(cand, allow_degraded=True):
                 return self._hands[cand], tried
         return None, tried

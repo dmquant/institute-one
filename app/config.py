@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Execution
     max_concurrent: int = 3
     default_hand: str = "claude"
+    research_hands: str = "codex,agy"
     default_timeout_s: int = 1800
     output_cap_bytes: int = 200_000  # tasks.output column cap
 
@@ -118,6 +119,11 @@ class Settings(BaseSettings):
     @property
     def frontend_dist(self) -> Path:
         return self.repo_root / "frontend" / "dist"
+
+    @property
+    def research_hand_names(self) -> tuple[str, ...]:
+        names = tuple(h.strip() for h in self.research_hands.split(",") if h.strip())
+        return names or (self.default_hand,)
 
 
 @lru_cache(maxsize=1)

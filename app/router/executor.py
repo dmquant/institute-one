@@ -18,7 +18,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .. import bus, db
 from ..config import get_settings
@@ -110,7 +110,19 @@ async def _finish(task_id: str, status: str, **fields: Any) -> None:
     await bus.emit(f"task.{status}", "task", task_id, {"status": status})
 
 
-async def _execute(task_id: str, *, on_chunk: OnChunk | None = None, allow_fallback: bool = True) -> Task:
+def _fallback_candidates(requested: str, fallback_chain: Sequence[str] | None) -> list[str] | None:
+    if fallback_chain is None:
+        return None
+    return [requested, *(h for h in fallback_chain if h != requested)]
+
+
+async def _execute(
+    task_id: str,
+    *,
+    on_chunk: OnChunk | None = None,
+    allow_fallback: bool = True,
+    fallback_chain: Sequence[str] | None = None,
+) -> Task:
     settings = get_settings()
     registry = get_registry()
     row = await db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -122,7 +134,11 @@ async def _execute(task_id: str, *, on_chunk: OnChunk | None = None, allow_fallb
     timeout_s: int = row["timeout_s"] or settings.default_timeout_s
     workspace = Path(row["workspace_dir"])
 
-    hand, tried = registry.resolve(requested, allow_fallback=allow_fallback)
+    candidates = _fallback_candidates(requested, fallback_chain) if allow_fallback else None
+    if candidates is None:
+        hand, tried = registry.resolve(requested, allow_fallback=allow_fallback)
+    else:
+        hand, tried = registry.resolve_chain(candidates)
     await db.execute("UPDATE tasks SET tried = ? WHERE id = ?", (json.dumps(tried), task_id))
     if hand is None:
         await _finish(task_id, "rate_limited", error=f"no hand available (tried: {', '.join(tried)})")
@@ -165,7 +181,10 @@ async def _execute(task_id: str, *, on_chunk: OnChunk | None = None, allow_fallb
         registry.record_result(hand.name, ok=False, rate_limited=True)
         # one automatic retry on the next hand in the chain
         if allow_fallback:
-            nxt, _ = registry.resolve(requested, allow_fallback=True)
+            if candidates is None:
+                nxt, _ = registry.resolve(requested, allow_fallback=True)
+            else:
+                nxt, _ = registry.resolve_chain(candidates)
             if nxt is not None and nxt.name != hand.name:
                 await db.execute(
                     "UPDATE tasks SET status='queued', hand=NULL, started_at=NULL WHERE id=? AND status='running'",
@@ -174,7 +193,12 @@ async def _execute(task_id: str, *, on_chunk: OnChunk | None = None, allow_fallb
                 # row may already be terminal if cancelled; only retry if requeue succeeded
                 check = await db.query_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
                 if check and check["status"] == "queued":
-                    return await _execute(task_id, on_chunk=on_chunk, allow_fallback=allow_fallback)
+                    return await _execute(
+                        task_id,
+                        on_chunk=on_chunk,
+                        allow_fallback=allow_fallback,
+                        fallback_chain=fallback_chain,
+                    )
         await _finish(
             task_id, "rate_limited",
             output=output, exit_code=result.exit_code,
@@ -204,6 +228,7 @@ async def submit(
     workspace: Path | None = None,
     timeout_s: int | None = None,
     fallback: bool = True,
+    fallback_chain: Sequence[str] | None = None,
     on_chunk: OnChunk | None = None,
 ) -> Task:
     """Run a hand and wait for the result. THE way to invoke a model."""
@@ -216,7 +241,9 @@ async def submit(
         session_id=session_id, parent_run_id=parent_run_id, workspace=ws,
         timeout_s=timeout_s or settings.default_timeout_s,
     )
-    atask = asyncio.ensure_future(_execute(task_id, on_chunk=on_chunk, allow_fallback=fallback))
+    atask = asyncio.ensure_future(
+        _execute(task_id, on_chunk=on_chunk, allow_fallback=fallback, fallback_chain=fallback_chain)
+    )
     _running[task_id] = atask
     try:
         return await atask
@@ -232,6 +259,7 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     ws.mkdir(parents=True, exist_ok=True)
     on_chunk = kwargs.pop("on_chunk", None)
     fallback = kwargs.pop("fallback", True)
+    fallback_chain = kwargs.pop("fallback_chain", None)
     timeout_s = kwargs.pop("timeout_s", None) or settings.default_timeout_s
     await _create_row(
         task_id=task_id, hand=hand, prompt=prompt,
@@ -239,7 +267,9 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
         session_id=kwargs.pop("session_id", None), parent_run_id=kwargs.pop("parent_run_id", None),
         workspace=ws, timeout_s=timeout_s,
     )
-    atask = asyncio.create_task(_execute(task_id, on_chunk=on_chunk, allow_fallback=fallback))
+    atask = asyncio.create_task(
+        _execute(task_id, on_chunk=on_chunk, allow_fallback=fallback, fallback_chain=fallback_chain)
+    )
     _running[task_id] = atask
     atask.add_done_callback(lambda _t: _running.pop(task_id, None))
     return task_id
