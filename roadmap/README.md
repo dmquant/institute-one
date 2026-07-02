@@ -28,7 +28,7 @@ The card is not just a ticket. It is the control record for the coding process. 
 
 ## Execution Map
 
-Seed backlog: 15 cards across phases M0–M7 (3 done · 6 ready · 6 inbox as of 2026-07-02). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001) lands.
+Seed backlog: 16 cards across phases M0–M7 (3 done · 1 in review · 5 ready · 7 inbox as of 2026-07-02). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001, in review) is deployed and wired (M7-003).
 
 ```mermaid
 flowchart LR
@@ -39,7 +39,7 @@ flowchart LR
     M4["M4 ☐ Market data & PIT store"]
     M5["M5 ☐ Forecast ledger"]
     M6["M6 ☐ Alpha & paper book<br/>cards TBD"]
-    M7["M7 ◔ Roadmap control plane<br/>plugin Kanban shipped · backend API next"]
+    M7["M7 ◔ Roadmap control plane<br/>plugin Kanban shipped · backend API in review"]
     M0 --> M1 --> M2
     M2 -. "unlocks bundle import (M1-003)" .-> M1
     M1 & M2 --> M3

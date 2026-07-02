@@ -150,7 +150,7 @@ v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研
 
 此外，[`roadmap/`](./roadmap/) 里还有一个执行层的**路线图控制平面**：设计文档加一块机器可读的卡片看板（`backlog.json`，阶段 M0–M7），所有非平凡改动都按 设计 → 卡片 → 编码会话 → diff → 验证 → 评审 → 发布门禁 → 完成 的流程推进。Obsidian 插件会把它渲染成路线图看板视图（命令 *Institute: 打开路线图*），并可将看板导出为 Markdown 笔记。`ROADMAP.md` 仍是长线特性地图；`roadmap/` 负责单张卡片的落地执行。
 
-当前执行进度（状态取自 `backlog.json`，2026-07-02——15 张种子卡片中 3 张完成 · 6 张就绪 · 6 张待定）：
+当前执行进度（状态取自 `backlog.json`，2026-07-02——16 张种子卡片中 3 张完成 · 1 张评审中 · 5 张就绪 · 7 张待定）：
 
 ```mermaid
 flowchart LR
@@ -161,7 +161,7 @@ flowchart LR
     M4["M4 ☐ 行情数据与 PIT 存储"]
     M5["M5 ☐ 预测台账"]
     M6["M6 ☐ Alpha 与纸面账本"]
-    M7["M7 ◔ 控制平面<br/>插件看板 ✅ · 后端 API 待建"]
+    M7["M7 ◔ 控制平面<br/>插件看板 ✅ · 后端 API 评审中"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
     M2 --> M4 --> M5 --> M6
