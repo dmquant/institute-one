@@ -211,7 +211,7 @@
       "title": "Add roadmap schema and seed import",
       "type": "schema",
       "phase": "M7 Roadmap Control Plane",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
@@ -303,6 +303,26 @@
         "prompt generation is deterministic for the same card state"
       ],
       "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+    },
+    {
+      "id": "M7-008",
+      "title": "Roadmap decisions, claim, export, and checklist/dependency CRUD",
+      "type": "feature",
+      "phase": "M7 Roadmap Control Plane",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "low",
+      "summary": "Implement the 02-data-model.md surface deferred out of M7-001: decision records (roadmap_decisions and roadmap_release_gates are pre-created but unused), POST /cards and /claim, checklist item CRUD, dependency add/remove routes, and GET /export.",
+      "design_links": ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
+      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      "dependencies": ["M7-001"],
+      "acceptance": [
+        "decisions can be opened and resolved with decision.opened/decision.resolved events",
+        "cards can be created and claimed via the API",
+        "checklist items and dependencies have add/check/remove routes",
+        "GET /export produces a backlog-compatible JSON snapshot"
+      ],
+      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
     }
   ]
 }
