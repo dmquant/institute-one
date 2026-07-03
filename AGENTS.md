@@ -25,7 +25,7 @@ Tests use `pytest` and `pytest-asyncio`; name files `tests/test_*.py`. `tests/co
 
 ## Commit & Pull Request Guidelines
 
-Git history uses short, descriptive subjects such as `Add agy hand (Google Antigravity CLI)`. Keep commits focused and name the changed subsystem when useful. Pull requests should include a summary, test/build results, linked issues when applicable, screenshots for UI changes, and notes for migrations or configuration changes.
+Git history uses short, descriptive subjects such as `Add agy hand (Google Antigravity CLI)`. Keep commits focused and name the changed subsystem when useful. When landing a notable batch, add a dated entry to `CHANGELOG.md`. Pull requests should include a summary, test/build results, linked issues when applicable, screenshots for UI changes, and notes for migrations or configuration changes.
 
 ## Operating Constraints
 

@@ -2,7 +2,7 @@
 
 **一台机器、一个 Python 进程、一个 SQLite 文件、一个 Obsidian 仓库。** 一支 AI 分析师团队在你自己的电脑上写晨报、上白板辩论、回信箱、跑深度研究——用的是你已经在付费的 agent CLI（Claude Code / Codex / Gemini）。
 
-[English README →](./README.md)
+[English README →](./README.md) · [更新日志](./CHANGELOG.md)
 
 ![仪表盘](docs/screenshots/dashboard.png)
 

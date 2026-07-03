@@ -2,7 +2,7 @@
 
 **A single-node AI research institute.** One Python process, one SQLite file, one Obsidian vault — a roster of AI analysts that writes briefings, debates on whiteboards, answers mail, and runs deep research on your own machine, using the agent CLIs you already pay for.
 
-[简体中文文档 →](./README.zh-CN.md)
+[简体中文文档 →](./README.zh-CN.md) · [Changelog](./CHANGELOG.md)
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
