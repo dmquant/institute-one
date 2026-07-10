@@ -28,7 +28,7 @@ The card is not just a ticket. It is the control record for the coding process. 
 
 ## Execution Map
 
-Seed backlog: 16 cards across phases M0–M7 (3 done · 1 in review · 5 ready · 7 inbox as of 2026-07-02). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001, in review) is deployed and wired (M7-003).
+Seed backlog: 16 cards across phases M0–M7 (3 done · 2 in review · 4 ready · 7 inbox as of 2026-07-03). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001, in review) is deployed and wired (M7-003).
 
 ```mermaid
 flowchart LR

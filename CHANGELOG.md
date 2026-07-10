@@ -2,6 +2,17 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-07-03 — Thesis schema (M1-001) and the PR #1 review
+
+### Added
+- **Thesis schema migration — card M1-001** (in review): additive `migrations/0003_theses.sql` — `theses` (lifecycle CHECK `candidate|active|watch|dormant|retired`; lanes as `kind='lane'` rows per the bootstrap contract), `thesis_versions` (per-thesis version counter, `supersedes_id` linkage, history preserved across updates), and `market_thesis_imports`/`market_thesis_import_items` provenance (manifest fields, `bundle_sha256`, dry-run/apply modes, idempotency enforced only for completed applies so failed imports never brick a retry). 16 new schema-level tests; suite 49 → 65.
+
+### Changed
+- External **PR #1 reviewed** (four-subsystem adversarial review): verdict is *selective adoption* — roughly half the PR independently implements planned roadmap work (Phase 1b market data, Phase 2 quality detection, Phase 3 evidence/claims) and is worth re-implementing against current main in tranches; wholesale merge is not viable (predates the M0 research-hand policy, migration-number collisions, prompt-surface and rate-limit-signature rule violations). See the "Open pull requests" section below.
+
+### Fixed
+- `tests/test_roadmap.py` no longer hardcodes seed card statuses (two tests broke when M7-001 moved to `review` on the board); assertions now derive from `backlog.json`.
+
 ## 2026-07-02 — Roadmap control plane, research-hand policy, bilingual docs
 
 ### Added
@@ -28,4 +39,4 @@ Notable changes to institute-one, grouped by push batch (dates are SGT work date
 
 ## Open pull requests
 
-- **[#1 Add routing, data, and evidence hardening](https://github.com/dmquant/institute-one/pull/1)** (external, opened 2026-06-13, 55 files, +3,952/−182) — pooled hand routing and cheap-tier routing, market-data cache/API (optional IBKR bars, SEC/FMP snapshots) with research data-bundle injection, evidence URL ledger and claim triage, `.env`-aware start/stop and daemonized startup. Not yet reviewed or merged; predates the 2026-07-02 batch, so it overlaps the M0 executor changes and several ROADMAP Phase-0/1b items and will need rebasing.
+- **[#1 Add routing, data, and evidence hardening](https://github.com/dmquant/institute-one/pull/1)** (external, opened 2026-06-13, 55 files, +3,952/−182) — pooled hand routing and cheap-tier routing, market-data cache/API (optional IBKR bars, SEC/FMP snapshots) with research data-bundle injection, evidence URL ledger and claim triage, `.env`-aware start/stop and daemonized startup. Reviewed 2026-07-03: **selective adoption** — will not merge as-is (conflicts with the M0 research-hand policy, migration-number collisions with `0002_roadmap.sql`+, prompt-surface and rate-limit-signature hard-rule violations); ~10 roadmap-aligned components queued for re-implementation against current main in tranches (market data → M4 cards; quality/evidence/claims → new M8 cards; ops daemonization → new M9 cards). Awaiting operator sign-off on the tranche plan and the PR reply.

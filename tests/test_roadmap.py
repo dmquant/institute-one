@@ -13,6 +13,14 @@ from app.institute import roadmap
 BACKLOG = Path(__file__).resolve().parent.parent / "roadmap" / "backlog.json"
 SEED = json.loads(BACKLOG.read_text(encoding="utf-8"))
 N_CARDS = len(SEED["cards"])
+# the seed is a living board — assert against its current M7-001 status, not a snapshot
+M7_STATUS = next(c for c in SEED["cards"] if c["id"] == "M7-001").get("status", "inbox")
+
+
+def _seed_gate(*prefixes: str) -> tuple[int, int]:
+    """(total, done) computed from the living seed for the given milestone prefixes."""
+    scoped = [c for c in SEED["cards"] if c.get("phase", "").split(" ")[0] in prefixes]
+    return len(scoped), sum(1 for c in scoped if c.get("status") == "done")
 
 
 def _seed_copy() -> dict:
@@ -34,7 +42,7 @@ async def test_import_is_idempotent_and_updates_changed_fields(tmp_path):
 
     card = await roadmap.get_card("M7-001")
     assert card["updated_at"] == first_updated_at
-    assert card["status"] == "ready"
+    assert card["status"] == M7_STATUS
     assert card["verification"] == [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
     assert card["design_links"] == ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"]
     assert card["expected_files"] == [
@@ -44,29 +52,35 @@ async def test_import_is_idempotent_and_updates_changed_fields(tmp_path):
     acceptance = [c for c in card["checklists"] if c["kind"] == "acceptance"]
     assert len(acceptance) == 4  # merged by text, never duplicated
 
-    # a changed seed updates fields but local status wins unless force
+    # a changed seed updates fields but local status wins unless force. The flip
+    # runs on a synthetic card with a pinned status: the live board's M7-001 may
+    # itself drift to 'parked', where a force would emit no status_forced event.
     data = _seed_copy()
-    target = next(c for c in data["cards"] if c["id"] == "M7-001")
-    target["title"] = "Roadmap durable backend"
-    target["status"] = "parked"
+    next(c for c in data["cards"] if c["id"] == "M7-001")["title"] = "Roadmap durable backend"
+    data["cards"].append({
+        "id": "M7-TMPF", "title": "temp force-flip card",
+        "phase": "M7 Roadmap Control Plane", "status": "ready",
+    })
     seed2 = tmp_path / "backlog.json"
     seed2.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
     res3 = await roadmap.import_backlog(seed2)
-    assert res3 == {"created": 0, "updated": 1, "unchanged": N_CARDS - 1, "total": N_CARDS}
-    card = await roadmap.get_card("M7-001")
-    assert card["title"] == "Roadmap durable backend"
-    assert card["status"] == "ready"  # local status preserved
+    assert res3 == {"created": 1, "updated": 1, "unchanged": N_CARDS - 1, "total": N_CARDS + 1}
+    assert (await roadmap.get_card("M7-001"))["title"] == "Roadmap durable backend"
+
+    next(c for c in data["cards"] if c["id"] == "M7-TMPF")["status"] = "parked"
+    seed2.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await roadmap.import_backlog(seed2)
+    assert (await roadmap.get_card("M7-TMPF"))["status"] == "ready"  # local status preserved
 
     await roadmap.import_backlog(seed2, force=True)
-    card = await roadmap.get_card("M7-001")
-    assert card["status"] == "parked"
+    assert (await roadmap.get_card("M7-TMPF"))["status"] == "parked"
 
     events = await bus.replay(0, types=["roadmap.import.completed"])
-    assert len(events) == 4
+    assert len(events) == 5
     forced = await bus.replay(0, types=["roadmap.import.status_forced"])
     assert len(forced) == 1  # forced flips stay on the audit trail
-    assert forced[0].ref_id == "M7-001"
+    assert forced[0].ref_id == "M7-TMPF"
     assert forced[0].payload == {"from": "ready", "to": "parked"}
 
 
@@ -127,45 +141,67 @@ async def test_reimport_reconciles_dropped_dependencies(tmp_path):
 
 # ---- (c) move rules ----------------------------------------------------------
 
-async def test_move_to_done_gated_by_dependencies_and_override():
-    await roadmap.import_backlog()
+async def test_move_to_done_gated_by_dependencies_and_override(tmp_path):
+    # self-contained pair with pinned statuses: the gate assertions must not
+    # depend on the live board (any non-done dependency blocks done)
+    data = _seed_copy()
+    data["cards"].append({
+        "id": "M7-TMPD", "title": "temp dependency card",
+        "phase": "M7 Roadmap Control Plane", "status": "ready",
+    })
+    data["cards"].append({
+        "id": "M7-TMPG", "title": "temp gated card",
+        "phase": "M7 Roadmap Control Plane", "dependencies": ["M7-TMPD"],
+    })
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await roadmap.import_backlog(seed)
 
-    # M7-003 depends on M7-001 which is 'ready' -> done is blocked
-    with pytest.raises(roadmap.RoadmapError, match="M7-001"):
-        await roadmap.move("M7-003", "done")
-    assert (await roadmap.get_card("M7-003"))["status"] == "inbox"
+    # M7-TMPG depends on M7-TMPD which is not 'done' -> done is blocked
+    with pytest.raises(roadmap.RoadmapError, match="M7-TMPD"):
+        await roadmap.move("M7-TMPG", "done")
+    assert (await roadmap.get_card("M7-TMPG"))["status"] == "inbox"
 
-    forced = await roadmap.move("M7-003", "done", override=True, reason="operator override")
+    forced = await roadmap.move("M7-TMPG", "done", override=True, reason="operator override")
     assert forced["status"] == "done"
     assert forced["completed_at"]
 
     events = await bus.replay(0, types=["roadmap.card.moved"])
-    assert events[-1].ref_id == "M7-003"
+    assert events[-1].ref_id == "M7-TMPG"
     assert events[-1].payload == {
         "from": "inbox", "to": "done", "override": True, "reason": "operator override",
     }
 
 
-async def test_plain_moves_and_conditional_claim():
-    await roadmap.import_backlog()
+async def test_plain_moves_and_conditional_claim(tmp_path):
+    # temp card with a pinned status: plain-move assertions must not depend on
+    # the live board's M7-001 status
+    data = _seed_copy()
+    data["cards"].append({
+        "id": "M7-TMPM", "title": "temp move card",
+        "phase": "M7 Roadmap Control Plane", "status": "ready", "acceptance": ["it works"],
+    })
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await roadmap.import_backlog(seed)
 
-    card = await roadmap.move("M7-001", "in_progress", owner="claude")
+    card = await roadmap.move("M7-TMPM", "in_progress", owner="claude")
     assert card["status"] == "in_progress"
     assert card["owner"] == "claude"
 
     # conditional claim: a stale mover loses and the row stays untouched
     with pytest.raises(roadmap.MoveConflict):
-        await roadmap.move("M7-001", "review", expected_status="ready")
-    assert (await roadmap.get_card("M7-001"))["status"] == "in_progress"
+        await roadmap.move("M7-TMPM", "review", expected_status="ready")
+    assert (await roadmap.get_card("M7-TMPM"))["status"] == "in_progress"
 
-    card = await roadmap.move("M7-001", "review")
+    card = await roadmap.move("M7-TMPM", "review")
     assert card["status"] == "review"
 
     # done needs evidence even with zero dependencies (02-data-model.md)
     with pytest.raises(roadmap.RoadmapError, match="evidence"):
-        await roadmap.move("M7-001", "done")
-    await roadmap.add_evidence("M7-001", "test", "pytest tests/test_roadmap.py", status="pass")
-    card = await roadmap.move("M7-001", "done")
+        await roadmap.move("M7-TMPM", "done")
+    await roadmap.add_evidence("M7-TMPM", "test", "pytest tests/test_roadmap.py", status="pass")
+    card = await roadmap.move("M7-TMPM", "done")
     assert card["status"] == "done"
     assert card["completed_at"]
 
@@ -192,12 +228,19 @@ async def test_move_gates_empty_acceptance_and_blocked(tmp_path):
         await roadmap.move("M7-TMP", "ready")
     assert (await roadmap.get_card("M7-TMP"))["status"] == "inbox"
 
-    # a blocked card cannot move forward unless override
-    await roadmap.update_card("M7-001", {"blocked_reason": "waiting on upstream schema"})
+    # a blocked card cannot move forward unless override (self-contained card:
+    # the real seed's M7-001 status drifts as the board advances)
+    data["cards"].append({
+        "id": "M7-TMP2", "title": "temp blocked card", "phase": "M7 Roadmap Control Plane",
+        "status": "ready", "acceptance": ["it works"],
+    })
+    seed.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await roadmap.import_backlog(seed)
+    await roadmap.update_card("M7-TMP2", {"blocked_reason": "waiting on upstream schema"})
     with pytest.raises(roadmap.RoadmapError, match="blocked"):
-        await roadmap.move("M7-001", "in_progress", owner="claude")
-    assert (await roadmap.get_card("M7-001"))["status"] == "ready"
-    card = await roadmap.move("M7-001", "in_progress", owner="claude", override=True)
+        await roadmap.move("M7-TMP2", "in_progress", owner="claude")
+    assert (await roadmap.get_card("M7-TMP2"))["status"] == "ready"
+    card = await roadmap.move("M7-TMP2", "in_progress", owner="claude", override=True)
     assert card["status"] == "in_progress"
 
 
@@ -341,8 +384,10 @@ async def test_api_roundtrip_and_release_gates():
         gates = {g["name"]: g for g in r.json()}
         assert set(gates) == {"Release A", "Release B", "Release C"}
         assert gates["Release A"]["prefixes"] == ["M0", "M1", "M2", "M3"]
-        assert gates["Release A"]["total"] == 8
-        assert gates["Release A"]["done"] == 3  # M0-001, M0-002, M1-000 seeded done
-        assert gates["Release B"]["total"] == 2
-        assert gates["Release C"]["total"] == 6
-        assert gates["Release C"]["done"] == 1  # M7-003 forced done above
+        # counts come from the living seed, not a snapshot of board statuses
+        total_a, done_a = _seed_gate("M0", "M1", "M2", "M3")
+        assert (gates["Release A"]["total"], gates["Release A"]["done"]) == (total_a, done_a)
+        assert gates["Release B"]["total"] == _seed_gate("M4", "M5", "M6")[0]
+        total_c, done_c = _seed_gate("M7")
+        assert gates["Release C"]["total"] == total_c
+        assert gates["Release C"]["done"] == done_c + 1  # M7-003 forced done above

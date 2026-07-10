@@ -73,7 +73,7 @@
       "title": "Add thesis and market import schema migration",
       "type": "schema",
       "phase": "M1 Thesis Registry",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",

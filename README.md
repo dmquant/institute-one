@@ -153,12 +153,12 @@ v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../
 
 There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M7), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. The Obsidian plugin renders it as a roadmap Kanban view (command *Institute: 打开路线图*) and can export the board as a Markdown note. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
 
-The execution track so far (statuses from `backlog.json`, 2026-07-02 — 3 done · 1 in review · 5 ready · 7 inbox of 16 seed cards):
+The execution track so far (statuses from `backlog.json`, 2026-07-03 — 3 done · 2 in review · 4 ready · 7 inbox of 16 seed cards):
 
 ```mermaid
 flowchart LR
     M0["M0 ☑ Research hands<br/>codex+agy round-robin"]
-    M1["M1 ◔ Thesis registry<br/>1/4 done"]
+    M1["M1 ◔ Thesis registry<br/>1/4 done · schema in review"]
     M2["M2 ☐ Securities & stock map"]
     M3["M3 ☐ Thesis-aware research"]
     M4["M4 ☐ Market data & PIT store"]
