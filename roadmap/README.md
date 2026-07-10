@@ -28,18 +28,18 @@ The card is not just a ticket. It is the control record for the coding process. 
 
 ## Execution Map
 
-Seed backlog: 16 cards across phases M0–M7 (3 done · 2 in review · 4 ready · 7 inbox as of 2026-07-03). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001, in review) is deployed and wired (M7-003).
+Seed backlog: 16 cards across phases M0–M7 (5 done · 3 in review · 2 ready · 6 inbox as of 2026-07-03). Card statuses live in [backlog.json](backlog.json); with the roadmap API (M7-001) done and the plugin wired to it (M7-003, in review), Kanban drag-moves persist server-side when the backend is up, falling back to bundled-seed + local overrides offline.
 
 ```mermaid
 flowchart LR
     M0["M0 ☑ Research hand policy<br/>codex+agy round-robin · 2/2 done"]
-    M1["M1 ◔ Thesis registry<br/>1/4 done — schema · API · import"]
-    M2["M2 ☐ Securities & stock map<br/>.SH/.SZ/.BJ security master"]
+    M1["M1 ◔ Thesis registry<br/>2/4 done — domain API in review"]
+    M2["M2 ◔ Securities & stock map<br/>.SH/.SZ/.BJ schema in review"]
     M3["M3 ☐ Thesis-aware research queue"]
     M4["M4 ☐ Market data & PIT store"]
     M5["M5 ☐ Forecast ledger"]
     M6["M6 ☐ Alpha & paper book<br/>cards TBD"]
-    M7["M7 ◔ Roadmap control plane<br/>plugin Kanban shipped · backend API in review"]
+    M7["M7 ◔ Roadmap control plane<br/>API ✅ · plugin wired to API (review)"]
     M0 --> M1 --> M2
     M2 -. "unlocks bundle import (M1-003)" .-> M1
     M1 & M2 --> M3

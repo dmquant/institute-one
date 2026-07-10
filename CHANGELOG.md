@@ -2,13 +2,17 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## 2026-07-03 — Thesis schema (M1-001) and the PR #1 review
+## 2026-07-03 — Thesis registry, security master, live Kanban, PR #1 review
 
 ### Added
-- **Thesis schema migration — card M1-001** (in review): additive `migrations/0003_theses.sql` — `theses` (lifecycle CHECK `candidate|active|watch|dormant|retired`; lanes as `kind='lane'` rows per the bootstrap contract), `thesis_versions` (per-thesis version counter, `supersedes_id` linkage, history preserved across updates), and `market_thesis_imports`/`market_thesis_import_items` provenance (manifest fields, `bundle_sha256`, dry-run/apply modes, idempotency enforced only for completed applies so failed imports never brick a retry). 16 new schema-level tests; suite 49 → 65.
+- **Thesis schema migration — card M1-001** (done): additive `migrations/0003_theses.sql` — `theses` (lifecycle CHECK `candidate|active|watch|dormant|retired`; lanes as `kind='lane'` rows per the bootstrap contract), `thesis_versions` (per-thesis version counter, `supersedes_id` linkage, history preserved across updates), and `market_thesis_imports`/`market_thesis_import_items` provenance (manifest fields, `bundle_sha256`, dry-run/apply modes, idempotency enforced only for completed applies so failed imports never brick a retry). 16 new schema-level tests.
+- **Thesis domain module and API — card M1-002** (in review): `app/institute/theses.py` + `app/api/theses.py` — create/update/tree/list with every content revision appending a `thesis_versions` row (supersedes chain), lifecycle transitions via conditional claim with optional `expected_status` → 409, duplicate slugs and concurrent version races mapped to 400/409 instead of raw 500s, path-like thesis ids (`ai/gpu`) supported. `GET/POST/PATCH /api/theses*`.
+- **Security master schema — card M2-001** (in review): additive `migrations/0004_securities.sql` — `securities` (canonical `.SH/.SZ/.BJ`/`.HK`/US ids, market + instrument-type normalization covering every value in the bootstrap bundle), `security_aliases` (Chinese names, unsuffixed tickers), `thesis_security_edges` (role, exposure, confidence, rationale, provenance), with a documented importer warning for cross-listed duplicate Chinese names (中芯国际, 中远海控).
+- **Plugin Kanban wired to the backend — card M7-003** (in review): the Obsidian roadmap view now prefers the live roadmap API (server-side card moves with dependency-block Notices and override retry, auto-seed of an empty backend, release gates from `GET /api/roadmap/release-gates`), falling back to the bundled seed + local overrides offline. Suite 49 → 92.
 
 ### Changed
 - External **PR #1 reviewed** (four-subsystem adversarial review): verdict is *selective adoption* — roughly half the PR independently implements planned roadmap work (Phase 1b market data, Phase 2 quality detection, Phase 3 evidence/claims) and is worth re-implementing against current main in tranches; wholesale merge is not viable (predates the M0 research-hand policy, migration-number collisions, prompt-surface and rate-limit-signature rule violations). See the "Open pull requests" section below.
+- Roadmap board: M7-001 and M1-001 approved to done; M1-002, M2-001, M7-003 in review; board diagrams refreshed (5 done · 3 in review · 2 ready · 6 inbox).
 
 ### Fixed
 - `tests/test_roadmap.py` no longer hardcodes seed card statuses (two tests broke when M7-001 moved to `review` on the board); assertions now derive from `backlog.json`.

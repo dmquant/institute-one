@@ -40,7 +40,7 @@ export interface InstituteSettings {
 	insertStyle: "callout" | "plain";
 	/** Dashboard poll interval in seconds (min 5). */
 	pollIntervalS: number;
-	/** Local roadmap progress overrides before the backend roadmap API exists. */
+	/** Offline-only roadmap status overrides — used when the backend roadmap API is unreachable. */
 	roadmapStatusOverrides: Record<string, string>;
 }
 

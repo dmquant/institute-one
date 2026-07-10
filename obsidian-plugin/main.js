@@ -39,6 +39,12 @@ function errMsg(e) {
   if (e instanceof Error) return e.message;
   return String(e);
 }
+var ApiError = class extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+};
 function withTimeout(p, ms, what) {
   return new Promise((resolve, reject) => {
     const t = window.setTimeout(
@@ -157,7 +163,7 @@ var InstituteApi = class {
       } catch {
         detail = resp.text ?? "";
       }
-      throw new Error(`HTTP ${resp.status} \u2014 ${detail.slice(0, 300)}`);
+      throw new ApiError(`HTTP ${resp.status} \u2014 ${detail.slice(0, 300)}`, resp.status);
     }
     return resp.json;
   }
@@ -232,6 +238,39 @@ var InstituteApi = class {
     return this.request(
       `/api/archive/search?q=${encodeURIComponent(q)}&limit=${limit}`
     );
+  }
+  // ---- roadmap -----------------------------------------------------------------
+  listCards() {
+    return this.request("/api/roadmap/cards");
+  }
+  getCard(cardId) {
+    return this.request(
+      `/api/roadmap/cards/${encodeURIComponent(cardId)}`
+    );
+  }
+  /**
+   * POST /api/roadmap/cards/{id}/move. Backend rejections: 400 = move rule
+   * (open dependencies / missing owner / no evidence — retry with override),
+   * 409 = concurrent change (expected_status mismatch or lost claim — reload).
+   */
+  moveCard(cardId, to, override = false, expected) {
+    const body = { status: to, override };
+    if (expected != null) body.expected_status = expected;
+    return this.request(
+      `/api/roadmap/cards/${encodeURIComponent(cardId)}/move`,
+      { method: "POST", body }
+    );
+  }
+  /** POST /api/roadmap/import — idempotent upsert of roadmap/backlog.json by card id. */
+  importSeed(force = false) {
+    return this.request("/api/roadmap/import", {
+      method: "POST",
+      body: { force }
+    });
+  }
+  /** GET /api/roadmap/release-gates — gate progress projected from card phases. */
+  releaseGates() {
+    return this.request("/api/roadmap/release-gates");
   }
   // ---- events ------------------------------------------------------------------
   events(since, limit, types) {
@@ -1005,7 +1044,7 @@ var backlog_default = {
       title: "Add thesis and market import schema migration",
       type: "schema",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",
@@ -1025,7 +1064,7 @@ var backlog_default = {
       title: "Implement thesis domain module and API",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
@@ -1065,7 +1104,7 @@ var backlog_default = {
       title: "Add security master schema",
       type: "schema",
       phase: "M2 Securities & Stock Map",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
@@ -1143,7 +1182,7 @@ var backlog_default = {
       title: "Add roadmap schema and seed import",
       type: "schema",
       phase: "M7 Roadmap Control Plane",
-      status: "ready",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
@@ -1163,7 +1202,7 @@ var backlog_default = {
       title: "Build Kanban board UI",
       type: "ui",
       phase: "M7 Roadmap Control Plane",
-      status: "inbox",
+      status: "review",
       priority: "P2",
       risk: "medium",
       summary: "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
@@ -1235,6 +1274,26 @@ var backlog_default = {
         "prompt generation is deterministic for the same card state"
       ],
       verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+    },
+    {
+      id: "M7-008",
+      title: "Roadmap decisions, claim, export, and checklist/dependency CRUD",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "inbox",
+      priority: "P2",
+      risk: "low",
+      summary: "Implement the 02-data-model.md surface deferred out of M7-001: decision records (roadmap_decisions and roadmap_release_gates are pre-created but unused), POST /cards and /claim, checklist item CRUD, dependency add/remove routes, and GET /export.",
+      design_links: ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
+      expected_files: ["app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      dependencies: ["M7-001"],
+      acceptance: [
+        "decisions can be opened and resolved with decision.opened/decision.resolved events",
+        "cards can be created and claimed via the API",
+        "checklist items and dependencies have add/check/remove routes",
+        "GET /export produces a backlog-compatible JSON snapshot"
+      ],
+      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
     }
   ]
 };
@@ -1261,15 +1320,25 @@ var STATUS_EN = {
   parked: "Parked"
 };
 var ACTIVE_STATUSES = /* @__PURE__ */ new Set(["in_progress", "review", "verify"]);
+var PRIORITY_VALUES = /* @__PURE__ */ new Set(["P0", "P1", "P2", "P3"]);
 var RoadmapView = class extends import_obsidian4.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.query = "";
+    this.queryRaw = "";
     this.phase = "all";
     this.priority = "all";
     this.status = "all";
     this.type = "all";
     this.selectedId = ROADMAP.cards[0]?.id ?? "";
+    /** "api" = backend rows are truth; "offline" = bundled seed + local overrides. */
+    this.mode = "offline";
+    this.apiCards = null;
+    this.apiGates = null;
+    this.loading = false;
+    this.importTried = false;
+    /** card ids whose checklists have been hydrated from GET /cards/{id} */
+    this.detailFetched = /* @__PURE__ */ new Set();
     this.plugin = plugin;
     this.navigation = false;
   }
@@ -1290,12 +1359,9 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     const head = root.createDiv({ cls: "ir-head" });
     const title = head.createDiv();
     title.createEl("h2", { text: "\u8DEF\u7EBF\u56FE\u6267\u884C" });
-    title.createDiv({
-      cls: "ir-subtitle",
-      text: `roadmap/backlog.json v${ROADMAP.version} \xB7 Obsidian Kanban-compatible`
-    });
+    this.subtitleEl = title.createDiv({ cls: "ir-subtitle" });
     const actions = head.createDiv({ cls: "ir-actions" });
-    this.button(actions, "\u5237\u65B0", "\u91CD\u65B0\u6E32\u67D3\u5F53\u524D\u8DEF\u7EBF\u56FE", () => this.render());
+    this.button(actions, "\u5237\u65B0", "\u91CD\u65B0\u4ECE\u540E\u7AEF\u52A0\u8F7D\u8DEF\u7EBF\u56FE", () => void this.reload());
     this.button(
       actions,
       "\u5BFC\u51FA Kanban \u7B14\u8BB0",
@@ -1303,46 +1369,111 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       () => void this.exportKanbanNote()
     );
     this.summaryEl = root.createDiv({ cls: "ir-summary" });
-    this.buildFilters(root);
+    this.filtersEl = root.createDiv({ cls: "ir-filters" });
     this.boardEl = root.createDiv({ cls: "ir-board" });
     this.detailEl = root.createDiv({ cls: "ir-detail" });
     this.gatesEl = root.createDiv({ cls: "ir-gates" });
     this.render();
+    void this.reload();
   }
   async onClose() {
     this.contentEl.empty();
   }
-  buildFilters(root) {
-    const filters = root.createDiv({ cls: "ir-filters" });
+  /** Probe the backend: render its rows when it has cards, seed it when empty,
+   * and fall back to the bundled backlog + local overrides when unreachable. */
+  async reload() {
+    this.loading = true;
+    this.renderSubtitle();
+    try {
+      let rows = await this.plugin.api.listCards();
+      if (!rows.length && !this.importTried) {
+        try {
+          const res = await this.plugin.api.importSeed();
+          this.importTried = true;
+          new import_obsidian4.Notice(
+            `Institute Roadmap: \u540E\u7AEF\u4E3A\u7A7A\uFF0C\u5DF2\u5BFC\u5165\u79CD\u5B50\uFF08\u65B0\u5EFA ${res.created} / \u66F4\u65B0 ${res.updated} / \u5171 ${res.total}\uFF09\u3002`,
+            6e3
+          );
+          rows = await this.plugin.api.listCards();
+        } catch (e) {
+          new import_obsidian4.Notice(`Institute Roadmap: \u79CD\u5B50\u5BFC\u5165\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+        }
+      }
+      if (rows.length) {
+        this.apiCards = rows.map(fromApiCard);
+        this.mode = "api";
+        this.detailFetched.clear();
+        this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
+      } else {
+        this.apiCards = null;
+        this.apiGates = null;
+        this.mode = "offline";
+      }
+    } catch {
+      this.apiCards = null;
+      this.apiGates = null;
+      this.mode = "offline";
+    }
+    this.loading = false;
+    this.render();
+  }
+  renderFilters() {
+    const cards = this.cards();
+    const phases = this.mode === "api" ? unique(cards.map((c) => c.phase)) : ROADMAP.phases;
+    const types = unique(cards.map((c) => c.type));
+    if (this.phase !== "all" && !phases.includes(this.phase)) this.phase = "all";
+    if (this.type !== "all" && !types.includes(this.type)) this.type = "all";
+    const filters = this.filtersEl;
+    filters.empty();
     const search = filters.createEl("input");
     search.type = "search";
     search.placeholder = "\u641C\u7D22\u5361\u7247\u3001\u6587\u4EF6\u3001\u9A8C\u6536\u9879...";
+    search.value = this.queryRaw;
     search.addEventListener("input", () => {
+      this.queryRaw = search.value;
       this.query = search.value.trim().toLowerCase();
       this.renderBoard();
     });
-    this.select(filters, "\u9636\u6BB5", ["all", ...ROADMAP.phases], (v) => {
+    this.select(filters, "\u9636\u6BB5", ["all", ...phases], this.phase, (v) => {
       this.phase = v;
       this.renderBoard();
     });
-    this.select(filters, "\u72B6\u6001", ["all", ...ROADMAP.columns], (v) => {
+    this.select(filters, "\u72B6\u6001", ["all", ...ROADMAP.columns], this.status, (v) => {
       this.status = v;
       this.renderBoard();
     });
-    this.select(filters, "\u4F18\u5148\u7EA7", ["all", "P0", "P1", "P2", "P3"], (v) => {
+    this.select(filters, "\u4F18\u5148\u7EA7", ["all", "P0", "P1", "P2", "P3"], this.priority, (v) => {
       this.priority = v;
       this.renderBoard();
     });
-    this.select(filters, "\u7C7B\u578B", ["all", ...unique(ROADMAP.cards.map((c) => c.type))], (v) => {
+    this.select(filters, "\u7C7B\u578B", ["all", ...types], this.type, (v) => {
       this.type = v;
       this.renderBoard();
     });
   }
   render() {
+    this.renderSubtitle();
     this.renderSummary();
+    this.renderFilters();
     this.renderBoard();
     this.renderDetail();
     this.renderGates();
+  }
+  renderSubtitle() {
+    this.subtitleEl.toggleClass("offline", this.mode === "offline" && !this.loading);
+    if (this.mode === "api") {
+      this.subtitleEl.setText(
+        `\u540E\u7AEF\u5B9E\u65F6 \xB7 ${this.plugin.api.baseUrl()}/api/roadmap \xB7 Obsidian Kanban-compatible`
+      );
+    } else if (this.loading) {
+      this.subtitleEl.setText(
+        `\u8FDE\u63A5\u540E\u7AEF\u4E2D\u2026 \u6682\u7528\u5185\u7F6E roadmap/backlog.json v${ROADMAP.version}`
+      );
+    } else {
+      this.subtitleEl.setText(
+        `\u79BB\u7EBF\u6A21\u5F0F \xB7 \u5185\u7F6E roadmap/backlog.json v${ROADMAP.version} \xB7 \u72B6\u6001\u6539\u52A8\u4EC5\u4FDD\u5B58\u5728\u672C\u5730`
+      );
+    }
   }
   renderSummary() {
     const cards = this.cards();
@@ -1418,6 +1549,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       return;
     }
     this.selectedId = card.id;
+    this.hydrateDetail(card);
     const blocked = isBlocked(card, byId);
     const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
     const title = top.createDiv();
@@ -1444,37 +1576,62 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.dependencyBlock(side, card, byId);
     this.block(side, "\u6267\u884C\u63D0\u793A", [agentPrompt(card)], "pre");
     if (blocked) {
-      side.createDiv({
-        cls: "ir-warning",
-        text: "\u8BE5\u5361\u7247\u5B58\u5728\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u79FB\u52A8\u5230 Done\u3002"
-      });
+      const reasons = [];
+      if (hasOpenDeps(card, byId)) {
+        reasons.push(
+          this.mode === "api" ? "\u8BE5\u5361\u7247\u5B58\u5728\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u79FB\u52A8\u5230 Done \u4F1A\u88AB\u540E\u7AEF\u62D2\u7EDD\uFF08\u53EF override \u5F3A\u5236\uFF09\u3002" : "\u8BE5\u5361\u7247\u5B58\u5728\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u79FB\u52A8\u5230 Done\u3002"
+        );
+      }
+      if (card.blocked_reason) {
+        reasons.push(`\u540E\u7AEF\u6807\u8BB0\u963B\u585E\uFF1A${card.blocked_reason}\uFF08\u5411\u524D\u79FB\u52A8\u4F1A\u88AB\u62D2\u7EDD\uFF0C\u53EF override \u5F3A\u5236\uFF09\u3002`);
+      }
+      side.createDiv({ cls: "ir-warning", text: reasons.join(" ") });
     }
   }
+  /** API mode: the list endpoint carries no checklists, so lazily hydrate the
+   * selected card's acceptance + blocked_reason from GET /cards/{id}. The
+   * seed-derived values stay as the fallback when the fetch fails. */
+  hydrateDetail(card) {
+    if (this.mode !== "api" || this.detailFetched.has(card.id)) return;
+    this.detailFetched.add(card.id);
+    void this.plugin.api.getCard(card.id).then(
+      (detail) => {
+        const target = this.apiCards?.find((c) => c.id === card.id);
+        if (!target) return;
+        target.acceptance = detail.checklists.filter((item) => item.kind === "acceptance").map((item) => item.text);
+        target.blocked_reason = detail.blocked_reason;
+        if (this.selectedId === card.id) {
+          this.renderBoard();
+          this.renderDetail();
+        }
+      },
+      () => {
+        this.detailFetched.delete(card.id);
+      }
+    );
+  }
   renderGates() {
-    const cards = this.cards();
     this.gatesEl.empty();
     this.gatesEl.createEl("h3", { text: "Release Gates" });
-    const gates = [
-      { name: "Release A", desc: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
-      { name: "Release B", desc: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
-      { name: "Release C", desc: "Roadmap Control Plane", prefixes: ["M7"] }
-    ];
+    const gates = this.mode === "api" && this.apiGates ? this.apiGates : localReleaseGates(this.cards());
     const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
     for (const gate of gates) {
-      const scoped = cards.filter((c) => gate.prefixes.some((p) => c.phase.startsWith(p)));
-      const done = scoped.filter((c) => c.status === "done").length;
-      const pct = scoped.length ? Math.round(done / scoped.length * 100) : 0;
       const box = wrap.createDiv({ cls: "ir-gate" });
       box.createDiv({ cls: "ir-gate-name", text: gate.name });
-      box.createDiv({ cls: "ir-gate-desc", text: gate.desc });
+      box.createDiv({ cls: "ir-gate-desc", text: gate.description });
       box.createDiv({ cls: "ir-progress" }).createDiv({
         cls: "ir-progress-bar",
-        attr: { style: `width: ${pct}%` }
+        attr: { style: `width: ${gate.pct}%` }
       });
-      box.createDiv({ cls: "ir-gate-meta", text: `${done}/${scoped.length} cards \xB7 ${pct}%` });
+      box.createDiv({ cls: "ir-gate-meta", text: `${gate.done}/${gate.total} cards \xB7 ${gate.pct}%` });
     }
   }
   async moveCard(card, status) {
+    if (card.status === status) return;
+    if (this.mode === "api") {
+      await this.moveCardRemote(card, status, false);
+      return;
+    }
     const byId = mapById(this.cards());
     if (status === "done" && isBlocked(card, byId)) {
       new import_obsidian4.Notice(`Institute Roadmap: ${card.id} \u4ECD\u6709\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u6807\u8BB0 Done\u3002`, 6e3);
@@ -1492,7 +1649,35 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.selectedId = card.id;
     this.render();
   }
+  /** Persist a move through POST /api/roadmap/cards/{id}/move.
+   * 400 = rule rejection → Notice with an override retry;
+   * 409 = concurrent change (expected_status stale) → reload. */
+  async moveCardRemote(card, status, override) {
+    this.selectedId = card.id;
+    try {
+      await this.plugin.api.moveCard(card.id, status, override, card.status);
+      await this.reload();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        new import_obsidian4.Notice(`Institute Roadmap: ${card.id} \u5DF2\u88AB\u5E76\u53D1\u4FEE\u6539\uFF0C\u6B63\u5728\u91CD\u65B0\u52A0\u8F7D\u3002`, 6e3);
+        await this.reload();
+      } else if (e instanceof ApiError && e.status === 400 && !override) {
+        this.offerOverride(card, status, errMsg(e));
+      } else {
+        new import_obsidian4.Notice(`Institute Roadmap: \u79FB\u52A8 ${card.id} \u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      }
+    }
+  }
+  offerOverride(card, status, detail) {
+    new OverrideModal(
+      this.app,
+      `${card.id} \u2192 ${STATUS_EN[status]} \u88AB\u540E\u7AEF\u62D2\u7EDD`,
+      detail,
+      () => void this.moveCardRemote(card, status, true)
+    ).open();
+  }
   cards() {
+    if (this.mode === "api" && this.apiCards) return this.apiCards;
     const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
     return ROADMAP.cards.map((card) => ({
       ...card,
@@ -1527,7 +1712,8 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     const path = (0, import_obsidian4.normalizePath)(this.plugin.subPath(rel));
     const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     if (folder) await this.ensureFolder(folder);
-    const content = buildKanbanMarkdown(this.cards());
+    const source = this.mode === "api" ? `${this.plugin.api.baseUrl()}/api/roadmap` : "roadmap/backlog.json (offline)";
+    const content = buildKanbanMarkdown(this.cards(), source);
     const existing = this.app.vault.getAbstractFileByPath(path);
     let file;
     if (existing instanceof import_obsidian4.TFile) {
@@ -1596,7 +1782,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     btn.addEventListener("click", onClick);
     return btn;
   }
-  select(parent, label, values, onChange) {
+  select(parent, label, values, current, onChange) {
     const wrap = parent.createDiv({ cls: "ir-select" });
     wrap.createSpan({ text: label });
     const sel = wrap.createEl("select");
@@ -1604,7 +1790,51 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       const text = value === "all" ? "\u5168\u90E8" : normalizeStatus(value) ? STATUS_ZH[normalizeStatus(value)] : value;
       sel.createEl("option", { text, value });
     }
+    if (values.includes(current)) sel.value = current;
     sel.addEventListener("change", () => onChange(sel.value));
+  }
+};
+function fromApiCard(row) {
+  const seed = ROADMAP.cards.find((c) => c.id === row.id);
+  return {
+    id: row.id,
+    title: row.title,
+    type: row.type,
+    phase: row.phase,
+    status: normalizeStatus(row.status) ?? "inbox",
+    priority: PRIORITY_VALUES.has(row.priority) ? row.priority : "P2",
+    risk: row.risk,
+    summary: row.summary ?? "",
+    design_links: row.design_links ?? [],
+    expected_files: row.expected_files ?? [],
+    dependencies: row.dependencies ?? [],
+    acceptance: seed?.acceptance ?? [],
+    verification: row.verification ?? [],
+    sort_order: row.sort_order,
+    blocked_reason: row.blocked_reason
+  };
+}
+var OverrideModal = class extends import_obsidian4.Modal {
+  constructor(app, heading, detail, onConfirm) {
+    super(app);
+    this.heading = heading;
+    this.detail = detail;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    this.titleEl.setText(this.heading);
+    this.contentEl.createDiv({ text: this.detail });
+    const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+    const cancel = row.createEl("button", { text: "\u53D6\u6D88" });
+    cancel.addEventListener("click", () => this.close());
+    const confirm = row.createEl("button", { text: "\u5F3A\u5236\u79FB\u52A8\uFF08override\uFF09", cls: "mod-warning" });
+    confirm.addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+  }
+  onClose() {
+    this.contentEl.empty();
   }
 };
 function normalizeStatus(value) {
@@ -1614,9 +1844,34 @@ function mapById(cards) {
   return new Map(cards.map((card) => [card.id, card]));
 }
 function isBlocked(card, byId) {
+  return hasOpenDeps(card, byId) || Boolean(card.blocked_reason);
+}
+function hasOpenDeps(card, byId) {
   return card.dependencies.some((id) => byId.get(id)?.status !== "done");
 }
+var RELEASE_GATES = [
+  { name: "Release A", description: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
+  { name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
+  { name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] }
+];
+function localReleaseGates(cards) {
+  return RELEASE_GATES.map((gate) => {
+    const scoped = cards.filter((c) => gate.prefixes.includes(c.phase.split(" ")[0]));
+    const done = scoped.filter((c) => c.status === "done").length;
+    return {
+      ...gate,
+      total: scoped.length,
+      done,
+      pct: scoped.length ? Math.round(done / scoped.length * 100) : 0,
+      status: scoped.length && done === scoped.length ? "met" : "open",
+      remaining: scoped.filter((c) => c.status !== "done").map((c) => c.id).sort()
+    };
+  });
+}
 function cardSort(a, b) {
+  if (a.sort_order !== void 0 && b.sort_order !== void 0 && a.sort_order !== b.sort_order) {
+    return a.sort_order - b.sort_order;
+  }
   const phase = ROADMAP.phases.indexOf(a.phase) - ROADMAP.phases.indexOf(b.phase);
   if (phase !== 0) return phase;
   const priority = a.priority.localeCompare(b.priority);
@@ -1645,12 +1900,12 @@ function agentPrompt(card) {
     "Constraints: local-only infrastructure, no git push, keep design/ ignored, preserve unrelated user changes."
   ].join("\n");
 }
-function buildKanbanMarkdown(cards) {
+function buildKanbanMarkdown(cards, source) {
   const byId = mapById(cards);
   const lines = [
     "---",
     "kanban-plugin: board",
-    "institute-roadmap-source: roadmap/backlog.json",
+    `institute-roadmap-source: ${source}`,
     `updated: ${(/* @__PURE__ */ new Date()).toISOString()}`,
     "---",
     "",
@@ -1676,10 +1931,11 @@ function buildKanbanMarkdown(cards) {
       ].join(" ");
       lines.push(`- [${checked}] **${card.id}** ${card.title} ${tags}`);
       lines.push(`  - phase: ${card.phase}`);
-      if (isBlocked(card, byId)) {
+      if (hasOpenDeps(card, byId)) {
         const deps = card.dependencies.filter((id) => byId.get(id)?.status !== "done").join(", ");
         lines.push(`  - blocked by: ${deps}`);
       }
+      if (card.blocked_reason) lines.push(`  - blocked: ${card.blocked_reason}`);
       if (card.verification[0]) lines.push(`  - verify: \`${card.verification[0]}\``);
     }
     lines.push("");
@@ -1720,6 +1976,15 @@ function ensureRoadmapStyles() {
 	color: var(--text-muted);
 	font-size: 12px;
 	margin-top: 2px;
+}
+.ir-subtitle.offline {
+	color: var(--color-orange);
+}
+.ir-modal-actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+	margin-top: 12px;
 }
 .ir-actions, .ir-status-actions {
 	display: flex;

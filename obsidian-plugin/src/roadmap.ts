@@ -1,5 +1,6 @@
-import { ItemView, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
+import { App, ItemView, Modal, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import backlog from "../../roadmap/backlog.json";
+import { ApiError, RoadmapApiCard, RoadmapReleaseGate, errMsg } from "./api";
 import type InstituteOnePlugin from "./main";
 
 export const VIEW_TYPE_ROADMAP = "institute-roadmap";
@@ -30,6 +31,10 @@ interface RoadmapCard {
 	dependencies: string[];
 	acceptance: string[];
 	verification: string[];
+	/** backend ordering (API mode only) */
+	sort_order?: number;
+	/** operator-set block (API mode only) — the backend rejects forward moves while set */
+	blocked_reason?: string | null;
 }
 
 interface RoadmapBacklog {
@@ -59,17 +64,30 @@ const STATUS_EN: Record<RoadmapStatus, string> = {
 	parked: "Parked",
 };
 const ACTIVE_STATUSES = new Set<RoadmapStatus>(["in_progress", "review", "verify"]);
+const PRIORITY_VALUES = new Set(["P0", "P1", "P2", "P3"]);
 
 export class RoadmapView extends ItemView {
 	private plugin: InstituteOnePlugin;
 	private query = "";
+	private queryRaw = "";
 	private phase = "all";
 	private priority = "all";
 	private status = "all";
 	private type = "all";
 	private selectedId = ROADMAP.cards[0]?.id ?? "";
 
+	/** "api" = backend rows are truth; "offline" = bundled seed + local overrides. */
+	private mode: "api" | "offline" = "offline";
+	private apiCards: RoadmapCard[] | null = null;
+	private apiGates: RoadmapReleaseGate[] | null = null;
+	private loading = false;
+	private importTried = false;
+	/** card ids whose checklists have been hydrated from GET /cards/{id} */
+	private detailFetched = new Set<string>();
+
+	private subtitleEl!: HTMLElement;
 	private summaryEl!: HTMLElement;
+	private filtersEl!: HTMLElement;
 	private boardEl!: HTMLElement;
 	private detailEl!: HTMLElement;
 	private gatesEl!: HTMLElement;
@@ -101,60 +119,127 @@ export class RoadmapView extends ItemView {
 		const head = root.createDiv({ cls: "ir-head" });
 		const title = head.createDiv();
 		title.createEl("h2", { text: "路线图执行" });
-		title.createDiv({
-			cls: "ir-subtitle",
-			text: `roadmap/backlog.json v${ROADMAP.version} · Obsidian Kanban-compatible`,
-		});
+		this.subtitleEl = title.createDiv({ cls: "ir-subtitle" });
 		const actions = head.createDiv({ cls: "ir-actions" });
-		this.button(actions, "刷新", "重新渲染当前路线图", () => this.render());
+		this.button(actions, "刷新", "重新从后端加载路线图", () => void this.reload());
 		this.button(actions, "导出 Kanban 笔记", "写入 Obsidian Kanban 兼容 Markdown", () =>
 			void this.exportKanbanNote(),
 		);
 
 		this.summaryEl = root.createDiv({ cls: "ir-summary" });
-		this.buildFilters(root);
+		this.filtersEl = root.createDiv({ cls: "ir-filters" });
 		this.boardEl = root.createDiv({ cls: "ir-board" });
 		this.detailEl = root.createDiv({ cls: "ir-detail" });
 		this.gatesEl = root.createDiv({ cls: "ir-gates" });
-		this.render();
+		this.render(); // instant paint from the bundled seed…
+		void this.reload(); // …then prefer the live backend
 	}
 
 	async onClose(): Promise<void> {
 		this.contentEl.empty();
 	}
 
-	private buildFilters(root: HTMLElement): void {
-		const filters = root.createDiv({ cls: "ir-filters" });
+	/** Probe the backend: render its rows when it has cards, seed it when empty,
+	 * and fall back to the bundled backlog + local overrides when unreachable. */
+	private async reload(): Promise<void> {
+		this.loading = true;
+		this.renderSubtitle();
+		try {
+			let rows = await this.plugin.api.listCards();
+			if (!rows.length && !this.importTried) {
+				// reachable but empty: seed it from the bundled backlog once
+				try {
+					const res = await this.plugin.api.importSeed();
+					// only a successful import counts — a failure retries on the next 刷新
+					this.importTried = true;
+					new Notice(
+						`Institute Roadmap: 后端为空，已导入种子（新建 ${res.created} / 更新 ${res.updated} / 共 ${res.total}）。`,
+						6000,
+					);
+					rows = await this.plugin.api.listCards();
+				} catch (e) {
+					new Notice(`Institute Roadmap: 种子导入失败 — ${errMsg(e)}`, 8000);
+				}
+			}
+			if (rows.length) {
+				this.apiCards = rows.map(fromApiCard);
+				this.mode = "api";
+				this.detailFetched.clear();
+				this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
+			} else {
+				this.apiCards = null;
+				this.apiGates = null;
+				this.mode = "offline";
+			}
+		} catch {
+			this.apiCards = null;
+			this.apiGates = null;
+			this.mode = "offline";
+		}
+		this.loading = false;
+		this.render();
+	}
+
+	private renderFilters(): void {
+		const cards = this.cards();
+		const phases = this.mode === "api" ? unique(cards.map((c) => c.phase)) : ROADMAP.phases;
+		const types = unique(cards.map((c) => c.type));
+		if (this.phase !== "all" && !phases.includes(this.phase)) this.phase = "all";
+		if (this.type !== "all" && !types.includes(this.type as RoadmapType)) this.type = "all";
+
+		const filters = this.filtersEl;
+		filters.empty();
 		const search = filters.createEl("input");
 		search.type = "search";
 		search.placeholder = "搜索卡片、文件、验收项...";
+		search.value = this.queryRaw;
 		search.addEventListener("input", () => {
+			this.queryRaw = search.value;
 			this.query = search.value.trim().toLowerCase();
 			this.renderBoard();
 		});
-		this.select(filters, "阶段", ["all", ...ROADMAP.phases], (v) => {
+		this.select(filters, "阶段", ["all", ...phases], this.phase, (v) => {
 			this.phase = v;
 			this.renderBoard();
 		});
-		this.select(filters, "状态", ["all", ...ROADMAP.columns], (v) => {
+		this.select(filters, "状态", ["all", ...ROADMAP.columns], this.status, (v) => {
 			this.status = v;
 			this.renderBoard();
 		});
-		this.select(filters, "优先级", ["all", "P0", "P1", "P2", "P3"], (v) => {
+		this.select(filters, "优先级", ["all", "P0", "P1", "P2", "P3"], this.priority, (v) => {
 			this.priority = v;
 			this.renderBoard();
 		});
-		this.select(filters, "类型", ["all", ...unique(ROADMAP.cards.map((c) => c.type))], (v) => {
+		this.select(filters, "类型", ["all", ...types], this.type, (v) => {
 			this.type = v;
 			this.renderBoard();
 		});
 	}
 
 	private render(): void {
+		this.renderSubtitle();
 		this.renderSummary();
+		this.renderFilters();
 		this.renderBoard();
 		this.renderDetail();
 		this.renderGates();
+	}
+
+	private renderSubtitle(): void {
+		this.subtitleEl.toggleClass("offline", this.mode === "offline" && !this.loading);
+		if (this.mode === "api") {
+			this.subtitleEl.setText(
+				`后端实时 · ${this.plugin.api.baseUrl()}/api/roadmap · Obsidian Kanban-compatible`,
+			);
+		} else if (this.loading) {
+			this.subtitleEl.setText(
+				`连接后端中… 暂用内置 roadmap/backlog.json v${ROADMAP.version}`,
+			);
+		} else {
+			this.subtitleEl.setText(
+				`离线模式 · 内置 roadmap/backlog.json v${ROADMAP.version} · 状态改动仅保存在本地`,
+			);
+		}
 	}
 
 	private renderSummary(): void {
@@ -239,6 +324,7 @@ export class RoadmapView extends ItemView {
 			return;
 		}
 		this.selectedId = card.id;
+		this.hydrateDetail(card);
 		const blocked = isBlocked(card, byId);
 
 		const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
@@ -265,39 +351,72 @@ export class RoadmapView extends ItemView {
 		this.dependencyBlock(side, card, byId);
 		this.block(side, "执行提示", [agentPrompt(card)], "pre");
 		if (blocked) {
-			side.createDiv({
-				cls: "ir-warning",
-				text: "该卡片存在未完成依赖，不能移动到 Done。",
-			});
+			const reasons: string[] = [];
+			if (hasOpenDeps(card, byId)) {
+				reasons.push(
+					this.mode === "api"
+						? "该卡片存在未完成依赖，移动到 Done 会被后端拒绝（可 override 强制）。"
+						: "该卡片存在未完成依赖，不能移动到 Done。",
+				);
+			}
+			if (card.blocked_reason) {
+				reasons.push(`后端标记阻塞：${card.blocked_reason}（向前移动会被拒绝，可 override 强制）。`);
+			}
+			side.createDiv({ cls: "ir-warning", text: reasons.join(" ") });
 		}
 	}
 
+	/** API mode: the list endpoint carries no checklists, so lazily hydrate the
+	 * selected card's acceptance + blocked_reason from GET /cards/{id}. The
+	 * seed-derived values stay as the fallback when the fetch fails. */
+	private hydrateDetail(card: RoadmapCard): void {
+		if (this.mode !== "api" || this.detailFetched.has(card.id)) return;
+		this.detailFetched.add(card.id);
+		void this.plugin.api.getCard(card.id).then(
+			(detail) => {
+				const target = this.apiCards?.find((c) => c.id === card.id);
+				if (!target) return;
+				target.acceptance = detail.checklists
+					.filter((item) => item.kind === "acceptance")
+					.map((item) => item.text);
+				target.blocked_reason = detail.blocked_reason;
+				if (this.selectedId === card.id) {
+					this.renderBoard();
+					this.renderDetail();
+				}
+			},
+			() => {
+				this.detailFetched.delete(card.id); // keep the seed fallback; retry on reselect
+			},
+		);
+	}
+
 	private renderGates(): void {
-		const cards = this.cards();
 		this.gatesEl.empty();
 		this.gatesEl.createEl("h3", { text: "Release Gates" });
-		const gates = [
-			{ name: "Release A", desc: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
-			{ name: "Release B", desc: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
-			{ name: "Release C", desc: "Roadmap Control Plane", prefixes: ["M7"] },
-		];
+		// API mode renders the backend projection (GET /api/roadmap/release-gates);
+		// offline recomputes the same gates locally from the seed + overrides.
+		const gates =
+			this.mode === "api" && this.apiGates ? this.apiGates : localReleaseGates(this.cards());
 		const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
 		for (const gate of gates) {
-			const scoped = cards.filter((c) => gate.prefixes.some((p) => c.phase.startsWith(p)));
-			const done = scoped.filter((c) => c.status === "done").length;
-			const pct = scoped.length ? Math.round((done / scoped.length) * 100) : 0;
 			const box = wrap.createDiv({ cls: "ir-gate" });
 			box.createDiv({ cls: "ir-gate-name", text: gate.name });
-			box.createDiv({ cls: "ir-gate-desc", text: gate.desc });
+			box.createDiv({ cls: "ir-gate-desc", text: gate.description });
 			box.createDiv({ cls: "ir-progress" }).createDiv({
 				cls: "ir-progress-bar",
-				attr: { style: `width: ${pct}%` },
+				attr: { style: `width: ${gate.pct}%` },
 			});
-			box.createDiv({ cls: "ir-gate-meta", text: `${done}/${scoped.length} cards · ${pct}%` });
+			box.createDiv({ cls: "ir-gate-meta", text: `${gate.done}/${gate.total} cards · ${gate.pct}%` });
 		}
 	}
 
 	private async moveCard(card: RoadmapCard, status: RoadmapStatus): Promise<void> {
+		if (card.status === status) return;
+		if (this.mode === "api") {
+			await this.moveCardRemote(card, status, false);
+			return;
+		}
 		const byId = mapById(this.cards());
 		if (status === "done" && isBlocked(card, byId)) {
 			new Notice(`Institute Roadmap: ${card.id} 仍有未完成依赖，不能标记 Done。`, 6000);
@@ -316,7 +435,41 @@ export class RoadmapView extends ItemView {
 		this.render();
 	}
 
+	/** Persist a move through POST /api/roadmap/cards/{id}/move.
+	 * 400 = rule rejection → Notice with an override retry;
+	 * 409 = concurrent change (expected_status stale) → reload. */
+	private async moveCardRemote(
+		card: RoadmapCard,
+		status: RoadmapStatus,
+		override: boolean,
+	): Promise<void> {
+		this.selectedId = card.id;
+		try {
+			await this.plugin.api.moveCard(card.id, status, override, card.status);
+			await this.reload();
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 409) {
+				new Notice(`Institute Roadmap: ${card.id} 已被并发修改，正在重新加载。`, 6000);
+				await this.reload();
+			} else if (e instanceof ApiError && e.status === 400 && !override) {
+				this.offerOverride(card, status, errMsg(e));
+			} else {
+				new Notice(`Institute Roadmap: 移动 ${card.id} 失败 — ${errMsg(e)}`, 8000);
+			}
+		}
+	}
+
+	private offerOverride(card: RoadmapCard, status: RoadmapStatus, detail: string): void {
+		new OverrideModal(
+			this.app,
+			`${card.id} → ${STATUS_EN[status]} 被后端拒绝`,
+			detail,
+			() => void this.moveCardRemote(card, status, true),
+		).open();
+	}
+
 	private cards(): RoadmapCard[] {
+		if (this.mode === "api" && this.apiCards) return this.apiCards;
 		const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
 		return ROADMAP.cards.map((card) => ({
 			...card,
@@ -355,7 +508,11 @@ export class RoadmapView extends ItemView {
 		const path = normalizePath(this.plugin.subPath(rel));
 		const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
 		if (folder) await this.ensureFolder(folder);
-		const content = buildKanbanMarkdown(this.cards());
+		const source =
+			this.mode === "api"
+				? `${this.plugin.api.baseUrl()}/api/roadmap`
+				: "roadmap/backlog.json (offline)";
+		const content = buildKanbanMarkdown(this.cards(), source);
 		const existing = this.app.vault.getAbstractFileByPath(path);
 		let file: TFile;
 		if (existing instanceof TFile) {
@@ -430,7 +587,13 @@ export class RoadmapView extends ItemView {
 		return btn;
 	}
 
-	private select(parent: HTMLElement, label: string, values: string[], onChange: (value: string) => void): void {
+	private select(
+		parent: HTMLElement,
+		label: string,
+		values: string[],
+		current: string,
+		onChange: (value: string) => void,
+	): void {
 		const wrap = parent.createDiv({ cls: "ir-select" });
 		wrap.createSpan({ text: label });
 		const sel = wrap.createEl("select");
@@ -443,7 +606,64 @@ export class RoadmapView extends ItemView {
 						: value;
 			sel.createEl("option", { text, value });
 		}
+		if (values.includes(current)) sel.value = current;
 		sel.addEventListener("change", () => onChange(sel.value));
+	}
+}
+
+/** Project a backend list row onto the view's card shape. The list endpoint
+ * carries dependency ids but no checklists, so acceptance starts from the
+ * bundled seed and is hydrated from GET /cards/{id} on selection
+ * (RoadmapView.hydrateDetail). */
+function fromApiCard(row: RoadmapApiCard): RoadmapCard {
+	const seed = ROADMAP.cards.find((c) => c.id === row.id);
+	return {
+		id: row.id,
+		title: row.title,
+		type: row.type as RoadmapType,
+		phase: row.phase,
+		status: normalizeStatus(row.status) ?? "inbox",
+		priority: (PRIORITY_VALUES.has(row.priority) ? row.priority : "P2") as RoadmapPriority,
+		risk: row.risk as RoadmapRisk,
+		summary: row.summary ?? "",
+		design_links: row.design_links ?? [],
+		expected_files: row.expected_files ?? [],
+		dependencies: row.dependencies ?? [],
+		acceptance: seed?.acceptance ?? [],
+		verification: row.verification ?? [],
+		sort_order: row.sort_order,
+		blocked_reason: row.blocked_reason,
+	};
+}
+
+/** Move rejection + override confirmation. A Notice auto-dismisses (and hides on
+ * any click inside it), losing the override affordance — a Modal keeps it up
+ * until the operator decides. */
+class OverrideModal extends Modal {
+	constructor(
+		app: App,
+		private heading: string,
+		private detail: string,
+		private onConfirm: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(this.heading);
+		this.contentEl.createDiv({ text: this.detail });
+		const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+		const cancel = row.createEl("button", { text: "取消" });
+		cancel.addEventListener("click", () => this.close());
+		const confirm = row.createEl("button", { text: "强制移动（override）", cls: "mod-warning" });
+		confirm.addEventListener("click", () => {
+			this.close();
+			this.onConfirm();
+		});
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 
@@ -456,10 +676,41 @@ function mapById(cards: RoadmapCard[]): Map<string, RoadmapCard> {
 }
 
 function isBlocked(card: RoadmapCard, byId: Map<string, RoadmapCard>): boolean {
+	return hasOpenDeps(card, byId) || Boolean(card.blocked_reason);
+}
+
+function hasOpenDeps(card: RoadmapCard, byId: Map<string, RoadmapCard>): boolean {
 	return card.dependencies.some((id) => byId.get(id)?.status !== "done");
 }
 
+/** Offline fallback for GET /api/roadmap/release-gates — mirrors
+ * app/institute/roadmap.py RELEASE_GATES + _phase_token (exact leading token). */
+const RELEASE_GATES = [
+	{ name: "Release A", description: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
+	{ name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
+	{ name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] },
+];
+
+function localReleaseGates(cards: RoadmapCard[]): RoadmapReleaseGate[] {
+	return RELEASE_GATES.map((gate) => {
+		const scoped = cards.filter((c) => gate.prefixes.includes(c.phase.split(" ")[0]));
+		const done = scoped.filter((c) => c.status === "done").length;
+		return {
+			...gate,
+			total: scoped.length,
+			done,
+			pct: scoped.length ? Math.round((done / scoped.length) * 100) : 0,
+			status: scoped.length && done === scoped.length ? "met" : "open",
+			remaining: scoped.filter((c) => c.status !== "done").map((c) => c.id).sort(),
+		};
+	});
+}
+
 function cardSort(a: RoadmapCard, b: RoadmapCard): number {
+	// API mode: the backend's sort_order is the operator-controlled ordering
+	if (a.sort_order !== undefined && b.sort_order !== undefined && a.sort_order !== b.sort_order) {
+		return a.sort_order - b.sort_order;
+	}
 	const phase = ROADMAP.phases.indexOf(a.phase) - ROADMAP.phases.indexOf(b.phase);
 	if (phase !== 0) return phase;
 	const priority = a.priority.localeCompare(b.priority);
@@ -491,12 +742,12 @@ function agentPrompt(card: RoadmapCard): string {
 	].join("\n");
 }
 
-function buildKanbanMarkdown(cards: RoadmapCard[]): string {
+function buildKanbanMarkdown(cards: RoadmapCard[], source: string): string {
 	const byId = mapById(cards);
 	const lines: string[] = [
 		"---",
 		"kanban-plugin: board",
-		"institute-roadmap-source: roadmap/backlog.json",
+		`institute-roadmap-source: ${source}`,
 		`updated: ${new Date().toISOString()}`,
 		"---",
 		"",
@@ -522,12 +773,13 @@ function buildKanbanMarkdown(cards: RoadmapCard[]): string {
 			].join(" ");
 			lines.push(`- [${checked}] **${card.id}** ${card.title} ${tags}`);
 			lines.push(`  - phase: ${card.phase}`);
-			if (isBlocked(card, byId)) {
+			if (hasOpenDeps(card, byId)) {
 				const deps = card.dependencies
 					.filter((id) => byId.get(id)?.status !== "done")
 					.join(", ");
 				lines.push(`  - blocked by: ${deps}`);
 			}
+			if (card.blocked_reason) lines.push(`  - blocked: ${card.blocked_reason}`);
 			if (card.verification[0]) lines.push(`  - verify: \`${card.verification[0]}\``);
 		}
 		lines.push("");
@@ -569,6 +821,15 @@ function ensureRoadmapStyles(): void {
 	color: var(--text-muted);
 	font-size: 12px;
 	margin-top: 2px;
+}
+.ir-subtitle.offline {
+	color: var(--color-orange);
+}
+.ir-modal-actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+	margin-top: 12px;
 }
 .ir-actions, .ir-status-actions {
 	display: flex;

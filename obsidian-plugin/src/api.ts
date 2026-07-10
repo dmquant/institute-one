@@ -145,6 +145,83 @@ export interface VaultIndexRow {
 	written_at: string;
 }
 
+/** GET /api/roadmap/cards — institute.roadmap.list_cards() rows */
+export interface RoadmapApiCard {
+	id: string;
+	title: string;
+	type: string;
+	phase: string;
+	status: string;
+	priority: string;
+	risk: string;
+	summary: string;
+	problem: string;
+	implementation: string;
+	agent_prompt: string;
+	owner: string | null;
+	blocked_reason: string | null;
+	sort_order: number;
+	design_links: string[];
+	expected_files: string[];
+	verification: string[];
+	tags: string[];
+	/** list endpoint: dependency ids; the detail endpoint replaces this with rows */
+	dependencies: string[];
+	created_at: string;
+	updated_at: string;
+	completed_at: string | null;
+}
+
+/** roadmap_checklists row (kind: acceptance | implementation | review) */
+export interface RoadmapChecklistItem {
+	id: string;
+	card_id: string;
+	kind: string;
+	text: string;
+	checked: number; // sqlite 0/1
+	sort_order: number;
+	created_at: string;
+	updated_at: string;
+}
+
+/** roadmap_dependencies row joined with the dependency's live status */
+export interface RoadmapDependencyRow {
+	id: string;
+	card_id: string;
+	depends_on_id: string;
+	relation: string;
+	created_at: string;
+	depends_on_status: string | null;
+}
+
+/** GET /api/roadmap/cards/{id} — also returned by POST …/move */
+export interface RoadmapApiCardDetail extends Omit<RoadmapApiCard, "dependencies"> {
+	checklists: RoadmapChecklistItem[];
+	dependencies: RoadmapDependencyRow[];
+	evidence: Record<string, unknown>[];
+	sessions: Record<string, unknown>[];
+}
+
+/** POST /api/roadmap/import — institute.roadmap.import_backlog() */
+export interface RoadmapImportResult {
+	created: number;
+	updated: number;
+	unchanged: number;
+	total: number;
+}
+
+/** GET /api/roadmap/release-gates — institute.roadmap.release_gates() rows */
+export interface RoadmapReleaseGate {
+	name: string;
+	description: string;
+	prefixes: string[];
+	total: number;
+	done: number;
+	pct: number;
+	status: string; // met | open
+	remaining: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
@@ -152,6 +229,16 @@ export interface VaultIndexRow {
 export function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
 	return String(e);
+}
+
+/** HTTP error carrying the status code so callers can branch on 400/409. */
+export class ApiError extends Error {
+	constructor(
+		message: string,
+		readonly status: number,
+	) {
+		super(message);
+	}
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -303,7 +390,7 @@ export class InstituteApi {
 			} catch {
 				detail = resp.text ?? "";
 			}
-			throw new Error(`HTTP ${resp.status} — ${detail.slice(0, 300)}`);
+			throw new ApiError(`HTTP ${resp.status} — ${detail.slice(0, 300)}`, resp.status);
 		}
 		return resp.json as T;
 	}
@@ -396,6 +483,50 @@ export class InstituteApi {
 		return this.request<ArchiveHit[]>(
 			`/api/archive/search?q=${encodeURIComponent(q)}&limit=${limit}`,
 		);
+	}
+
+	// ---- roadmap -----------------------------------------------------------------
+
+	listCards(): Promise<RoadmapApiCard[]> {
+		return this.request<RoadmapApiCard[]>("/api/roadmap/cards");
+	}
+
+	getCard(cardId: string): Promise<RoadmapApiCardDetail> {
+		return this.request<RoadmapApiCardDetail>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}`,
+		);
+	}
+
+	/**
+	 * POST /api/roadmap/cards/{id}/move. Backend rejections: 400 = move rule
+	 * (open dependencies / missing owner / no evidence — retry with override),
+	 * 409 = concurrent change (expected_status mismatch or lost claim — reload).
+	 */
+	moveCard(
+		cardId: string,
+		to: string,
+		override = false,
+		expected?: string | null,
+	): Promise<RoadmapApiCardDetail> {
+		const body: Record<string, unknown> = { status: to, override };
+		if (expected != null) body.expected_status = expected;
+		return this.request<RoadmapApiCardDetail>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}/move`,
+			{ method: "POST", body },
+		);
+	}
+
+	/** POST /api/roadmap/import — idempotent upsert of roadmap/backlog.json by card id. */
+	importSeed(force = false): Promise<RoadmapImportResult> {
+		return this.request<RoadmapImportResult>("/api/roadmap/import", {
+			method: "POST",
+			body: { force },
+		});
+	}
+
+	/** GET /api/roadmap/release-gates — gate progress projected from card phases. */
+	releaseGates(): Promise<RoadmapReleaseGate[]> {
+		return this.request<RoadmapReleaseGate[]>("/api/roadmap/release-gates");
 	}
 
 	// ---- events ------------------------------------------------------------------
