@@ -194,6 +194,9 @@ async def test_plain_moves_and_conditional_claim(tmp_path):
         await roadmap.move("M7-TMPM", "review", expected_status="ready")
     assert (await roadmap.get_card("M7-TMPM"))["status"] == "in_progress"
 
+    # review needs a coding session with a summary (M7-005)
+    sess = await roadmap.create_session("M7-TMPM", actor="claude", goal="do the work")
+    await roadmap.update_session(sess["id"], {"status": "completed", "summary": "did the work"})
     card = await roadmap.move("M7-TMPM", "review")
     assert card["status"] == "review"
 
@@ -244,6 +247,53 @@ async def test_move_gates_empty_acceptance_and_blocked(tmp_path):
     assert card["status"] == "in_progress"
 
 
+async def test_move_to_review_gated_by_session_summary(tmp_path):
+    # self-contained card with a pinned status: the gate assertions must not
+    # depend on the live board (review requires a session summary, M7-005)
+    data = _seed_copy()
+    data["cards"].append({
+        "id": "M7-TMPR", "title": "temp review-gate card",
+        "phase": "M7 Roadmap Control Plane", "status": "in_progress", "owner": "claude",
+    })
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await roadmap.import_backlog(seed)
+
+    # no sessions at all -> review is blocked
+    with pytest.raises(roadmap.RoadmapError, match="session summary"):
+        await roadmap.move("M7-TMPR", "review")
+    assert (await roadmap.get_card("M7-TMPR"))["status"] == "in_progress"
+
+    # a session without a summary does not open the gate; whitespace doesn't count
+    sess = await roadmap.create_session("M7-TMPR", actor="claude", goal="implement the thing")
+    with pytest.raises(roadmap.RoadmapError, match="session summary"):
+        await roadmap.move("M7-TMPR", "review")
+    await roadmap.update_session(sess["id"], {"summary": "   "})
+    with pytest.raises(roadmap.RoadmapError, match="session summary"):
+        await roadmap.move("M7-TMPR", "review")
+
+    # a cancelled session never opens the gate, even with a summary
+    ghost = await roadmap.create_session("M7-TMPR", actor="claude", goal="abandoned attempt")
+    await roadmap.update_session(ghost["id"], {"status": "cancelled", "summary": "went nowhere"})
+    with pytest.raises(roadmap.RoadmapError, match="session summary"):
+        await roadmap.move("M7-TMPR", "review")
+
+    # override is the single escape hatch, and it lands on the audit trail
+    card = await roadmap.move("M7-TMPR", "review", override=True, reason="operator says go")
+    assert card["status"] == "review"
+    events = await bus.replay(0, types=["roadmap.card.moved"])
+    assert events[-1].ref_id == "M7-TMPR"
+    assert events[-1].payload == {
+        "from": "in_progress", "to": "review", "override": True, "reason": "operator says go",
+    }
+
+    # back to in_progress, then a real summary opens the gate without override
+    await roadmap.move("M7-TMPR", "in_progress")
+    await roadmap.update_session(sess["id"], {"status": "completed", "summary": "implemented + tested"})
+    card = await roadmap.move("M7-TMPR", "review")
+    assert card["status"] == "review"
+
+
 # ---- (d) invalid values --------------------------------------------------------
 
 async def test_invalid_status_type_priority_rejected(tmp_path):
@@ -257,6 +307,9 @@ async def test_invalid_status_type_priority_rejected(tmp_path):
         await roadmap.update_card("M7-001", {"type": "bananas"})
     with pytest.raises(roadmap.RoadmapError, match="move"):
         await roadmap.update_card("M7-001", {"status": "done"})
+    # explicit null on a text field is a 400-shaped error, not a NOT NULL 500
+    with pytest.raises(roadmap.RoadmapError, match="title must be a string"):
+        await roadmap.update_card("M7-001", {"title": None})
 
     data = _seed_copy()
     data["cards"][0]["priority"] = "P9"
@@ -289,6 +342,21 @@ async def test_session_create_and_command_append_roundtrip():
     assert [c["command_label"] for c in got["commands"]] == ["pytest", "compileall"]
     assert got["commands"][0]["exit_code"] == 0
     assert got["commands"][0]["output_excerpt"] == "all green"
+
+    # full field round-trip: goal + planned files stay updatable mid-session
+    updated = await roadmap.update_session(
+        sess["id"],
+        {"goal": "implement roadmap backend + api",
+         "planned_files": ["app/institute/roadmap.py", "app/api/roadmap.py"]},
+    )
+    assert updated["actor"] == "claude"
+    assert updated["goal"] == "implement roadmap backend + api"
+    assert updated["planned_files"] == ["app/institute/roadmap.py", "app/api/roadmap.py"]
+    assert updated["status"] == "active"  # field edits never claim the status
+
+    # explicit null on a text field is a 400-shaped error, not a NOT NULL 500
+    with pytest.raises(roadmap.RoadmapError, match="summary must be a string"):
+        await roadmap.update_session(sess["id"], {"summary": None})
 
     done = await roadmap.update_session(
         sess["id"], {"status": "completed", "summary": "schema + api + tests", "touched_files": ["app/main.py"]}
@@ -362,22 +430,38 @@ async def test_api_roundtrip_and_release_gates():
         r = await client.patch("/api/roadmap/cards/M7-001", json={"priority": "P9"})
         assert r.status_code == 400
 
+        # review gate (M7-005): no session summary -> 400, override -> allowed
+        r = await client.post("/api/roadmap/cards/M7-006/move", json={"status": "review"})
+        assert r.status_code == 400
+        assert "session summary" in r.json()["detail"]
+
         r = await client.post(
-            "/api/roadmap/cards/M7-001/sessions", json={"actor": "claude", "goal": "wire the api"}
+            "/api/roadmap/cards/M7-001/sessions",
+            json={"actor": "claude", "goal": "wire the api", "planned_files": ["app/api/roadmap.py"]},
         )
         assert r.status_code == 200
+        assert r.json()["planned_files"] == ["app/api/roadmap.py"]
         sid = r.json()["id"]
         r = await client.post(
             f"/api/roadmap/sessions/{sid}/commands",
             json={"command_label": "build", "command_text": "npm run build", "exit_code": 0},
         )
         assert r.status_code == 200
-        r = await client.patch(f"/api/roadmap/sessions/{sid}", json={"status": "completed", "summary": "ok"})
+        # explicit JSON null on a text field -> 400 (was an unhandled NOT NULL 500)
+        r = await client.patch(f"/api/roadmap/sessions/{sid}", json={"summary": None})
+        assert r.status_code == 400
+        assert "summary must be a string" in r.json()["detail"]
+        r = await client.patch(
+            f"/api/roadmap/sessions/{sid}",
+            json={"status": "completed", "summary": "ok", "touched_files": ["app/api/roadmap.py"]},
+        )
         assert r.status_code == 200
         assert r.json()["finished_at"]
+        assert r.json()["touched_files"] == ["app/api/roadmap.py"]
         r = await client.get("/api/roadmap/sessions", params={"card_id": "M7-001"})
         assert r.status_code == 200
         assert len(r.json()) == 1
+        assert r.json()[0]["n_commands"] == 1
 
         r = await client.get("/api/roadmap/release-gates")
         assert r.status_code == 200
@@ -388,6 +472,12 @@ async def test_api_roundtrip_and_release_gates():
         total_a, done_a = _seed_gate("M0", "M1", "M2", "M3")
         assert (gates["Release A"]["total"], gates["Release A"]["done"]) == (total_a, done_a)
         assert gates["Release B"]["total"] == _seed_gate("M4", "M5", "M6")[0]
-        total_c, done_c = _seed_gate("M7")
+        total_c, _ = _seed_gate("M7")
         assert gates["Release C"]["total"] == total_c
-        assert gates["Release C"]["done"] == done_c + 1  # M7-003 forced done above
+        # living seed dones plus the forced M7-003 move above (a no-op if the
+        # board has already marked M7-003 done)
+        done_ids = {
+            c["id"] for c in SEED["cards"]
+            if c.get("phase", "").split(" ")[0] == "M7" and c.get("status") == "done"
+        }
+        assert gates["Release C"]["done"] == len(done_ids | {"M7-003"})

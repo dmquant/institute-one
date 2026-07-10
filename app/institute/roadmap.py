@@ -387,6 +387,8 @@ async def update_card(card_id: str, fields: dict[str, Any]) -> dict[str, Any] | 
             sets.append(f"{key}_json = ?")
             params.append(_dumps(val))
         else:
+            if val is None:  # explicit JSON null -> 400, not a NOT NULL 500
+                raise RoadmapError(f"{key} must be a string")
             sets.append(f"{key} = ?")
             params.append(val)
     sets.append("updated_at = ?")
@@ -410,9 +412,11 @@ async def move(
     """Move a card between statuses (02-data-model.md move semantics).
 
     Unless ``override``: a blocked card cannot move forward; ``ready`` needs a
-    non-empty acceptance checklist; ``in_progress`` needs an owner; ``done``
-    needs every dependency done AND at least one piece of evidence. The write
-    is a conditional claim on the status we validated against.
+    non-empty acceptance checklist; ``in_progress`` needs an owner; ``review``
+    needs a non-cancelled coding session with a non-empty summary
+    (05-global-coding-process §5); ``done`` needs every dependency done AND at
+    least one piece of evidence. The write is a conditional claim on the
+    status we validated against.
     """
     _validate_enum(to_status, set(STATUSES), "status")
     card = await db.query_one("SELECT * FROM roadmap_cards WHERE id = ?", (card_id,))
@@ -437,6 +441,18 @@ async def move(
                 raise RoadmapError("cannot move to ready: acceptance checklist is empty")
         if to_status == "in_progress" and not (owner or card["owner"]):
             raise RoadmapError("cannot move to in_progress without an owner")
+        if to_status == "review":
+            # cancelled sessions never open the gate — their summary (if any)
+            # documents an abandoned attempt, not reviewable work
+            n = await db.query_one(
+                "SELECT COUNT(*) AS n FROM roadmap_coding_sessions "
+                "WHERE card_id = ? AND status != 'cancelled' AND TRIM(summary) != ''",
+                (card_id,),
+            )
+            if not n or not n["n"]:
+                raise RoadmapError(
+                    "cannot move to review without a session summary; set override to force"
+                )
         if to_status == "done":
             open_deps = await db.query(
                 "SELECT d.depends_on_id FROM roadmap_dependencies d "
@@ -559,6 +575,8 @@ async def update_session(session_id: str, fields: dict[str, Any]) -> dict[str, A
             sets.append(f"{key}_json = ?")
             params.append(_dumps(_require_str_list(val, key)))
         else:
+            if val is None:  # explicit JSON null -> 400, not a NOT NULL 500
+                raise RoadmapError(f"{key} must be a string")
             sets.append(f"{key} = ?")
             params.append(val)
 

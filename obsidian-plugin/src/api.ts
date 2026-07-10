@@ -194,12 +194,27 @@ export interface RoadmapDependencyRow {
 	depends_on_status: string | null;
 }
 
+/** roadmap_coding_sessions row; GET /api/roadmap/sessions adds n_commands */
+export interface RoadmapSession {
+	id: string;
+	card_id: string;
+	actor: string;
+	goal: string;
+	status: string; // active | completed | partial | blocked | cancelled
+	planned_files: string[];
+	touched_files: string[];
+	summary: string;
+	started_at: string;
+	finished_at: string | null;
+	n_commands?: number;
+}
+
 /** GET /api/roadmap/cards/{id} — also returned by POST …/move */
 export interface RoadmapApiCardDetail extends Omit<RoadmapApiCard, "dependencies"> {
 	checklists: RoadmapChecklistItem[];
 	dependencies: RoadmapDependencyRow[];
 	evidence: Record<string, unknown>[];
-	sessions: Record<string, unknown>[];
+	sessions: RoadmapSession[];
 }
 
 /** POST /api/roadmap/import — institute.roadmap.import_backlog() */
@@ -522,6 +537,46 @@ export class InstituteApi {
 			method: "POST",
 			body: { force },
 		});
+	}
+
+	/** GET /api/roadmap/sessions?card_id= — newest first, rows carry n_commands. */
+	listSessions(cardId: string): Promise<RoadmapSession[]> {
+		return this.request<RoadmapSession[]>(
+			`/api/roadmap/sessions?card_id=${encodeURIComponent(cardId)}`,
+		);
+	}
+
+	/** POST /api/roadmap/cards/{id}/sessions — opens an active coding session. */
+	createSession(
+		cardId: string,
+		actor: string,
+		goal: string,
+		plannedFiles: string[] = [],
+	): Promise<RoadmapSession> {
+		return this.request<RoadmapSession>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}/sessions`,
+			{ method: "POST", body: { actor, goal, planned_files: plannedFiles } },
+		);
+	}
+
+	/**
+	 * PATCH /api/roadmap/sessions/{id}. A terminal status (completed/partial/
+	 * blocked/cancelled) sets finished_at exactly once — 409 on a lost claim.
+	 */
+	updateSession(
+		sessionId: string,
+		patch: {
+			status?: string;
+			goal?: string;
+			summary?: string;
+			planned_files?: string[];
+			touched_files?: string[];
+		},
+	): Promise<RoadmapSession> {
+		return this.request<RoadmapSession>(
+			`/api/roadmap/sessions/${encodeURIComponent(sessionId)}`,
+			{ method: "PATCH", body: patch },
+		);
 	}
 
 	/** GET /api/roadmap/release-gates — gate progress projected from card phases. */

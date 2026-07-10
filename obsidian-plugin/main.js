@@ -268,6 +268,29 @@ var InstituteApi = class {
       body: { force }
     });
   }
+  /** GET /api/roadmap/sessions?card_id= — newest first, rows carry n_commands. */
+  listSessions(cardId) {
+    return this.request(
+      `/api/roadmap/sessions?card_id=${encodeURIComponent(cardId)}`
+    );
+  }
+  /** POST /api/roadmap/cards/{id}/sessions — opens an active coding session. */
+  createSession(cardId, actor, goal, plannedFiles = []) {
+    return this.request(
+      `/api/roadmap/cards/${encodeURIComponent(cardId)}/sessions`,
+      { method: "POST", body: { actor, goal, planned_files: plannedFiles } }
+    );
+  }
+  /**
+   * PATCH /api/roadmap/sessions/{id}. A terminal status (completed/partial/
+   * blocked/cancelled) sets finished_at exactly once — 409 on a lost claim.
+   */
+  updateSession(sessionId, patch) {
+    return this.request(
+      `/api/roadmap/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "PATCH", body: patch }
+    );
+  }
   /** GET /api/roadmap/release-gates — gate progress projected from card phases. */
   releaseGates() {
     return this.request("/api/roadmap/release-gates");
@@ -1064,7 +1087,7 @@ var backlog_default = {
       title: "Implement thesis domain module and API",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "review",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
@@ -1084,7 +1107,7 @@ var backlog_default = {
       title: "Import market-thesis-data bundle",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe.",
@@ -1104,7 +1127,7 @@ var backlog_default = {
       title: "Add security master schema",
       type: "schema",
       phase: "M2 Securities & Stock Map",
-      status: "review",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
@@ -1202,7 +1225,7 @@ var backlog_default = {
       title: "Build Kanban board UI",
       type: "ui",
       phase: "M7 Roadmap Control Plane",
-      status: "review",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
@@ -1222,7 +1245,7 @@ var backlog_default = {
       title: "Add coding session tracking",
       type: "feature",
       phase: "M7 Roadmap Control Plane",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Implement coding sessions as first-class records tied to roadmap cards, commands, touched files, and completion summaries.",
@@ -1321,6 +1344,14 @@ var STATUS_EN = {
 };
 var ACTIVE_STATUSES = /* @__PURE__ */ new Set(["in_progress", "review", "verify"]);
 var PRIORITY_VALUES = /* @__PURE__ */ new Set(["P0", "P1", "P2", "P3"]);
+var SESSION_STATUS_ZH = {
+  active: "\u8FDB\u884C\u4E2D",
+  completed: "\u5DF2\u5B8C\u6210",
+  partial: "\u90E8\u5206\u5B8C\u6210",
+  blocked: "\u53D7\u963B",
+  cancelled: "\u5DF2\u53D6\u6D88"
+};
+var SESSION_FINISH_STATUSES = ["completed", "partial", "blocked", "cancelled"];
 var RoadmapView = class extends import_obsidian4.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1339,6 +1370,10 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.importTried = false;
     /** card ids whose checklists have been hydrated from GET /cards/{id} */
     this.detailFetched = /* @__PURE__ */ new Set();
+    /** card ids whose sessions have been hydrated from GET /sessions?card_id= */
+    this.sessionsFetched = /* @__PURE__ */ new Set();
+    /** null = the fetch failed; the panel renders a retry row instead of 加载中 */
+    this.sessionsByCard = /* @__PURE__ */ new Map();
     this.plugin = plugin;
     this.navigation = false;
   }
@@ -1403,6 +1438,8 @@ var RoadmapView = class extends import_obsidian4.ItemView {
         this.apiCards = rows.map(fromApiCard);
         this.mode = "api";
         this.detailFetched.clear();
+        this.sessionsFetched.clear();
+        this.sessionsByCard.clear();
         this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
       } else {
         this.apiCards = null;
@@ -1550,6 +1587,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     }
     this.selectedId = card.id;
     this.hydrateDetail(card);
+    this.hydrateSessions(card);
     const blocked = isBlocked(card, byId);
     const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
     const title = top.createDiv();
@@ -1574,6 +1612,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.block(main, "\u8BBE\u8BA1\u94FE\u63A5", card.design_links, "code");
     const side = body.createDiv();
     this.dependencyBlock(side, card, byId);
+    if (this.mode === "api") this.sessionsBlock(side, card);
     this.block(side, "\u6267\u884C\u63D0\u793A", [agentPrompt(card)], "pre");
     if (blocked) {
       const reasons = [];
@@ -1609,6 +1648,96 @@ var RoadmapView = class extends import_obsidian4.ItemView {
         this.detailFetched.delete(card.id);
       }
     );
+  }
+  /** API mode: lazily hydrate the selected card's coding sessions from
+   * GET /api/roadmap/sessions?card_id= (list rows carry n_commands). */
+  hydrateSessions(card) {
+    if (this.mode !== "api" || this.sessionsFetched.has(card.id)) return;
+    this.sessionsFetched.add(card.id);
+    void this.plugin.api.listSessions(card.id).then(
+      (rows) => {
+        this.sessionsByCard.set(card.id, rows);
+        if (this.selectedId === card.id) this.renderDetail();
+      },
+      () => {
+        this.sessionsByCard.set(card.id, null);
+        if (this.selectedId === card.id) this.renderDetail();
+      }
+    );
+  }
+  /** Sessions panel (API mode only): the backend refuses moving a card to
+   * Review until a non-cancelled session carries a summary (override escapes). */
+  sessionsBlock(parent, card) {
+    const box = parent.createDiv({ cls: "ir-block" });
+    const head = box.createDiv({ cls: "ir-sessions-head" });
+    head.createEl("h4", { text: "\u7F16\u7801\u4F1A\u8BDD" });
+    this.button(head, "\u5F00\u59CB\u4F1A\u8BDD", "\u5F00\u59CB\u4E00\u4E2A\u7F16\u7801\u4F1A\u8BDD\uFF08actor + goal\uFF09", () => {
+      new SessionStartModal(this.app, (actor, goal) => void this.startSession(card, actor, goal)).open();
+    });
+    const sessions = this.sessionsByCard.get(card.id);
+    if (sessions === void 0) {
+      box.createDiv({ cls: "ir-empty", text: "\u52A0\u8F7D\u4E2D\u2026" });
+      return;
+    }
+    if (sessions === null) {
+      box.createDiv({ cls: "ir-empty", text: "\u4F1A\u8BDD\u52A0\u8F7D\u5931\u8D25\u3002" });
+      this.button(box, "\u91CD\u8BD5", "\u91CD\u65B0\u52A0\u8F7D\u7F16\u7801\u4F1A\u8BDD", () => this.refreshSessions(card));
+      return;
+    }
+    if (!sessions.length) {
+      box.createDiv({ cls: "ir-empty", text: "\u65E0\u4F1A\u8BDD \u2014 \u79FB\u52A8\u5230 Review \u9700\u8981\u5E26\u603B\u7ED3\u7684\u4F1A\u8BDD\u3002" });
+      return;
+    }
+    for (const sess of sessions) {
+      const row = box.createDiv({ cls: "ir-session" });
+      const meta = row.createDiv({ cls: "ir-card-meta" });
+      meta.createSpan({ cls: "ir-id", text: sess.actor });
+      meta.createSpan({
+        cls: `ir-pill session-${sess.status}`,
+        text: SESSION_STATUS_ZH[sess.status] ?? sess.status
+      });
+      meta.createSpan({ text: `${sess.n_commands ?? 0} \u6761\u547D\u4EE4` });
+      row.createDiv({ cls: "ir-session-goal", text: sess.goal });
+      row.createDiv({
+        cls: `ir-session-summary${sess.summary.trim() ? "" : " is-missing"}`,
+        text: sess.summary.trim() || "\uFF08\u5C1A\u65E0\u603B\u7ED3\uFF09"
+      });
+      if (sess.status === "active") {
+        this.button(row, "\u5B8C\u6210\u4F1A\u8BDD", "\u586B\u5199\u603B\u7ED3\u5E76\u7ED3\u675F\u4F1A\u8BDD", () => {
+          new SessionFinishModal(
+            this.app,
+            sess,
+            (status, summary) => void this.finishSession(card, sess, status, summary)
+          ).open();
+        });
+      }
+    }
+  }
+  async startSession(card, actor, goal) {
+    try {
+      await this.plugin.api.createSession(card.id, actor, goal);
+      this.refreshSessions(card);
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u5F00\u59CB\u4F1A\u8BDD\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+    }
+  }
+  async finishSession(card, sess, status, summary) {
+    try {
+      await this.plugin.api.updateSession(sess.id, { status, summary });
+      this.refreshSessions(card);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        new import_obsidian4.Notice(`Institute Roadmap: \u4F1A\u8BDD ${sess.id} \u5DF2\u88AB\u5E76\u53D1\u7ED3\u675F\uFF0C\u6B63\u5728\u91CD\u65B0\u52A0\u8F7D\u3002`, 6e3);
+        this.refreshSessions(card);
+      } else {
+        new import_obsidian4.Notice(`Institute Roadmap: \u7ED3\u675F\u4F1A\u8BDD\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
+      }
+    }
+  }
+  refreshSessions(card) {
+    this.sessionsFetched.delete(card.id);
+    this.sessionsByCard.delete(card.id);
+    this.renderDetail();
   }
   renderGates() {
     this.gatesEl.empty();
@@ -1837,6 +1966,77 @@ var OverrideModal = class extends import_obsidian4.Modal {
     this.contentEl.empty();
   }
 };
+var SessionStartModal = class extends import_obsidian4.Modal {
+  constructor(app, onSubmit) {
+    super(app);
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    this.titleEl.setText("\u5F00\u59CB\u7F16\u7801\u4F1A\u8BDD");
+    const actor = this.contentEl.createEl("input");
+    actor.type = "text";
+    actor.placeholder = "actor\uFF08human / claude / codex / \u2026\uFF09";
+    actor.value = "human";
+    actor.addClass("ir-modal-input");
+    const goal = this.contentEl.createEl("input");
+    goal.type = "text";
+    goal.placeholder = "\u672C\u6B21\u4F1A\u8BDD\u7684\u5355\u4E00\u76EE\u6807";
+    goal.addClass("ir-modal-input");
+    const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+    const cancel = row.createEl("button", { text: "\u53D6\u6D88" });
+    cancel.addEventListener("click", () => this.close());
+    const confirm = row.createEl("button", { text: "\u5F00\u59CB\u4F1A\u8BDD", cls: "mod-cta" });
+    confirm.addEventListener("click", () => {
+      if (!actor.value.trim() || !goal.value.trim()) {
+        new import_obsidian4.Notice("Institute Roadmap: \u4F1A\u8BDD\u9700\u8981 actor \u548C goal\u3002", 6e3);
+        return;
+      }
+      this.close();
+      this.onSubmit(actor.value.trim(), goal.value.trim());
+    });
+    goal.focus();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var SessionFinishModal = class extends import_obsidian4.Modal {
+  constructor(app, session, onSubmit) {
+    super(app);
+    this.session = session;
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    this.titleEl.setText(`\u7ED3\u675F\u4F1A\u8BDD \xB7 ${this.session.actor}`);
+    this.contentEl.createDiv({ cls: "ir-subtitle", text: this.session.goal });
+    const status = this.contentEl.createEl("select");
+    status.addClass("ir-modal-input");
+    for (const value of SESSION_FINISH_STATUSES) {
+      status.createEl("option", { text: SESSION_STATUS_ZH[value] ?? value, value });
+    }
+    const summary = this.contentEl.createEl("textarea");
+    summary.placeholder = "\u603B\u7ED3\uFF1A\u6539\u4E86\u4EC0\u4E48\u3001\u9A8C\u8BC1\u7ED3\u679C\u3001\u9057\u7559\u98CE\u9669\uFF08Review \u79FB\u52A8\u7684\u524D\u7F6E\u6761\u4EF6\uFF09";
+    summary.rows = 5;
+    summary.addClass("ir-modal-input");
+    summary.value = this.session.summary ?? "";
+    const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+    const cancel = row.createEl("button", { text: "\u53D6\u6D88" });
+    cancel.addEventListener("click", () => this.close());
+    const confirm = row.createEl("button", { text: "\u7ED3\u675F\u4F1A\u8BDD", cls: "mod-cta" });
+    confirm.addEventListener("click", () => {
+      if (!summary.value.trim() && status.value !== "cancelled") {
+        new import_obsidian4.Notice("Institute Roadmap: \u7ED3\u675F\u4F1A\u8BDD\u9700\u8981\u603B\u7ED3\uFF08\u53D6\u6D88\u9664\u5916\uFF09\u3002", 6e3);
+        return;
+      }
+      this.close();
+      this.onSubmit(status.value, summary.value.trim());
+    });
+    summary.focus();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 function normalizeStatus(value) {
   return ROADMAP.columns.includes(value) ? value : null;
 }
@@ -1985,6 +2185,52 @@ function ensureRoadmapStyles() {
 	gap: 8px;
 	justify-content: flex-end;
 	margin-top: 12px;
+}
+.ir-modal-input {
+	display: block;
+	width: 100%;
+	margin-top: 8px;
+}
+.ir-sessions-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.ir-sessions-head h4 {
+	margin: 0 0 5px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-session {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	background: var(--ir-panel-2);
+	padding: 8px;
+	margin-bottom: 8px;
+}
+.ir-pill.session-active {
+	color: var(--color-blue);
+}
+.ir-pill.session-blocked, .ir-pill.session-cancelled {
+	color: var(--color-orange);
+}
+.ir-pill.session-completed {
+	color: var(--color-green);
+}
+.ir-session-goal {
+	font-weight: 650;
+	margin-top: 6px;
+	line-height: 1.35;
+}
+.ir-session-summary {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin: 5px 0 6px;
+	white-space: pre-wrap;
+}
+.ir-session-summary.is-missing {
+	color: var(--color-orange);
 }
 .ir-actions, .ir-status-actions {
 	display: flex;

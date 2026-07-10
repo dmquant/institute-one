@@ -1,6 +1,6 @@
 import { App, ItemView, Modal, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import backlog from "../../roadmap/backlog.json";
-import { ApiError, RoadmapApiCard, RoadmapReleaseGate, errMsg } from "./api";
+import { ApiError, RoadmapApiCard, RoadmapReleaseGate, RoadmapSession, errMsg } from "./api";
 import type InstituteOnePlugin from "./main";
 
 export const VIEW_TYPE_ROADMAP = "institute-roadmap";
@@ -65,6 +65,15 @@ const STATUS_EN: Record<RoadmapStatus, string> = {
 };
 const ACTIVE_STATUSES = new Set<RoadmapStatus>(["in_progress", "review", "verify"]);
 const PRIORITY_VALUES = new Set(["P0", "P1", "P2", "P3"]);
+// roadmap_coding_sessions statuses (roadmap/06-agent-protocol.md completion states)
+const SESSION_STATUS_ZH: Record<string, string> = {
+	active: "进行中",
+	completed: "已完成",
+	partial: "部分完成",
+	blocked: "受阻",
+	cancelled: "已取消",
+};
+const SESSION_FINISH_STATUSES = ["completed", "partial", "blocked", "cancelled"];
 
 export class RoadmapView extends ItemView {
 	private plugin: InstituteOnePlugin;
@@ -84,6 +93,10 @@ export class RoadmapView extends ItemView {
 	private importTried = false;
 	/** card ids whose checklists have been hydrated from GET /cards/{id} */
 	private detailFetched = new Set<string>();
+	/** card ids whose sessions have been hydrated from GET /sessions?card_id= */
+	private sessionsFetched = new Set<string>();
+	/** null = the fetch failed; the panel renders a retry row instead of 加载中 */
+	private sessionsByCard = new Map<string, RoadmapSession[] | null>();
 
 	private subtitleEl!: HTMLElement;
 	private summaryEl!: HTMLElement;
@@ -165,6 +178,8 @@ export class RoadmapView extends ItemView {
 				this.apiCards = rows.map(fromApiCard);
 				this.mode = "api";
 				this.detailFetched.clear();
+				this.sessionsFetched.clear();
+				this.sessionsByCard.clear();
 				this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
 			} else {
 				this.apiCards = null;
@@ -325,6 +340,7 @@ export class RoadmapView extends ItemView {
 		}
 		this.selectedId = card.id;
 		this.hydrateDetail(card);
+		this.hydrateSessions(card);
 		const blocked = isBlocked(card, byId);
 
 		const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
@@ -349,6 +365,7 @@ export class RoadmapView extends ItemView {
 
 		const side = body.createDiv();
 		this.dependencyBlock(side, card, byId);
+		if (this.mode === "api") this.sessionsBlock(side, card);
 		this.block(side, "执行提示", [agentPrompt(card)], "pre");
 		if (blocked) {
 			const reasons: string[] = [];
@@ -389,6 +406,106 @@ export class RoadmapView extends ItemView {
 				this.detailFetched.delete(card.id); // keep the seed fallback; retry on reselect
 			},
 		);
+	}
+
+	/** API mode: lazily hydrate the selected card's coding sessions from
+	 * GET /api/roadmap/sessions?card_id= (list rows carry n_commands). */
+	private hydrateSessions(card: RoadmapCard): void {
+		if (this.mode !== "api" || this.sessionsFetched.has(card.id)) return;
+		this.sessionsFetched.add(card.id);
+		void this.plugin.api.listSessions(card.id).then(
+			(rows) => {
+				this.sessionsByCard.set(card.id, rows);
+				if (this.selectedId === card.id) this.renderDetail();
+			},
+			() => {
+				// keep the fetched flag — a bare re-render must not refetch in a
+				// loop; the null marker renders an explicit retry button instead
+				this.sessionsByCard.set(card.id, null);
+				if (this.selectedId === card.id) this.renderDetail();
+			},
+		);
+	}
+
+	/** Sessions panel (API mode only): the backend refuses moving a card to
+	 * Review until a non-cancelled session carries a summary (override escapes). */
+	private sessionsBlock(parent: HTMLElement, card: RoadmapCard): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		const head = box.createDiv({ cls: "ir-sessions-head" });
+		head.createEl("h4", { text: "编码会话" });
+		this.button(head, "开始会话", "开始一个编码会话（actor + goal）", () => {
+			new SessionStartModal(this.app, (actor, goal) => void this.startSession(card, actor, goal)).open();
+		});
+		const sessions = this.sessionsByCard.get(card.id);
+		if (sessions === undefined) {
+			box.createDiv({ cls: "ir-empty", text: "加载中…" });
+			return;
+		}
+		if (sessions === null) {
+			box.createDiv({ cls: "ir-empty", text: "会话加载失败。" });
+			this.button(box, "重试", "重新加载编码会话", () => this.refreshSessions(card));
+			return;
+		}
+		if (!sessions.length) {
+			box.createDiv({ cls: "ir-empty", text: "无会话 — 移动到 Review 需要带总结的会话。" });
+			return;
+		}
+		for (const sess of sessions) {
+			const row = box.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			meta.createSpan({ cls: "ir-id", text: sess.actor });
+			meta.createSpan({
+				cls: `ir-pill session-${sess.status}`,
+				text: SESSION_STATUS_ZH[sess.status] ?? sess.status,
+			});
+			meta.createSpan({ text: `${sess.n_commands ?? 0} 条命令` });
+			row.createDiv({ cls: "ir-session-goal", text: sess.goal });
+			row.createDiv({
+				cls: `ir-session-summary${sess.summary.trim() ? "" : " is-missing"}`,
+				text: sess.summary.trim() || "（尚无总结）",
+			});
+			if (sess.status === "active") {
+				this.button(row, "完成会话", "填写总结并结束会话", () => {
+					new SessionFinishModal(this.app, sess, (status, summary) =>
+						void this.finishSession(card, sess, status, summary),
+					).open();
+				});
+			}
+		}
+	}
+
+	private async startSession(card: RoadmapCard, actor: string, goal: string): Promise<void> {
+		try {
+			await this.plugin.api.createSession(card.id, actor, goal);
+			this.refreshSessions(card);
+		} catch (e) {
+			new Notice(`Institute Roadmap: 开始会话失败 — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	private async finishSession(
+		card: RoadmapCard,
+		sess: RoadmapSession,
+		status: string,
+		summary: string,
+	): Promise<void> {
+		try {
+			await this.plugin.api.updateSession(sess.id, { status, summary });
+			this.refreshSessions(card);
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 409) {
+				new Notice(`Institute Roadmap: 会话 ${sess.id} 已被并发结束，正在重新加载。`, 6000);
+				this.refreshSessions(card);
+			} else {
+				new Notice(`Institute Roadmap: 结束会话失败 — ${errMsg(e)}`, 8000);
+			}
+		}
+	}
+
+	private refreshSessions(card: RoadmapCard): void {
+		this.sessionsFetched.delete(card.id);
+		this.sessionsByCard.delete(card.id);
+		this.renderDetail(); // hydrateSessions refetches and re-renders
 	}
 
 	private renderGates(): void {
@@ -667,6 +784,91 @@ class OverrideModal extends Modal {
 	}
 }
 
+/** Start a coding session: actor (who is coding) + goal (one session, one goal). */
+class SessionStartModal extends Modal {
+	constructor(
+		app: App,
+		private onSubmit: (actor: string, goal: string) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText("开始编码会话");
+		const actor = this.contentEl.createEl("input");
+		actor.type = "text";
+		actor.placeholder = "actor（human / claude / codex / …）";
+		actor.value = "human";
+		actor.addClass("ir-modal-input");
+		const goal = this.contentEl.createEl("input");
+		goal.type = "text";
+		goal.placeholder = "本次会话的单一目标";
+		goal.addClass("ir-modal-input");
+		const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+		const cancel = row.createEl("button", { text: "取消" });
+		cancel.addEventListener("click", () => this.close());
+		const confirm = row.createEl("button", { text: "开始会话", cls: "mod-cta" });
+		confirm.addEventListener("click", () => {
+			if (!actor.value.trim() || !goal.value.trim()) {
+				new Notice("Institute Roadmap: 会话需要 actor 和 goal。", 6000);
+				return;
+			}
+			this.close();
+			this.onSubmit(actor.value.trim(), goal.value.trim());
+		});
+		goal.focus();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** Finish a session: completion state + the summary the Review gate requires. */
+class SessionFinishModal extends Modal {
+	constructor(
+		app: App,
+		private session: RoadmapSession,
+		private onSubmit: (status: string, summary: string) => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.titleEl.setText(`结束会话 · ${this.session.actor}`);
+		this.contentEl.createDiv({ cls: "ir-subtitle", text: this.session.goal });
+		const status = this.contentEl.createEl("select");
+		status.addClass("ir-modal-input");
+		for (const value of SESSION_FINISH_STATUSES) {
+			status.createEl("option", { text: SESSION_STATUS_ZH[value] ?? value, value });
+		}
+		const summary = this.contentEl.createEl("textarea");
+		summary.placeholder = "总结：改了什么、验证结果、遗留风险（Review 移动的前置条件）";
+		summary.rows = 5;
+		summary.addClass("ir-modal-input");
+		summary.value = this.session.summary ?? "";
+		const row = this.contentEl.createDiv({ cls: "ir-modal-actions" });
+		const cancel = row.createEl("button", { text: "取消" });
+		cancel.addEventListener("click", () => this.close());
+		const confirm = row.createEl("button", { text: "结束会话", cls: "mod-cta" });
+		confirm.addEventListener("click", () => {
+			// cancelled = abandoned attempt: it never opens the Review gate, so
+			// don't force a summary; every other terminal status documents work
+			if (!summary.value.trim() && status.value !== "cancelled") {
+				new Notice("Institute Roadmap: 结束会话需要总结（取消除外）。", 6000);
+				return;
+			}
+			this.close();
+			this.onSubmit(status.value, summary.value.trim());
+		});
+		summary.focus();
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
 function normalizeStatus(value: string | undefined): RoadmapStatus | null {
 	return ROADMAP.columns.includes(value as RoadmapStatus) ? (value as RoadmapStatus) : null;
 }
@@ -830,6 +1032,52 @@ function ensureRoadmapStyles(): void {
 	gap: 8px;
 	justify-content: flex-end;
 	margin-top: 12px;
+}
+.ir-modal-input {
+	display: block;
+	width: 100%;
+	margin-top: 8px;
+}
+.ir-sessions-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.ir-sessions-head h4 {
+	margin: 0 0 5px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-session {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	background: var(--ir-panel-2);
+	padding: 8px;
+	margin-bottom: 8px;
+}
+.ir-pill.session-active {
+	color: var(--color-blue);
+}
+.ir-pill.session-blocked, .ir-pill.session-cancelled {
+	color: var(--color-orange);
+}
+.ir-pill.session-completed {
+	color: var(--color-green);
+}
+.ir-session-goal {
+	font-weight: 650;
+	margin-top: 6px;
+	line-height: 1.35;
+}
+.ir-session-summary {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin: 5px 0 6px;
+	white-space: pre-wrap;
+}
+.ir-session-summary.is-missing {
+	color: var(--color-orange);
 }
 .ir-actions, .ir-status-actions {
 	display: flex;
