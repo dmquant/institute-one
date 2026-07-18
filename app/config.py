@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Point at the *subtree the institute owns*, e.g. ~/Obsidian/Main/Institute
     vault_dir: Path | None = None
 
+    # Analyst roster file. None -> catalog/analysts.json in the repo.
+    # Tests point this at a tmp copy so CRUD never touches the real catalog.
+    catalog_file: Path | None = None
+
     # Execution
     max_concurrent: int = 3
     default_hand: str = "claude"
@@ -114,6 +118,8 @@ class Settings(BaseSettings):
 
     @property
     def catalog_path(self) -> Path:
+        if self.catalog_file is not None:
+            return self.catalog_file.expanduser()
         return self.repo_root / "catalog" / "analysts.json"
 
     @property

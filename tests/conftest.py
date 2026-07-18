@@ -10,6 +10,7 @@ sees this environment.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import shutil
 import tempfile
@@ -25,6 +26,21 @@ for _flag in ("CLAUDE", "CODEX", "GEMINI", "OPENCODE", "OLLAMA", "AGY"):
 os.environ["INSTITUTE_ENABLE_ECHO"] = "true"
 os.environ["INSTITUTE_DEFAULT_HAND"] = "echo"
 os.environ["INSTITUTE_RESEARCH_HANDS"] = "echo"
+
+# Tests run against a tmp COPY of the roster: CRUD tests must never rewrite the
+# real catalog, and per-analyst hand preferences (e.g. "codex") would dead-end
+# in this environment where only the echo hand exists — so neutralize them.
+_REAL_CATALOG = Path(__file__).resolve().parent.parent / "catalog" / "analysts.json"
+_TEST_CATALOG = _TMP_ROOT / "catalog" / "analysts.json"
+_TEST_CATALOG.parent.mkdir(parents=True, exist_ok=True)
+_catalog_data = json.loads(_REAL_CATALOG.read_text(encoding="utf-8"))
+for _a in _catalog_data["analysts"]:
+    _a["hand"] = None
+    _a["model"] = None
+_TEST_CATALOG.write_text(
+    json.dumps(_catalog_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+os.environ["INSTITUTE_CATALOG_FILE"] = str(_TEST_CATALOG)
 
 from app import config  # noqa: E402
 
