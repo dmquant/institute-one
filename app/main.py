@@ -70,6 +70,7 @@ def create_app() -> FastAPI:
         roadmap as api_roadmap,
         sessions as api_sessions,
         tasks as api_tasks,
+        theses as api_theses,
         vault as api_vault,
         whiteboard as api_whiteboard,
         workflows as api_workflows,
@@ -80,7 +81,8 @@ def create_app() -> FastAPI:
         api_meta.router, api_tasks.router, api_hands.router, api_events.router,
         api_analysts.router, api_sessions.router, api_workflows.router,
         api_whiteboard.router, api_mailbox.router, api_research.router,
-        api_roadmap.router, api_archive.router, api_vault.router, api_mcp.router,
+        api_roadmap.router, api_theses.router, api_archive.router, api_vault.router,
+        api_mcp.router,
     ):
         app.include_router(r)
 
