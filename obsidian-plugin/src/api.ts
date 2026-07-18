@@ -217,6 +217,19 @@ export interface RoadmapPrompt {
 	generated: boolean;
 }
 
+/** POST /api/roadmap/import result. */
+export interface RoadmapImportResult {
+	created: number;
+	updated: number;
+	unchanged: number;
+	total: number;
+}
+
+/** GET /api/roadmap/cards/{id} — detail fields the plugin hydrates from. */
+export interface RoadmapCardDetail extends RoadmapLiveCard {
+	checklists: Array<{ id: string; kind: string; text: string; checked: number }>;
+}
+
 // ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
@@ -481,6 +494,19 @@ export class InstituteApi {
 
 	roadmapCards(): Promise<RoadmapLiveCard[]> {
 		return this.request<RoadmapLiveCard[]>("/api/roadmap/cards");
+	}
+
+	roadmapCardDetail(cardId: string): Promise<RoadmapCardDetail> {
+		return this.request<RoadmapCardDetail>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}`,
+		);
+	}
+
+	roadmapImportSeed(force = false): Promise<RoadmapImportResult> {
+		return this.request<RoadmapImportResult>("/api/roadmap/import", {
+			method: "POST",
+			body: { force },
+		});
 	}
 
 	roadmapSessions(cardId?: string, status?: string, limit = 100): Promise<RoadmapSessionRow[]> {

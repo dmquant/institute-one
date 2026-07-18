@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app import bus
+from app import bus, db
 from app.institute import theses
 
 
@@ -68,19 +68,20 @@ async def test_update_appends_versions_only_on_content_change():
     updated = await theses.update_thesis(thesis["id"], {"tags": ["semis", "memory"]})
     assert [v["version"] for v in updated["versions"]] == [1]
 
-    # view + status change: version 2 records the new content
+    # view change: version 2 records the new content
     updated = await theses.update_thesis(
-        thesis["id"], {"view": "供需缺口到 2027", "status": "paused"}, author="operator"
+        thesis["id"], {"view": "供需缺口到 2027"}, author="operator"
     )
     assert [v["version"] for v in updated["versions"]] == [1, 2]
     assert updated["versions"][-1]["view"] == "供需缺口到 2027"
-    assert updated["versions"][-1]["status"] == "paused"
     assert updated["versions"][-1]["author"] == "operator"
     # unchanged fields carry forward into the version row
     assert updated["versions"][-1]["title"] == "HBM 供不应求"
+    assert updated["versions"][-1]["status"] == "active"
 
-    with pytest.raises(theses.ThesisError, match="unknown status"):
-        await theses.update_thesis(thesis["id"], {"status": "zombie"})
+    # status is not patchable: the lifecycle channel is set_status()
+    with pytest.raises(theses.ThesisError, match="set_status"):
+        await theses.update_thesis(thesis["id"], {"status": "paused"})
     with pytest.raises(theses.ThesisError, match="unknown thesis fields"):
         await theses.update_thesis(thesis["id"], {"slug": "new-slug"})
     with pytest.raises(theses.ThesisError, match="own parent"):
@@ -108,6 +109,56 @@ async def test_list_filters():
     assert [t["id"] for t in await theses.list_theses(kind="lane")] == [lane["id"]]
     assert [t["id"] for t in await theses.list_theses(status="active")] == [thesis["id"]]
     assert [t["id"] for t in await theses.list_theses(parent_id=lane["id"])] == [thesis["id"]]
+
+
+async def test_set_status_is_a_conditional_claim():
+    _, thesis = await _lane_and_thesis()  # active
+
+    moved = await theses.set_status(thesis["id"], "paused", reason="wait for earnings")
+    assert moved["status"] == "paused"
+    # the transition is versioned like any other content change
+    assert [v["version"] for v in moved["versions"]] == [1, 2]
+    assert moved["versions"][-1]["status"] == "paused"
+
+    # no-op transition returns the row untouched
+    same = await theses.set_status(thesis["id"], "paused")
+    assert [v["version"] for v in same["versions"]] == [1, 2]
+
+    # stale expected_status loses (409 semantics)
+    with pytest.raises(theses.ThesisConflict, match="expected"):
+        await theses.set_status(thesis["id"], "active", expected_status="candidate")
+    assert (await theses.get_thesis(thesis["id"]))["status"] == "paused"
+
+    with pytest.raises(theses.ThesisError, match="unknown status"):
+        await theses.set_status(thesis["id"], "zombie")
+    assert await theses.set_status("missing", "active") is None
+
+    events = await bus.replay(0, types=["thesis.status_changed"])
+    assert len(events) == 1
+    # version stamps the event: emits happen post-commit and can arrive out of
+    # commit order, so consumers order/dedupe by version, not arrival
+    assert events[0].payload == {
+        "from": "active", "to": "paused", "reason": "wait for earnings", "version": 2,
+    }
+
+
+async def test_set_status_noop_still_claims_expected_state(monkeypatch):
+    _, thesis = await _lane_and_thesis()  # active
+    original_query_one = db.query_one
+    raced = False
+
+    async def query_one_with_race(sql, params=()):
+        nonlocal raced
+        row = await original_query_one(sql, params)
+        if not raced and sql.startswith("SELECT * FROM theses WHERE id = ? OR slug = ?"):
+            raced = True
+            await db.execute("UPDATE theses SET status = 'paused' WHERE id = ?", (thesis["id"],))
+        return row
+
+    monkeypatch.setattr(db, "query_one", query_one_with_race)
+    with pytest.raises(theses.ThesisConflict, match="changed concurrently"):
+        await theses.set_status(thesis["id"], "active", expected_status="active")
+    assert (await theses.get_thesis(thesis["id"]))["status"] == "paused"
 
 
 # ---- API ------------------------------------------------------------------------
@@ -142,12 +193,29 @@ async def test_api_roundtrip():
         r = await client.get("/api/theses", params={"flat": "true"})
         assert {t["slug"] for t in r.json()} == {"cn-demand", "baijiu-destock"}
 
-        r = await client.patch(f"/api/theses/{thesis_id}", json={"status": "active", "view": "批价企稳"})
+        r = await client.patch(f"/api/theses/{thesis_id}", json={"view": "批价企稳"})
         assert r.status_code == 200
-        assert r.json()["status"] == "active"
         assert [v["version"] for v in r.json()["versions"]] == [1, 2]
 
-        r = await client.patch(f"/api/theses/{thesis_id}", json={"status": "nonsense"})
-        assert r.status_code == 400
+        # status is not a PATCH field: fail loudly so old clients cannot think
+        # a lifecycle change succeeded when it was ignored
+        r = await client.patch(f"/api/theses/{thesis_id}", json={"status": "paused", "view": "又变了"})
+        assert r.status_code == 422
+        current = (await client.get(f"/api/theses/{thesis_id}")).json()
+        assert current["status"] == "candidate"
+        assert current["view"] == "批价企稳"
         assert (await client.get("/api/theses/missing")).status_code == 404
         assert (await client.patch("/api/theses/missing", json={"view": "x"})).status_code == 404
+
+        # lifecycle route: conditional transition, stale expectation -> 409
+        r = await client.post(f"/api/theses/{thesis_id}/status", json={"status": "active"})
+        assert r.status_code == 200
+        assert r.json()["status"] == "active"
+        r = await client.post(f"/api/theses/{thesis_id}/status", json={"status": "nonsense"})
+        assert r.status_code == 400
+        r = await client.post(
+            f"/api/theses/{thesis_id}/status",
+            json={"status": "paused", "expected_status": "candidate"},
+        )
+        assert r.status_code == 409
+        assert (await client.post("/api/theses/missing/status", json={"status": "active"})).status_code == 404

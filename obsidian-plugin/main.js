@@ -242,6 +242,17 @@ var InstituteApi = class {
   roadmapCards() {
     return this.request("/api/roadmap/cards");
   }
+  roadmapCardDetail(cardId) {
+    return this.request(
+      `/api/roadmap/cards/${encodeURIComponent(cardId)}`
+    );
+  }
+  roadmapImportSeed(force = false) {
+    return this.request("/api/roadmap/import", {
+      method: "POST",
+      body: { force }
+    });
+  }
   roadmapSessions(cardId, status, limit = 100) {
     const params = new URLSearchParams();
     if (cardId) params.set("card_id", cardId);
@@ -1579,6 +1590,11 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     /** Same idea for the sessions panel: last STARTED load wins, not last response. */
     this.sessionsGen = 0;
     this.livePrompt = null;
+    /** Backend checklist texts per card (hydrated on select): live-only cards
+     * have no bundled acceptance, and seed cards may have operator-added items. */
+    this.liveAcceptance = /* @__PURE__ */ new Map();
+    /** Prevent duplicate explicit seed-sync clicks while one import is running. */
+    this.seedImporting = false;
     // process strip (M7-006): live sessions/decisions/gates beyond the board.
     // Section fetch failures keep last-known-good data and surface an error
     // marker instead of masquerading as "no data".
@@ -1619,6 +1635,12 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       "\u5237\u65B0",
       "\u4ECE\u540E\u7AEF\u5237\u65B0\u8DEF\u7EBF\u56FE\u4E0E Coding Sessions",
       () => void this.refreshLiveRoadmap(true)
+    );
+    this.button(
+      actions,
+      "\u540C\u6B65\u79CD\u5B50",
+      "\u663E\u5F0F\u5C06 bundled backlog \u5408\u5E76\u5230\u540E\u7AEF\uFF08\u9ED8\u8BA4\u4FDD\u7559\u5B9E\u65F6\u72B6\u6001\uFF09",
+      () => void this.importSeed()
     );
     this.button(
       actions,
@@ -1850,7 +1872,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     const body = this.detailEl.createDiv({ cls: "ir-detail-grid" });
     const main = body.createDiv();
     this.block(main, "\u6458\u8981", [card.summary]);
-    this.block(main, "\u9A8C\u6536\u6807\u51C6", card.acceptance);
+    this.block(main, "\u9A8C\u6536\u6807\u51C6", this.liveAcceptance.get(card.id) ?? card.acceptance);
     this.block(main, "\u9A8C\u8BC1\u547D\u4EE4", card.verification, "code");
     this.block(main, "\u9884\u671F\u6587\u4EF6", card.expected_files, "code");
     this.block(main, "\u8BBE\u8BA1\u94FE\u63A5", card.design_links, "code");
@@ -2039,6 +2061,25 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.renderProcess();
     this.renderGates();
   }
+  async importSeed() {
+    if (this.seedImporting) {
+      new import_obsidian4.Notice("Institute Roadmap: \u79CD\u5B50\u540C\u6B65\u6B63\u5728\u8FDB\u884C\u3002", 4e3);
+      return;
+    }
+    this.seedImporting = true;
+    try {
+      const res = await this.plugin.api.roadmapImportSeed();
+      new import_obsidian4.Notice(
+        `Institute Roadmap: \u79CD\u5B50\u540C\u6B65\u5B8C\u6210\uFF08\u65B0\u5EFA ${res.created} / \u66F4\u65B0 ${res.updated} / \u5171 ${res.total}\uFF09\u3002`,
+        6e3
+      );
+      await this.refreshLiveRoadmap(false);
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u79CD\u5B50\u540C\u6B65\u5931\u8D25 \u2014 ${errMsg(e)}\u3002`, 8e3);
+    } finally {
+      this.seedImporting = false;
+    }
+  }
   async refreshLiveRoadmap(showNotice) {
     const gen = ++this.roadmapGen;
     const processGenAtStart = this.processGen;
@@ -2048,6 +2089,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       if (gen !== this.roadmapGen) return;
       this.liveStatuses.clear();
       this.liveCards.clear();
+      this.liveAcceptance.clear();
       for (const row of rows) {
         const status = normalizeStatus(row.status);
         if (status) this.liveStatuses.set(row.id, status);
@@ -2094,6 +2136,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       this.backendReady = false;
       this.liveStatuses.clear();
       this.liveCards.clear();
+      this.liveAcceptance.clear();
       this.activeSessions = [];
       this.openDecisions = [];
       this.liveGates = [];
@@ -2113,17 +2156,27 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     let sessions = [];
     let error = "";
     let prompt = null;
-    try {
-      sessions = await this.plugin.api.roadmapSessions(cardId);
-      prompt = await this.plugin.api.roadmapAgentPrompt(cardId).then((p) => ({ cardId, text: p.prompt })).catch(() => null);
-    } catch (e) {
-      error = errMsg(e);
-    }
+    let acceptance = null;
+    const [sessionResult, promptResult, acceptanceResult] = await Promise.all([
+      this.plugin.api.roadmapSessions(cardId).then((rows) => ({ rows, error: "" })).catch((e) => ({ rows: [], error: errMsg(e) })),
+      this.plugin.api.roadmapAgentPrompt(cardId).then((p) => ({ cardId, text: p.prompt })).catch(() => null),
+      this.plugin.api.roadmapCardDetail(cardId).then((d) => d.checklists.filter((c) => c.kind === "acceptance").map((c) => c.text)).catch(() => null)
+    ]);
+    sessions = sessionResult.rows;
+    error = sessionResult.error;
+    prompt = promptResult;
+    acceptance = acceptanceResult;
     if (gen !== this.sessionsGen) return;
     this.sessions = sessions;
     this.sessionsError = error;
     this.sessionsLoading = false;
     this.livePrompt = prompt;
+    if (acceptance !== null) {
+      this.liveAcceptance.set(cardId, acceptance);
+    } else {
+      this.liveAcceptance.delete(cardId);
+    }
+    this.renderBoard();
     if (this.selectedId === cardId) {
       this.renderDetail();
     } else if (this.selectedId) {
@@ -2330,6 +2383,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
     const merged = ROADMAP.cards.map((card) => ({
       ...card,
+      acceptance: this.liveAcceptance.get(card.id) ?? card.acceptance,
       status: this.liveStatuses.get(card.id) ?? normalizeStatus(overrides[card.id]) ?? card.status
     }));
     const seedIds = new Set(ROADMAP.cards.map((c) => c.id));
@@ -2347,8 +2401,8 @@ var RoadmapView = class extends import_obsidian4.ItemView {
         design_links: live.design_links ?? [],
         expected_files: live.expected_files ?? [],
         dependencies: live.dependencies ?? [],
-        acceptance: [],
-        // list endpoint carries no checklists; detail panel does
+        acceptance: this.liveAcceptance.get(id) ?? [],
+        // hydrated on select
         verification: live.verification ?? []
       });
     }

@@ -157,7 +157,7 @@ async def test_apply_imports_and_reapply_is_idempotent(bundle_dir: Path):
     assert [v["version"] for v in hbm2["versions"]] == [1]
 
     # a changed view lands as an update + a new version, and local status survives
-    await theses.update_thesis(hbm["id"], {"status": "active"})   # -> version 2 (status change)
+    await theses.set_status(hbm["id"], "active")   # -> version 2 (status change)
     data = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
     data["theses"][0]["view"] = "2027 年前 HBM 供需缺口都在"
     (bundle_dir / "bundle.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -246,6 +246,40 @@ async def test_recanonicalization_merges_onto_existing_security(bundle_dir: Path
     assert res2["counts"]["edge"]["created"] == 0
     assert res2["counts"]["edge"]["updated"] == 0
     assert (await theses.get_thesis(hbm_row["id"]))["securities"][0]["confidence"] == 0.8
+
+
+async def test_recanonicalization_aborts_on_two_manual_edge_owners(bundle_dir: Path):
+    """A canonical merge must never choose between two operator-owned rows."""
+    data = json.loads((bundle_dir / "bundle.json").read_text(encoding="utf-8"))
+    data["stocks"].append({"id": "st-nvda2", "ticker": "NVDA2", "market": "US"})
+    data["thesisStockEdges"].append(
+        {"thesisId": "th-hbm", "stockId": "st-nvda2", "role": "core", "rationale": "second"}
+    )
+    (bundle_dir / "bundle.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    await mti.import_bundle(bundle_dir, apply=True)
+
+    hbm = next(t for t in await theses.list_theses(kind="thesis") if t["meta"].get("bundle_id") == "th-hbm")
+    await securities.upsert_edge(hbm["id"], "NVDA.US", role="core", rationale="manual-primary")
+    await securities.upsert_edge(hbm["id"], "NVDA2.US", role="core", rationale="manual-secondary")
+
+    # The upstream correction collapses NVDA2.US onto NVDA.US, where another
+    # manual edge already owns the same (thesis, security, role) key.
+    next(s for s in data["stocks"] if s["id"] == "st-nvda2")["ticker"] = "NVDA"
+    (bundle_dir / "bundle.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(mti.BundleError, match="manual edge collision"):
+        await mti.import_bundle(bundle_dir, apply=True)
+
+    # The apply transaction rolled back: both operator rows and securities survive.
+    assert await securities.find_security("NVDA.US") is not None
+    assert await securities.find_security("NVDA2.US") is not None
+    edges = (await theses.get_thesis(hbm["id"]))["securities"]
+    assert {(e["security_id"], e["rationale"], e["source"]) for e in edges} == {
+        ("NVDA.US", "manual-primary", "manual"),
+        ("NVDA2.US", "manual-secondary", "manual"),
+    }
+    failed = (await mti.list_batches())[0]
+    assert failed["status"] == "failed"
+    assert any("manual edge collision" in warning for warning in failed["warnings"])
 
 
 async def test_manual_edge_is_never_overwritten_by_bundle(bundle_dir: Path):

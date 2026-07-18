@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import get_settings
 from ..institute import market_thesis_import, securities, theses
@@ -15,6 +15,8 @@ router = APIRouter(prefix="/api/theses", tags=["theses"])
 async def _call(fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
     try:
         return await fn(*args, **kwargs)
+    except theses.ThesisConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     except (theses.ThesisError, securities.SecurityError, market_thesis_import.BundleError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -32,10 +34,12 @@ class ThesisCreate(BaseModel):
 
 
 class ThesisPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # no status here: lifecycle transitions go through POST /{id}/status
     title: str | None = None
     view: str | None = None
     direction: str | None = None
-    status: str | None = None
     parent_id: str | None = None
     tags: list[str] | None = None
     meta: dict[str, Any] | None = None
@@ -47,6 +51,12 @@ class EdgeBody(BaseModel):
     exposure: str = ""
     confidence: float | None = None
     rationale: str = ""
+
+
+class StatusBody(BaseModel):
+    status: str
+    expected_status: str | None = None  # optimistic concurrency: 409 if stale
+    reason: str = ""
 
 
 class ImportBody(BaseModel):
@@ -96,6 +106,17 @@ async def create_thesis(body: ThesisCreate):
 @router.patch("/{thesis_id}")
 async def update_thesis(thesis_id: str, body: ThesisPatch):
     thesis = await _call(theses.update_thesis, thesis_id, body.model_dump(exclude_unset=True))
+    if thesis is None:
+        raise HTTPException(404, "thesis not found")
+    return thesis
+
+
+@router.post("/{thesis_id}/status")
+async def set_thesis_status(thesis_id: str, body: StatusBody):
+    thesis = await _call(
+        theses.set_status, thesis_id, body.status,
+        expected_status=body.expected_status, reason=body.reason,
+    )
     if thesis is None:
         raise HTTPException(404, "thesis not found")
     return thesis

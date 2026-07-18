@@ -723,6 +723,15 @@ async def test_create_and_checklist_edge_inputs_are_400_not_500():
     with pytest.raises(roadmap.RoadmapError, match="already exists"):
         await roadmap.set_checklist_item(a["id"], text="second")
 
+    # explicit null on a NOT NULL text field is a 400, not a NOT NULL 500
+    # (ported from the remote wave-3 line); nullable columns still accept null
+    with pytest.raises(roadmap.RoadmapError, match="must be a string"):
+        await roadmap.update_card("M9-EDGE", {"title": None})
+    with pytest.raises(roadmap.RoadmapError, match="must be a string"):
+        await roadmap.update_card("M9-EDGE", {"summary": None})
+    cleared = await roadmap.update_card("M9-EDGE", {"owner": None, "blocked_reason": None})
+    assert cleared["owner"] is None and cleared["blocked_reason"] is None
+
 
 async def test_import_reconciles_relation_changes(tmp_path):
     await roadmap.import_backlog()

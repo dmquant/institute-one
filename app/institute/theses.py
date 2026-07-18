@@ -22,13 +22,19 @@ CREATE_STATUSES = {"candidate", "active"}
 
 # fields whose change produces a new thesis_versions row
 _VERSIONED_FIELDS = ("title", "view", "direction", "status")
-_UPDATABLE_FIELDS = {"title", "view", "direction", "status", "parent_id", "tags", "meta"}
+# status is NOT patchable: lifecycle transitions go through set_status(),
+# which is the only race-safe channel and the only thesis.status_changed emitter
+_UPDATABLE_FIELDS = {"title", "view", "direction", "parent_id", "tags", "meta"}
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,78}[a-z0-9]$")
 
 
 class ThesisError(ValueError):
     """Validation failure (the API maps this to 400)."""
+
+
+class ThesisConflict(ThesisError):
+    """Conditional claim lost — the row changed under us (API maps to 409)."""
 
 
 def _new_id() -> str:
@@ -192,6 +198,80 @@ async def tree() -> list[dict[str, Any]]:
     return [_attach(r) for r in by_parent.get(None, [])]
 
 
+async def set_status(
+    thesis_id: str,
+    to_status: str,
+    *,
+    expected_status: str | None = None,
+    reason: str = "",
+    author: str = "operator",
+) -> dict[str, Any] | None:
+    """Lifecycle transition as a conditional claim (ported from the remote wave-2 line).
+
+    Unlike a field patch through update_thesis, this is race-safe: a stale
+    ``expected_status`` raises ThesisConflict (API: 409) and the UPDATE claims
+    the exact status it validated against. Appends a version row and emits a
+    dedicated ``thesis.status_changed`` event.
+    """
+    _validate_enum(to_status, STATUSES, "status")
+    row = await db.query_one("SELECT * FROM theses WHERE id = ? OR slug = ?", (thesis_id, thesis_id))
+    if row is None:
+        return None
+    thesis_id = row["id"]
+    from_status = row["status"]
+    if expected_status is not None and expected_status != from_status:
+        raise ThesisConflict(f"thesis {thesis_id} is {from_status!r}, expected {expected_status!r}")
+    if to_status == from_status:
+        # A no-op is still an optimistic-concurrency claim. Without this
+        # conditional UPDATE, another writer could move the row after the
+        # pre-read and we would incorrectly return 200 for stale state.
+        async with db.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE theses SET status = status WHERE id = ? AND status = ?",
+                (thesis_id, from_status),
+            )
+            claimed = cur.rowcount
+            await cur.close()
+            if not claimed:
+                raise ThesisConflict(f"thesis {thesis_id} changed concurrently; reload and retry")
+        return await get_thesis(thesis_id)
+
+    now = bus.now_iso()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "UPDATE theses SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+            (to_status, now, thesis_id, from_status),
+        )
+        claimed = cur.rowcount
+        await cur.close()
+        if not claimed:
+            raise ThesisConflict(f"thesis {thesis_id} changed concurrently; reload and retry")
+        # a status change is versioned content, same as every other transition
+        cur = await conn.execute("SELECT * FROM theses WHERE id = ?", (thesis_id,))
+        fresh = await cur.fetchone()
+        await cur.close()
+        cur = await conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM thesis_versions WHERE thesis_id = ?",
+            (thesis_id,),
+        )
+        version = (await cur.fetchone())["v"] + 1
+        await cur.close()
+        await _append_version(
+            conn, thesis_id, version,
+            {"title": fresh["title"], "view": fresh["view"],
+             "direction": fresh["direction"], "status": to_status},
+            author, now,
+        )
+    # the emit happens after commit, so two racing transitions may emit out of
+    # commit order — the version number IS the order; consumers projecting
+    # state from events must drop payloads older than their last-seen version
+    await bus.emit(
+        "thesis.status_changed", "thesis", thesis_id,
+        {"from": from_status, "to": to_status, "reason": reason, "version": version},
+    )
+    return await get_thesis(thesis_id)
+
+
 async def update_thesis(
     thesis_id: str, fields: dict[str, Any], *, author: str = "operator"
 ) -> dict[str, Any] | None:
@@ -199,13 +279,13 @@ async def update_thesis(
     if row is None:
         return None
     thesis_id = row["id"]
+    if "status" in fields:
+        raise ThesisError("status changes go through set_status(), not update")
     unknown = set(fields) - _UPDATABLE_FIELDS
     if unknown:
         raise ThesisError(f"unknown thesis fields: {', '.join(sorted(unknown))}")
     if "direction" in fields:
         _validate_enum(fields["direction"], DIRECTIONS, "direction")
-    if "status" in fields:
-        _validate_enum(fields["status"], STATUSES, "status")
     if "title" in fields and (not isinstance(fields["title"], str) or not fields["title"].strip()):
         raise ThesisError("title must be a non-empty string")
     if "view" in fields and not isinstance(fields["view"], str):

@@ -137,7 +137,7 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
-.venv/bin/python -m pytest tests -q        # 39 tests, run on the echo hand
+.venv/bin/python -m pytest tests -q        # 89 tests, run on the echo hand
 ```
 
 - **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.
@@ -153,18 +153,18 @@ v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../
 
 There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M7), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. The Obsidian plugin renders it as a roadmap Kanban view (command *Institute: 打开路线图*) and can export the board as a Markdown note. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
 
-The execution track so far (statuses from `backlog.json`, 2026-07-02 — 3 done · 1 in review · 5 ready · 7 inbox of 16 seed cards):
+The execution track so far (statuses from `backlog.json`, 2026-07-18 — 4 done · 10 in review · 4 inbox of 18 cards):
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ Research hands<br/>codex+agy round-robin"]
-    M1["M1 ◔ Thesis registry<br/>1/4 done"]
-    M2["M2 ☐ Securities & stock map"]
-    M3["M3 ☐ Thesis-aware research"]
-    M4["M4 ☐ Market data & PIT store"]
-    M5["M5 ☐ Forecast ledger"]
+    M0["M0 ☑ Research hands<br/>2/2 done"]
+    M1["M1 ◔ Thesis registry<br/>1 done · 3 review"]
+    M2["M2 ◔ Securities & stock map<br/>1 review"]
+    M3["M3 ☐ Thesis-aware research<br/>1 inbox"]
+    M4["M4 ☐ Market data & PIT store<br/>1 inbox"]
+    M5["M5 ☐ Forecast ledger<br/>1 inbox"]
     M6["M6 ☐ Alpha & paper book"]
-    M7["M7 ◔ Control plane<br/>plugin Kanban ✅ · backend API in review"]
+    M7["M7 ◔ Control plane<br/>1 done · 6 review · 1 inbox"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
     M2 --> M4 --> M5 --> M6

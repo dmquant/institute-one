@@ -406,6 +406,26 @@ async def import_bundle(path: str | Path | None = None, *, apply: bool = False) 
             "manifest_json, created_at, finished_at) VALUES (?,?,'dry_run','completed','{}','[]',?,?,NULL)",
             (batch_id, str(src), json.dumps(manifest, ensure_ascii=False), now),
         )
+    except BundleError as exc:
+        # Domain conflicts deliberately abort the apply transaction, which also
+        # rolls back its provisional batch row. Recreate a failed provenance
+        # record so the operator can see and resolve the blocked import.
+        _warn(warnings, str(exc))
+        finished_at = bus.now_iso()
+        await db.execute(
+            "INSERT INTO market_thesis_import_batches (id, source, mode, status, counts_json, warnings_json, "
+            "manifest_json, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                batch_id, str(src), "apply" if apply else "dry_run", "failed",
+                json.dumps(counts, ensure_ascii=False), json.dumps(warnings, ensure_ascii=False),
+                json.dumps(manifest, ensure_ascii=False), now, finished_at,
+            ),
+        )
+        await bus.emit(
+            "thesis.import_failed", "import", batch_id,
+            {"mode": "apply" if apply else "dry_run", "error": str(exc)},
+        )
+        raise
 
     # finalize the batch row with the counts/warnings gathered above
     await db.execute(
@@ -539,9 +559,15 @@ async def _recanonicalize_security(conn, old_id: str, new_id: str, warnings: lis
             await conn.execute(
                 "UPDATE thesis_security_edges SET security_id = ? WHERE id = ?", (new_id, edge["id"])
             )
+        elif edge["source"] != "import" and owner["source"] != "import":
+            # Two operator-owned rows collapse onto the same natural key.
+            # Choosing either one would silently destroy manual work, so stop
+            # the whole import transaction and require explicit resolution.
+            raise BundleError(
+                f"manual edge collision while recanonicalizing {old_id} -> {new_id}: "
+                f"{edge['id']} conflicts with {owner['id']}"
+            )
         else:
-            if edge["source"] != "import":
-                _warn(warnings, f"manual edge {edge['id']} dropped: equivalent edge already on {new_id}")
             await conn.execute("DELETE FROM thesis_security_edges WHERE id = ?", (edge["id"],))
     await conn.execute(
         "UPDATE OR IGNORE security_aliases SET security_id = ? WHERE security_id = ?", (new_id, old_id)
@@ -751,3 +777,34 @@ async def list_batches(limit: int = 20) -> list[dict[str, Any]]:
                 batch[field] = None
         out.append(batch)
     return out
+
+
+def _cli() -> None:
+    """Operator entry point (ported from the remote wave-3 line):
+
+    .venv/bin/python -m app.institute.market_thesis_import market-thesis-data --dry-run
+    .venv/bin/python -m app.institute.market_thesis_import market-thesis-data --apply
+    """
+    import argparse
+    import asyncio
+
+    parser = argparse.ArgumentParser(description="Import a market-thesis-data bundle")
+    parser.add_argument("bundle", nargs="?", default=None,
+                        help="bundle DIRECTORY (default: market-thesis-data/ in the repo)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", help="validate + report only (default)")
+    group.add_argument("--apply", action="store_true", help="write lanes/theses/securities/edges")
+    args = parser.parse_args()
+
+    async def _run() -> dict[str, Any]:
+        await db.init()
+        try:
+            return await import_bundle(args.bundle, apply=args.apply)
+        finally:
+            await db.close()
+
+    print(json.dumps(asyncio.run(_run()), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    _cli()

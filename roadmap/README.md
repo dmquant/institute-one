@@ -28,18 +28,18 @@ The card is not just a ticket. It is the control record for the coding process. 
 
 ## Execution Map
 
-Seed backlog: 16 cards across phases M0–M7 (3 done · 1 in review · 5 ready · 7 inbox as of 2026-07-02). Card statuses live in [backlog.json](backlog.json); drag-moves in the plugin Kanban persist only in local plugin data until the roadmap API (M7-001, in review) is deployed and wired (M7-003).
+Backlog: 18 cards across phases M0–M7 (4 done · 10 in review · 4 inbox as of 2026-07-18). Card statuses live in [backlog.json](backlog.json) as the repo seed and in SQLite as runtime truth. The plugin is backend-first; offline moves remain local, and seed synchronization is an explicit operator action.
 
 ```mermaid
 flowchart LR
     M0["M0 ☑ Research hand policy<br/>codex+agy round-robin · 2/2 done"]
-    M1["M1 ◔ Thesis registry<br/>1/4 done — schema · API · import"]
-    M2["M2 ☐ Securities & stock map<br/>.SH/.SZ/.BJ security master"]
-    M3["M3 ☐ Thesis-aware research queue"]
-    M4["M4 ☐ Market data & PIT store"]
-    M5["M5 ☐ Forecast ledger"]
+    M1["M1 ◔ Thesis registry<br/>1 done · 3 review"]
+    M2["M2 ◔ Securities & stock map<br/>1 review"]
+    M3["M3 ☐ Thesis-aware research queue<br/>1 inbox"]
+    M4["M4 ☐ Market data & PIT store<br/>1 inbox"]
+    M5["M5 ☐ Forecast ledger<br/>1 inbox"]
     M6["M6 ☐ Alpha & paper book<br/>cards TBD"]
-    M7["M7 ◔ Roadmap control plane<br/>plugin Kanban shipped · backend API in review"]
+    M7["M7 ◔ Roadmap control plane<br/>1 done · 6 review · 1 inbox"]
     M0 --> M1 --> M2
     M2 -. "unlocks bundle import (M1-003)" .-> M1
     M1 & M2 --> M3
@@ -47,7 +47,7 @@ flowchart LR
     M1 --> M5
 ```
 
-Note: the Kanban board UI (card M7-003) shipped in `obsidian-plugin/src/roadmap.ts` ahead of its seed status — the seed still lists it as inbox because status flips wait on the M7-001 import.
+Note: the Kanban board and backend control plane are implemented but remain in formal review. Opening the view no longer auto-imports or creates backend rows; use the explicit **Sync seed** action when an operator wants to merge `backlog.json` into SQLite.
 
 ## Reading Order
 

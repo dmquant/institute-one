@@ -515,12 +515,18 @@ async def update_card(card_id: str, fields: dict[str, Any]) -> dict[str, Any] | 
     if not fields:
         return await get_card(card_id)
 
+    # owner and blocked_reason are the only nullable columns; an explicit
+    # JSON null on any other field must be a 400, not a NOT NULL 500
+    # (ported from the remote wave-3 line)
+    _NULLABLE = {"owner", "blocked_reason"}
     sets, params = [], []
     for key, val in fields.items():
         if key in _CARD_JSON_FIELDS:
             sets.append(f"{key}_json = ?")
             params.append(_dumps(val))
         else:
+            if val is None and key not in _NULLABLE:
+                raise RoadmapError(f"{key} must be a string")
             sets.append(f"{key} = ?")
             params.append(val)
     sets.append("updated_at = ?")

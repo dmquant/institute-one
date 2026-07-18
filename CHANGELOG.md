@@ -2,6 +2,25 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-07-18 — Parallel-line reconciliation and review closeout
+
+### Added
+- Ported the remote line's thesis lifecycle endpoint onto the local implementation: `POST /api/theses/{id}/status` uses optimistic concurrency, appends a version, and emits `thesis.status_changed`; the importer now also has a module CLI entry point.
+- The Obsidian roadmap view hydrates live card checklists and exposes an explicit, retryable seed-sync action. Merely opening an empty board no longer writes backend state.
+
+### Changed
+- Reconciled the local and remote histories at `3d8dda9` while keeping the more complete local schema/implementation. The incompatible remote `0003_theses.sql` / `0004_securities.sql` migrations remain intentionally excluded.
+- Updated the execution map to the current 18-card board: 4 done, 10 in review, 4 inbox.
+
+### Fixed
+- Thesis PATCH requests containing lifecycle-only fields now fail loudly instead of returning 200 after silently dropping `status`; no-op status changes also perform a conditional claim.
+- Canonical security merges abort rather than deleting one of two colliding operator-owned edges, preserve both rows through rollback, and record a failed import batch for operator resolution.
+- Roadmap card PATCH maps explicit nulls on non-null text fields to a domain 400, while keeping `owner` and `blocked_reason` nullable.
+- Checklist hydration is independent of coding-session availability, and backend acceptance truth now drives detail, board counts, search, and prompt fallback consistently.
+
+### Verification
+- Two local read-only review passes closed all confirmed findings. Full backend suite: 89 passed; backend compile, diff check, and the production Obsidian plugin build are green.
+
 ## 2026-07-16 — Roadmap control plane completed (M7-005 … M7-008)
 
 ### Added

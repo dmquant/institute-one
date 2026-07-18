@@ -92,6 +92,11 @@ export class RoadmapView extends ItemView {
 	/** Same idea for the sessions panel: last STARTED load wins, not last response. */
 	private sessionsGen = 0;
 	private livePrompt: { cardId: string; text: string } | null = null;
+	/** Backend checklist texts per card (hydrated on select): live-only cards
+	 * have no bundled acceptance, and seed cards may have operator-added items. */
+	private liveAcceptance = new Map<string, string[]>();
+	/** Prevent duplicate explicit seed-sync clicks while one import is running. */
+	private seedImporting = false;
 	// process strip (M7-006): live sessions/decisions/gates beyond the board.
 	// Section fetch failures keep last-known-good data and surface an error
 	// marker instead of masquerading as "no data".
@@ -144,6 +149,9 @@ export class RoadmapView extends ItemView {
 		const actions = head.createDiv({ cls: "ir-actions" });
 		this.button(actions, "刷新", "从后端刷新路线图与 Coding Sessions", () =>
 			void this.refreshLiveRoadmap(true),
+		);
+		this.button(actions, "同步种子", "显式将 bundled backlog 合并到后端（默认保留实时状态）", () =>
+			void this.importSeed(),
 		);
 		this.button(actions, "导出 Kanban 笔记", "写入 Obsidian Kanban 兼容 Markdown", () =>
 			void this.exportKanbanNote(),
@@ -398,7 +406,9 @@ export class RoadmapView extends ItemView {
 		const body = this.detailEl.createDiv({ cls: "ir-detail-grid" });
 		const main = body.createDiv();
 		this.block(main, "摘要", [card.summary]);
-		this.block(main, "验收标准", card.acceptance);
+		// backend checklists win when hydrated: live-only cards have no bundled
+		// acceptance, and seed cards may carry operator-added items
+		this.block(main, "验收标准", this.liveAcceptance.get(card.id) ?? card.acceptance);
 		this.block(main, "验证命令", card.verification, "code");
 		this.block(main, "预期文件", card.expected_files, "code");
 		this.block(main, "设计链接", card.design_links, "code");
@@ -607,6 +617,26 @@ export class RoadmapView extends ItemView {
 		this.renderGates();
 	}
 
+	private async importSeed(): Promise<void> {
+		if (this.seedImporting) {
+			new Notice("Institute Roadmap: 种子同步正在进行。", 4000);
+			return;
+		}
+		this.seedImporting = true;
+		try {
+			const res = await this.plugin.api.roadmapImportSeed();
+			new Notice(
+				`Institute Roadmap: 种子同步完成（新建 ${res.created} / 更新 ${res.updated} / 共 ${res.total}）。`,
+				6000,
+			);
+			await this.refreshLiveRoadmap(false);
+		} catch (e) {
+			new Notice(`Institute Roadmap: 种子同步失败 — ${errMsg(e)}。`, 8000);
+		} finally {
+			this.seedImporting = false;
+		}
+	}
+
 	private async refreshLiveRoadmap(showNotice: boolean): Promise<void> {
 		const gen = ++this.roadmapGen;
 		const processGenAtStart = this.processGen;
@@ -618,6 +648,7 @@ export class RoadmapView extends ItemView {
 			if (gen !== this.roadmapGen) return; // a move or newer refresh superseded this snapshot
 			this.liveStatuses.clear();
 			this.liveCards.clear();
+			this.liveAcceptance.clear(); // re-hydrated on select; stale checklists must not linger
 			for (const row of rows) {
 				const status = normalizeStatus(row.status);
 				if (status) this.liveStatuses.set(row.id, status);
@@ -675,6 +706,7 @@ export class RoadmapView extends ItemView {
 			// is about to write — offline means the live map is meaningless
 			this.liveStatuses.clear();
 			this.liveCards.clear();
+			this.liveAcceptance.clear();
 			this.activeSessions = [];
 			this.openDecisions = [];
 			this.liveGates = [];
@@ -695,21 +727,42 @@ export class RoadmapView extends ItemView {
 		let sessions: RoadmapSession[] = [];
 		let error = "";
 		let prompt: { cardId: string; text: string } | null = null;
-		try {
-			sessions = await this.plugin.api.roadmapSessions(cardId);
-			// the live prompt rides along; its absence is not an error
-			prompt = await this.plugin.api
+		let acceptance: string[] | null = null;
+		// These endpoints are independent: a sessions outage must not suppress
+		// prompt or checklist hydration when the card-detail API still works.
+		const [sessionResult, promptResult, acceptanceResult] = await Promise.all([
+			this.plugin.api
+				.roadmapSessions(cardId)
+				.then((rows) => ({ rows, error: "" }))
+				.catch((e) => ({ rows: [] as RoadmapSession[], error: errMsg(e) })),
+			this.plugin.api
 				.roadmapAgentPrompt(cardId)
 				.then((p) => ({ cardId, text: p.prompt }))
-				.catch(() => null);
-		} catch (e) {
-			error = errMsg(e);
-		}
+				.catch(() => null),
+			this.plugin.api
+				.roadmapCardDetail(cardId)
+				.then((d) => d.checklists.filter((c) => c.kind === "acceptance").map((c) => c.text))
+				.catch(() => null),
+		]);
+		sessions = sessionResult.rows;
+		error = sessionResult.error;
+		prompt = promptResult;
+		acceptance = acceptanceResult;
 		if (gen !== this.sessionsGen) return; // a newer load owns the panel now
 		this.sessions = sessions;
 		this.sessionsError = error;
 		this.sessionsLoading = false;
 		this.livePrompt = prompt;
+		if (acceptance !== null) {
+			this.liveAcceptance.set(cardId, acceptance);
+		} else {
+			// hydration failed: drop the stale cache rather than presenting
+			// old backend checklists as current truth (falls back to bundled)
+			this.liveAcceptance.delete(cardId);
+		}
+		// Board counts and search consume card.acceptance too, so refresh them
+		// whenever detail hydration changes the backend checklist snapshot.
+		this.renderBoard();
 		if (this.selectedId === cardId) {
 			this.renderDetail();
 		} else if (this.selectedId) {
@@ -945,6 +998,7 @@ export class RoadmapView extends ItemView {
 		const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
 		const merged = ROADMAP.cards.map((card) => ({
 			...card,
+			acceptance: this.liveAcceptance.get(card.id) ?? card.acceptance,
 			status:
 				this.liveStatuses.get(card.id) ??
 				normalizeStatus(overrides[card.id]) ??
@@ -968,7 +1022,7 @@ export class RoadmapView extends ItemView {
 				design_links: live.design_links ?? [],
 				expected_files: live.expected_files ?? [],
 				dependencies: live.dependencies ?? [],
-				acceptance: [], // list endpoint carries no checklists; detail panel does
+				acceptance: this.liveAcceptance.get(id) ?? [], // hydrated on select
 				verification: live.verification ?? [],
 			});
 		}

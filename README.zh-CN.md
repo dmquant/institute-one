@@ -134,7 +134,7 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # 停止
 tail -f ~/.institute-one/logs/server.log   # 日志
-.venv/bin/python -m pytest tests -q        # 39 个测试，跑在 echo 手上
+.venv/bin/python -m pytest tests -q        # 89 个测试，跑在 echo 手上
 ```
 
 - **暂停一切新开工**：把 `admin_state` 的 `maintenance` 设为 `{"paused": true}` —— 开板/扫队任务跳过，进行中的自然收尾。
@@ -150,18 +150,18 @@ v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研
 
 此外，[`roadmap/`](./roadmap/) 里还有一个执行层的**路线图控制平面**：设计文档加一块机器可读的卡片看板（`backlog.json`，阶段 M0–M7），所有非平凡改动都按 设计 → 卡片 → 编码会话 → diff → 验证 → 评审 → 发布门禁 → 完成 的流程推进。Obsidian 插件会把它渲染成路线图看板视图（命令 *Institute: 打开路线图*），并可将看板导出为 Markdown 笔记。`ROADMAP.md` 仍是长线特性地图；`roadmap/` 负责单张卡片的落地执行。
 
-当前执行进度（状态取自 `backlog.json`，2026-07-02——16 张种子卡片中 3 张完成 · 1 张评审中 · 5 张就绪 · 7 张待定）：
+当前执行进度（状态取自 `backlog.json`，2026-07-18——18 张卡片中 4 张完成 · 10 张评审中 · 4 张待定）：
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ 研究手策略<br/>codex+agy 轮转"]
-    M1["M1 ◔ 论点注册表<br/>1/4 完成"]
-    M2["M2 ☐ 证券主档与股票映射"]
-    M3["M3 ☐ 论点感知研究队列"]
-    M4["M4 ☐ 行情数据与 PIT 存储"]
-    M5["M5 ☐ 预测台账"]
+    M0["M0 ☑ 研究手策略<br/>2/2 完成"]
+    M1["M1 ◔ 论点注册表<br/>1 完成 · 3 评审"]
+    M2["M2 ◔ 证券主档与股票映射<br/>1 评审"]
+    M3["M3 ☐ 论点感知研究队列<br/>1 待定"]
+    M4["M4 ☐ 行情数据与 PIT 存储<br/>1 待定"]
+    M5["M5 ☐ 预测台账<br/>1 待定"]
     M6["M6 ☐ Alpha 与纸面账本"]
-    M7["M7 ◔ 控制平面<br/>插件看板 ✅ · 后端 API 评审中"]
+    M7["M7 ◔ 控制平面<br/>1 完成 · 6 评审 · 1 待定"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
     M2 --> M4 --> M5 --> M6
