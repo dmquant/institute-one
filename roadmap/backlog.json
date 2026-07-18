@@ -1,6 +1,14 @@
 {
   "version": 1,
-  "columns": ["inbox", "ready", "in_progress", "review", "verify", "done", "parked"],
+  "columns": [
+    "inbox",
+    "ready",
+    "in_progress",
+    "review",
+    "verify",
+    "done",
+    "parked"
+  ],
   "phases": [
     "M0 Research Hand Policy",
     "M1 Thesis Registry",
@@ -21,15 +29,25 @@
       "priority": "P0",
       "risk": "medium",
       "summary": "Default deep research to codex and agy, and constrain research fallback to the configured research hand chain.",
-      "design_links": ["design/local-thesis-alpha/01-local-architecture.md", "design/local-thesis-alpha/05-implementation-roadmap.md"],
-      "expected_files": ["app/config.py", "app/institute/workflows.py", "app/router/executor.py", "app/hands/registry.py"],
+      "design_links": [
+        "design/local-thesis-alpha/01-local-architecture.md",
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      "expected_files": [
+        "app/config.py",
+        "app/institute/workflows.py",
+        "app/router/executor.py",
+        "app/hands/registry.py"
+      ],
       "dependencies": [],
       "acceptance": [
         "INSTITUTE_RESEARCH_HANDS defaults to codex,agy",
         "research workflow steps rotate through the configured research hands",
         "research fallback does not use non-research hands"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"
+      ]
     },
     {
       "id": "M0-002",
@@ -40,14 +58,23 @@
       "priority": "P0",
       "risk": "low",
       "summary": "Add a focused workflow test with fake codex and agy hands to prove research uses only the configured research hand list.",
-      "design_links": ["design/local-thesis-alpha/05-implementation-roadmap.md"],
-      "expected_files": ["tests/conftest.py", "tests/test_workflows.py"],
-      "dependencies": ["M0-001"],
+      "design_links": [
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      "expected_files": [
+        "tests/conftest.py",
+        "tests/test_workflows.py"
+      ],
+      "dependencies": [
+        "M0-001"
+      ],
       "acceptance": [
         "tests can override research hands to echo",
         "focused test asserts requested and actual hands are limited to codex/agy"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_workflows.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_workflows.py -q"
+      ]
     },
     {
       "id": "M1-000",
@@ -58,95 +85,152 @@
       "priority": "P0",
       "risk": "low",
       "summary": "Treat market-thesis-data as the bootstrap source for the local thesis registry and document import mappings, validation, and warnings.",
-      "design_links": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      "expected_files": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      "design_links": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      "expected_files": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
       "dependencies": [],
       "acceptance": [
         "bundle counts and schema are documented",
         "lane/thesis/stock/edge field mappings are documented",
         "import validation and warning policy are documented"
       ],
-      "verification": ["python3 -m json.tool market-thesis-data/manifest.json", "python3 -m json.tool market-thesis-data/bundle.json"]
+      "verification": [
+        "python3 -m json.tool market-thesis-data/manifest.json",
+        "python3 -m json.tool market-thesis-data/bundle.json"
+      ]
     },
     {
       "id": "M1-001",
       "title": "Add thesis and market import schema migration",
       "type": "schema",
       "phase": "M1 Thesis Registry",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "tests/test_theses.py", "tests/test_market_thesis_import.py"],
-      "dependencies": ["M0-001", "M1-000"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "tests/test_theses.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      "dependencies": [
+        "M0-001",
+        "M1-000"
+      ],
       "acceptance": [
         "migration is additive",
         "thesis lifecycle status is represented",
         "version table can preserve view history",
         "import batch and import item provenance are represented"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_theses.py -q", ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q", ".venv/bin/python -m compileall app -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_theses.py -q",
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
     },
     {
       "id": "M1-002",
       "title": "Implement thesis domain module and API",
       "type": "feature",
       "phase": "M1 Thesis Registry",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md"],
-      "expected_files": ["app/institute/theses.py", "app/api/theses.py", "app/main.py", "tests/test_theses.py"],
-      "dependencies": ["M1-001"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md"
+      ],
+      "expected_files": [
+        "app/institute/theses.py",
+        "app/api/theses.py",
+        "app/main.py",
+        "tests/test_theses.py"
+      ],
+      "dependencies": [
+        "M1-001"
+      ],
       "acceptance": [
         "GET /api/theses returns tree data",
         "POST /api/theses creates candidate or active thesis",
         "PATCH /api/theses/{id} updates projection fields",
         "tests cover create, update, duplicate slug, and tree listing"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_theses.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_theses.py -q"
+      ]
     },
     {
       "id": "M1-003",
       "title": "Import market-thesis-data bundle",
       "type": "feature",
       "phase": "M1 Thesis Registry",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe.",
-      "design_links": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      "expected_files": ["app/institute/theses.py", "app/institute/market_thesis_import.py", "tests/test_market_thesis_import.py"],
-      "dependencies": ["M1-001", "M1-002", "M2-001"],
+      "design_links": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      "expected_files": [
+        "app/institute/theses.py",
+        "app/institute/market_thesis_import.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      "dependencies": [
+        "M1-001",
+        "M1-002",
+        "M2-001"
+      ],
       "acceptance": [
         "dry-run validates schema and reports counts/warnings",
         "apply import inserts lanes, theses, securities, and thesis-stock edges",
         "import preserves practical metadata",
         "import is idempotent"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"
+      ]
     },
     {
       "id": "M2-001",
       "title": "Add security master schema",
       "type": "schema",
       "phase": "M2 Securities & Stock Map",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "tests/test_securities.py"],
-      "dependencies": ["M1-001"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "tests/test_securities.py"
+      ],
+      "dependencies": [
+        "M1-001"
+      ],
       "acceptance": [
         "canonical ids support CN_A, HK, and US suffixes",
         "aliases can map Chinese names and unsuffixed tickers",
         "thesis-security edge stores role, exposure, confidence, and rationale",
         "market-thesis-data markets normalize into local market and instrument_type"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_securities.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_securities.py -q"
+      ]
     },
     {
       "id": "M3-001",
@@ -157,16 +241,28 @@
       "priority": "P1",
       "risk": "high",
       "summary": "Add thesis_id, security_id, question, output_type, priority_reason, and cooldown fields while preserving current research behavior and supporting imported market-thesis-data theses.",
-      "design_links": ["design/local-thesis-alpha/03-infinite-research-loop.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/research.py", "tests/test_research.py"],
-      "dependencies": ["M1-002", "M2-001"],
+      "design_links": [
+        "design/local-thesis-alpha/03-infinite-research-loop.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/research.py",
+        "tests/test_research.py"
+      ],
+      "dependencies": [
+        "M1-002",
+        "M2-001"
+      ],
       "acceptance": [
         "old topic-only enqueue still works",
         "structured enqueue stores thesis/security/question",
         "dedup uses thesis, security, and normalized question",
         "imported practical.actionCode can seed research candidates"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_research.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_research.py -q"
+      ]
     },
     {
       "id": "M4-001",
@@ -177,15 +273,25 @@
       "priority": "P1",
       "risk": "high",
       "summary": "Add local point-in-time market data tables for trading calendar, price bars, benchmarks, and corporate actions.",
-      "design_links": ["design/local-thesis-alpha/06-market-data-pit.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/market_data.py", "tests/test_market_data.py"],
-      "dependencies": ["M2-001"],
+      "design_links": [
+        "design/local-thesis-alpha/06-market-data-pit.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/market_data.py",
+        "tests/test_market_data.py"
+      ],
+      "dependencies": [
+        "M2-001"
+      ],
       "acceptance": [
         "tables carry valid_time/as_known_at where required",
         "benchmark marks are separate from securities",
         "calendar can represent closed and suspended days"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_market_data.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_market_data.py -q"
+      ]
     },
     {
       "id": "M5-001",
@@ -196,15 +302,26 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Create forecasts and forecast_settlements tables with deterministic settlement rule fields.",
-      "design_links": ["design/local-thesis-alpha/04-alpha-portfolio-loop.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/forecasts.py", "tests/test_forecasts.py"],
-      "dependencies": ["M1-002", "M4-001"],
+      "design_links": [
+        "design/local-thesis-alpha/04-alpha-portfolio-loop.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/forecasts.py",
+        "tests/test_forecasts.py"
+      ],
+      "dependencies": [
+        "M1-002",
+        "M4-001"
+      ],
       "acceptance": [
         "forecast requires thesis, claim, horizon, direction, and settlement_rule",
         "settlement can record hit/miss/partial/invalid",
         "invalid benchmark fails closed"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_forecasts.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_forecasts.py -q"
+      ]
     },
     {
       "id": "M7-001",
@@ -215,8 +332,16 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
-      "design_links": ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      "design_links": [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
       "dependencies": [],
       "acceptance": [
         "seed import upserts cards by id",
@@ -224,105 +349,224 @@
         "dependencies validate known ids",
         "status/type/priority values are validated"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
     },
     {
       "id": "M7-003",
       "title": "Build Kanban board UI",
       "type": "ui",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "review",
       "priority": "P2",
       "risk": "medium",
       "summary": "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
-      "design_links": ["roadmap/01-portal-design.md"],
-      "expected_files": ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/main.ts", "obsidian-plugin/src/dashboard.ts", "obsidian-plugin/tsconfig.json"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/01-portal-design.md"
+      ],
+      "expected_files": [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/main.ts",
+        "obsidian-plugin/src/dashboard.ts",
+        "obsidian-plugin/tsconfig.json"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "plugin view displays cards grouped by status",
         "filters by phase/type/priority",
         "card detail panel shows checklists, dependencies, expected files, verification commands, and prompt",
         "operator can export a markdown-backed Kanban note"
       ],
-      "verification": ["cd obsidian-plugin && npm run build"]
+      "verification": [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-005",
       "title": "Add coding session tracking",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "ready",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Implement coding sessions as first-class records tied to roadmap cards, commands, touched files, and completion summaries.",
-      "design_links": ["roadmap/05-global-coding-process.md", "roadmap/06-agent-protocol.md", "roadmap/02-data-model.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/06-agent-protocol.md",
+        "roadmap/02-data-model.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "card can start a coding session",
         "session records actor, goal, planned files, touched files, status, and summary",
         "session commands can be attached as evidence",
         "card cannot move to review without a session summary unless operator overrides"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-006",
       "title": "Add global coding process and release gate views",
       "type": "ui",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "review",
       "priority": "P1",
       "risk": "medium",
       "summary": "Add UI views that show active coding sessions, open decisions, release gates, and evidence readiness beyond the Kanban board.",
-      "design_links": ["roadmap/05-global-coding-process.md", "roadmap/01-portal-design.md"],
-      "expected_files": ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/api.ts", "app/api/roadmap.py"],
-      "dependencies": ["M7-001", "M7-003", "M7-005"],
+      "design_links": [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/01-portal-design.md"
+      ],
+      "expected_files": [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/api.ts",
+        "app/api/roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001",
+        "M7-003",
+        "M7-005"
+      ],
       "acceptance": [
         "roadmap view exposes sessions, decisions, and release gates",
         "release readiness is computed from card status and evidence",
         "blocked process items are visible without opening each card"
       ],
-      "verification": ["cd obsidian-plugin && npm run build"]
+      "verification": [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-007",
       "title": "Generate agent prompts from roadmap cards",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "review",
       "priority": "P2",
       "risk": "low",
       "summary": "Generate deterministic coding-agent prompts from card metadata, constraints, acceptance criteria, and verification commands.",
-      "design_links": ["roadmap/06-agent-protocol.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/06-agent-protocol.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "prompt includes card id, title, design links, expected files, acceptance criteria, verification commands, and constraints",
         "operator can copy the generated prompt",
         "prompt generation is deterministic for the same card state"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-008",
       "title": "Roadmap decisions, claim, export, and checklist/dependency CRUD",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "review",
       "priority": "P2",
       "risk": "low",
       "summary": "Implement the 02-data-model.md surface deferred out of M7-001: decision records (roadmap_decisions and roadmap_release_gates are pre-created but unused), POST /cards and /claim, checklist item CRUD, dependency add/remove routes, and GET /export.",
-      "design_links": ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "decisions can be opened and resolved with decision.opened/decision.resolved events",
         "cards can be created and claimed via the API",
         "checklist items and dependencies have add/check/remove routes",
         "GET /export produces a backlog-compatible JSON snapshot"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
+    },
+    {
+      "id": "M7-009",
+      "title": "Repair test baseline against catalog hand prefs and seed drift",
+      "type": "test",
+      "phase": "M7 Roadmap Control Plane",
+      "status": "done",
+      "priority": "P1",
+      "risk": "low",
+      "summary": "Tests now run against a tmp catalog copy with hand prefs neutralized (INSTITUTE_CATALOG_FILE), and roadmap tests track the seeded M7-001 review status instead of asserting ready.",
+      "design_links": [
+        "roadmap/05-global-coding-process.md"
+      ],
+      "expected_files": [
+        "app/config.py",
+        "tests/conftest.py",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "analyst CRUD tests never rewrite catalog/analysts.json",
+        "per-analyst hand preferences do not break the echo-only test env",
+        "full suite passes on a clean checkout"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q"
+      ]
+    },
+    {
+      "id": "M7-010",
+      "title": "Idempotency keys for roadmap mutation routes",
+      "type": "feature",
+      "phase": "M7 Roadmap Control Plane",
+      "status": "inbox",
+      "priority": "P3",
+      "risk": "low",
+      "summary": "A client that cancels mid-response and retries POST /sessions/{id}/commands (or other mutation routes) duplicates rows. Accept an optional client-supplied idempotency key and make retries safe. Residual finding from the M7-005 codex review; low urgency while the only client is the human-driven Obsidian plugin, which never auto-retries.",
+      "design_links": [
+        "roadmap/02-data-model.md"
+      ],
+      "expected_files": [
+        "app/api/roadmap.py",
+        "app/institute/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-005"
+      ],
+      "acceptance": [
+        "mutation routes accept an optional idempotency key",
+        "a retried request with the same key returns the original row instead of duplicating",
+        "keys are scoped so unrelated requests never collide"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
     }
   ]
 }

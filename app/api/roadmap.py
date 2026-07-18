@@ -55,6 +55,59 @@ class MoveBody(BaseModel):
     expected_status: str | None = None  # optimistic concurrency: fail with 409 if stale
 
 
+class CardCreate(BaseModel):
+    id: str
+    title: str
+    type: str = "feature"
+    phase: str = ""
+    status: str = "inbox"
+    priority: str = "P2"
+    risk: str = "medium"
+    owner: str | None = None
+    summary: str = ""
+    problem: str = ""
+    implementation: str = ""
+    agent_prompt: str = ""
+    sort_order: float | None = None
+    design_links: list[str] = Field(default_factory=list)
+    expected_files: list[str] = Field(default_factory=list)
+    verification: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    acceptance: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
+
+
+class ClaimBody(BaseModel):
+    owner: str
+    expected_status: str | None = None
+
+
+class ChecklistCreate(BaseModel):
+    kind: str = "acceptance"
+    text: str
+
+
+class ChecklistPatch(BaseModel):
+    checked: bool | None = None
+    text: str | None = None
+
+
+class DependencyBody(BaseModel):
+    depends_on_id: str
+    relation: str = "blocks"
+
+
+class DecisionCreate(BaseModel):
+    title: str
+    question: str
+    card_id: str | None = None
+    options: list[str] = Field(default_factory=list)
+
+
+class DecisionPatch(BaseModel):
+    decision: str
+
+
 class EvidenceBody(BaseModel):
     kind: str
     title: str
@@ -82,6 +135,7 @@ class CommandBody(BaseModel):
     command_text: str
     exit_code: int | None = None
     output_excerpt: str | None = None
+    attach_as_evidence: bool = False
 
 
 # ---- cards -------------------------------------------------------------------
@@ -105,6 +159,32 @@ async def get_card(card_id: str):
     if card is None:
         raise HTTPException(404, "roadmap card not found")
     return card
+
+
+@router.post("/cards")
+async def create_card(body: CardCreate):
+    data = body.model_dump(exclude_unset=True)
+    data.setdefault("id", body.id)
+    data.setdefault("title", body.title)
+    return await _call(roadmap.create_card, data)
+
+
+@router.post("/cards/{card_id}/claim")
+async def claim_card(card_id: str, body: ClaimBody):
+    card = await _call(
+        roadmap.claim_card, card_id, body.owner, expected_status=body.expected_status
+    )
+    if card is None:
+        raise HTTPException(404, "roadmap card not found")
+    return card
+
+
+@router.get("/cards/{card_id}/prompt")
+async def agent_prompt(card_id: str):
+    prompt = await roadmap.generate_agent_prompt(card_id)
+    if prompt is None:
+        raise HTTPException(404, "roadmap card not found")
+    return prompt
 
 
 @router.post("/import")
@@ -150,6 +230,78 @@ async def add_evidence(card_id: str, body: EvidenceBody):
     return evidence
 
 
+# ---- checklists ------------------------------------------------------------------
+
+@router.post("/cards/{card_id}/checklists")
+async def add_checklist_item(card_id: str, body: ChecklistCreate):
+    item = await _call(roadmap.add_checklist_item, card_id, body.kind, body.text)
+    if item is None:
+        raise HTTPException(404, "roadmap card not found")
+    return item
+
+
+@router.patch("/checklists/{item_id}")
+async def set_checklist_item(item_id: str, body: ChecklistPatch):
+    item = await _call(roadmap.set_checklist_item, item_id, checked=body.checked, text=body.text)
+    if item is None:
+        raise HTTPException(404, "checklist item not found")
+    return item
+
+
+@router.delete("/checklists/{item_id}")
+async def remove_checklist_item(item_id: str):
+    if not await roadmap.remove_checklist_item(item_id):
+        raise HTTPException(404, "checklist item not found")
+    return {"removed": True}
+
+
+# ---- dependencies ----------------------------------------------------------------
+
+@router.post("/cards/{card_id}/dependencies")
+async def add_dependency(card_id: str, body: DependencyBody):
+    dep = await _call(roadmap.add_dependency, card_id, body.depends_on_id, body.relation)
+    if dep is None:
+        raise HTTPException(404, "roadmap card not found")
+    return dep
+
+
+@router.delete("/dependencies/{dep_id}")
+async def remove_dependency(dep_id: str):
+    if not await roadmap.remove_dependency(dep_id):
+        raise HTTPException(404, "dependency not found")
+    return {"removed": True}
+
+
+# ---- decisions -------------------------------------------------------------------
+
+@router.post("/decisions")
+async def open_decision(body: DecisionCreate):
+    return await _call(
+        roadmap.open_decision, body.title, body.question,
+        card_id=body.card_id, options=body.options,
+    )
+
+
+@router.get("/decisions")
+async def list_decisions(card_id: str | None = None, status: str | None = None, limit: int = 100):
+    return await roadmap.list_decisions(card_id=card_id, status=status, limit=limit)
+
+
+@router.patch("/decisions/{decision_id}")
+async def resolve_decision(decision_id: str, body: DecisionPatch):
+    decision = await _call(roadmap.resolve_decision, decision_id, body.decision)
+    if decision is None:
+        raise HTTPException(404, "decision not found")
+    return decision
+
+
+# ---- export ---------------------------------------------------------------------
+
+@router.get("/export")
+async def export_backlog():
+    return await roadmap.export_backlog()
+
+
 # ---- coding sessions -----------------------------------------------------------
 
 @router.post("/cards/{card_id}/sessions")
@@ -188,6 +340,7 @@ async def append_command(session_id: str, body: CommandBody):
     cmd = await _call(
         roadmap.append_command, session_id, body.command_label, body.command_text,
         exit_code=body.exit_code, output_excerpt=body.output_excerpt,
+        attach_as_evidence=body.attach_as_evidence,
     )
     if cmd is None:
         raise HTTPException(404, "roadmap session not found")
