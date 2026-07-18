@@ -134,7 +134,7 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # 停止
 tail -f ~/.institute-one/logs/server.log   # 日志
-.venv/bin/python -m pytest tests -q        # 89 个测试，跑在 echo 手上
+.venv/bin/python -m pytest tests -q        # 90 个测试，跑在 echo 手上
 ```
 
 - **暂停一切新开工**：把 `admin_state` 的 `maintenance` 设为 `{"paused": true}` —— 开板/扫队任务跳过，进行中的自然收尾。

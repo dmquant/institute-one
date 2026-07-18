@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -9,6 +10,8 @@ from fastapi.responses import StreamingResponse
 from .. import bus
 
 router = APIRouter(prefix="/api/events", tags=["events"])
+
+_HEARTBEAT_SECONDS = 25.0
 
 
 @router.get("")
@@ -29,13 +32,22 @@ async def stream(since: int = 0, types: str | None = None):
             last = e.id
             yield f"id: {e.id}\nevent: {e.type}\ndata: {json.dumps(e.to_dict(), ensure_ascii=False)}\n\n"
         sub = bus.subscribe()
+        next_event: asyncio.Task[bus.Event] | None = None
         try:
             while True:
-                try:
-                    e = await asyncio.wait_for(anext(sub), timeout=25)
-                except asyncio.TimeoutError:
+                if next_event is None:
+                    next_event = asyncio.create_task(anext(sub))
+                done, _ = await asyncio.wait(
+                    {next_event}, timeout=_HEARTBEAT_SECONDS,
+                )
+                if not done:
                     yield ": heartbeat\n\n"
                     continue
+                try:
+                    e = next_event.result()
+                except StopAsyncIteration:
+                    return
+                next_event = None
                 if e.id <= last:
                     continue
                 if type_list and not any(e.type.startswith(t) for t in type_list):
@@ -43,6 +55,10 @@ async def stream(since: int = 0, types: str | None = None):
                 last = e.id
                 yield f"id: {e.id}\nevent: {e.type}\ndata: {json.dumps(e.to_dict(), ensure_ascii=False)}\n\n"
         finally:
+            if next_event is not None and not next_event.done():
+                next_event.cancel()
+                with suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await next_event
             await sub.aclose()
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={

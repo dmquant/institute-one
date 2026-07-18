@@ -137,7 +137,7 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
-.venv/bin/python -m pytest tests -q        # 89 tests, run on the echo hand
+.venv/bin/python -m pytest tests -q        # 90 tests, run on the echo hand
 ```
 
 - **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.

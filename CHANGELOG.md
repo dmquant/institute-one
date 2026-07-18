@@ -17,9 +17,10 @@ Notable changes to institute-one, grouped by push batch (dates are SGT work date
 - Canonical security merges abort rather than deleting one of two colliding operator-owned edges, preserve both rows through rollback, and record a failed import batch for operator resolution.
 - Roadmap card PATCH maps explicit nulls on non-null text fields to a domain 400, while keeping `owner` and `blocked_reason` nullable.
 - Checklist hydration is independent of coding-session availability, and backend acceptance truth now drives detail, board counts, search, and prompt fallback consistently.
+- SSE heartbeats keep one pending subscription read instead of cancelling and closing the async generator every 25 seconds; the stop script now waits for graceful exit and sends Uvicorn a second interrupt when long-lived streams hold shutdown open.
 
 ### Verification
-- Two local read-only review passes closed all confirmed findings. Full backend suite: 89 passed; backend compile, diff check, and the production Obsidian plugin build are green.
+- Two local read-only review passes closed all confirmed findings. Full backend suite: 90 passed; backend compile, diff check, shell syntax, and the production Obsidian plugin build are green.
 
 ## 2026-07-16 — Roadmap control plane completed (M7-005 … M7-008)
 
