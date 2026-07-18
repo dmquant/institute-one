@@ -238,6 +238,37 @@ var InstituteApi = class {
     const t = types ? `&types=${encodeURIComponent(types)}` : "";
     return this.request(`/api/events?since=${since}&limit=${limit}${t}`);
   }
+  // ---- roadmap -------------------------------------------------------------------
+  roadmapCards() {
+    return this.request("/api/roadmap/cards");
+  }
+  roadmapSessions(cardId, status, limit = 100) {
+    const params = new URLSearchParams();
+    if (cardId) params.set("card_id", cardId);
+    if (status) params.set("status", status);
+    params.set("limit", String(limit));
+    return this.request(`/api/roadmap/sessions?${params.toString()}`);
+  }
+  roadmapDecisions(status, limit = 100) {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+    params.set("limit", String(limit));
+    return this.request(`/api/roadmap/decisions?${params.toString()}`);
+  }
+  resolveRoadmapDecision(decisionId, decision) {
+    return this.request(
+      `/api/roadmap/decisions/${encodeURIComponent(decisionId)}`,
+      { method: "PATCH", body: { decision } }
+    );
+  }
+  roadmapReleaseGates() {
+    return this.request("/api/roadmap/release-gates");
+  }
+  roadmapAgentPrompt(cardId) {
+    return this.request(
+      `/api/roadmap/cards/${encodeURIComponent(cardId)}/prompt`
+    );
+  }
   // ---- vault ---------------------------------------------------------------------
   vaultDoctor() {
     return this.request("/api/vault/doctor", { method: "POST" });
@@ -932,7 +963,15 @@ var import_obsidian4 = require("obsidian");
 // ../roadmap/backlog.json
 var backlog_default = {
   version: 1,
-  columns: ["inbox", "ready", "in_progress", "review", "verify", "done", "parked"],
+  columns: [
+    "inbox",
+    "ready",
+    "in_progress",
+    "review",
+    "verify",
+    "done",
+    "parked"
+  ],
   phases: [
     "M0 Research Hand Policy",
     "M1 Thesis Registry",
@@ -953,15 +992,25 @@ var backlog_default = {
       priority: "P0",
       risk: "medium",
       summary: "Default deep research to codex and agy, and constrain research fallback to the configured research hand chain.",
-      design_links: ["design/local-thesis-alpha/01-local-architecture.md", "design/local-thesis-alpha/05-implementation-roadmap.md"],
-      expected_files: ["app/config.py", "app/institute/workflows.py", "app/router/executor.py", "app/hands/registry.py"],
+      design_links: [
+        "design/local-thesis-alpha/01-local-architecture.md",
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      expected_files: [
+        "app/config.py",
+        "app/institute/workflows.py",
+        "app/router/executor.py",
+        "app/hands/registry.py"
+      ],
       dependencies: [],
       acceptance: [
         "INSTITUTE_RESEARCH_HANDS defaults to codex,agy",
         "research workflow steps rotate through the configured research hands",
         "research fallback does not use non-research hands"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"
+      ]
     },
     {
       id: "M0-002",
@@ -972,14 +1021,23 @@ var backlog_default = {
       priority: "P0",
       risk: "low",
       summary: "Add a focused workflow test with fake codex and agy hands to prove research uses only the configured research hand list.",
-      design_links: ["design/local-thesis-alpha/05-implementation-roadmap.md"],
-      expected_files: ["tests/conftest.py", "tests/test_workflows.py"],
-      dependencies: ["M0-001"],
+      design_links: [
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      expected_files: [
+        "tests/conftest.py",
+        "tests/test_workflows.py"
+      ],
+      dependencies: [
+        "M0-001"
+      ],
       acceptance: [
         "tests can override research hands to echo",
         "focused test asserts requested and actual hands are limited to codex/agy"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_workflows.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_workflows.py -q"
+      ]
     },
     {
       id: "M1-000",
@@ -990,95 +1048,152 @@ var backlog_default = {
       priority: "P0",
       risk: "low",
       summary: "Treat market-thesis-data as the bootstrap source for the local thesis registry and document import mappings, validation, and warnings.",
-      design_links: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      expected_files: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      design_links: [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      expected_files: [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
       dependencies: [],
       acceptance: [
         "bundle counts and schema are documented",
         "lane/thesis/stock/edge field mappings are documented",
         "import validation and warning policy are documented"
       ],
-      verification: ["python3 -m json.tool market-thesis-data/manifest.json", "python3 -m json.tool market-thesis-data/bundle.json"]
+      verification: [
+        "python3 -m json.tool market-thesis-data/manifest.json",
+        "python3 -m json.tool market-thesis-data/bundle.json"
+      ]
     },
     {
       id: "M1-001",
       title: "Add thesis and market import schema migration",
       type: "schema",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",
-      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      expected_files: ["migrations/*.sql", "tests/test_theses.py", "tests/test_market_thesis_import.py"],
-      dependencies: ["M0-001", "M1-000"],
+      design_links: [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "tests/test_theses.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      dependencies: [
+        "M0-001",
+        "M1-000"
+      ],
       acceptance: [
         "migration is additive",
         "thesis lifecycle status is represented",
         "version table can preserve view history",
         "import batch and import item provenance are represented"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_theses.py -q", ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q", ".venv/bin/python -m compileall app -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_theses.py -q",
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
     },
     {
       id: "M1-002",
       title: "Implement thesis domain module and API",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
-      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md"],
-      expected_files: ["app/institute/theses.py", "app/api/theses.py", "app/main.py", "tests/test_theses.py"],
-      dependencies: ["M1-001"],
+      design_links: [
+        "design/local-thesis-alpha/02-thesis-stock-model.md"
+      ],
+      expected_files: [
+        "app/institute/theses.py",
+        "app/api/theses.py",
+        "app/main.py",
+        "tests/test_theses.py"
+      ],
+      dependencies: [
+        "M1-001"
+      ],
       acceptance: [
         "GET /api/theses returns tree data",
         "POST /api/theses creates candidate or active thesis",
         "PATCH /api/theses/{id} updates projection fields",
         "tests cover create, update, duplicate slug, and tree listing"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_theses.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_theses.py -q"
+      ]
     },
     {
       id: "M1-003",
       title: "Import market-thesis-data bundle",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe.",
-      design_links: ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      expected_files: ["app/institute/theses.py", "app/institute/market_thesis_import.py", "tests/test_market_thesis_import.py"],
-      dependencies: ["M1-001", "M1-002", "M2-001"],
+      design_links: [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      expected_files: [
+        "app/institute/theses.py",
+        "app/institute/market_thesis_import.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      dependencies: [
+        "M1-001",
+        "M1-002",
+        "M2-001"
+      ],
       acceptance: [
         "dry-run validates schema and reports counts/warnings",
         "apply import inserts lanes, theses, securities, and thesis-stock edges",
         "import preserves practical metadata",
         "import is idempotent"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"
+      ]
     },
     {
       id: "M2-001",
       title: "Add security master schema",
       type: "schema",
       phase: "M2 Securities & Stock Map",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
-      design_links: ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      expected_files: ["migrations/*.sql", "tests/test_securities.py"],
-      dependencies: ["M1-001"],
+      design_links: [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "tests/test_securities.py"
+      ],
+      dependencies: [
+        "M1-001"
+      ],
       acceptance: [
         "canonical ids support CN_A, HK, and US suffixes",
         "aliases can map Chinese names and unsuffixed tickers",
         "thesis-security edge stores role, exposure, confidence, and rationale",
         "market-thesis-data markets normalize into local market and instrument_type"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_securities.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_securities.py -q"
+      ]
     },
     {
       id: "M3-001",
@@ -1089,16 +1204,28 @@ var backlog_default = {
       priority: "P1",
       risk: "high",
       summary: "Add thesis_id, security_id, question, output_type, priority_reason, and cooldown fields while preserving current research behavior and supporting imported market-thesis-data theses.",
-      design_links: ["design/local-thesis-alpha/03-infinite-research-loop.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      expected_files: ["migrations/*.sql", "app/institute/research.py", "tests/test_research.py"],
-      dependencies: ["M1-002", "M2-001"],
+      design_links: [
+        "design/local-thesis-alpha/03-infinite-research-loop.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "app/institute/research.py",
+        "tests/test_research.py"
+      ],
+      dependencies: [
+        "M1-002",
+        "M2-001"
+      ],
       acceptance: [
         "old topic-only enqueue still works",
         "structured enqueue stores thesis/security/question",
         "dedup uses thesis, security, and normalized question",
         "imported practical.actionCode can seed research candidates"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_research.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_research.py -q"
+      ]
     },
     {
       id: "M4-001",
@@ -1109,15 +1236,25 @@ var backlog_default = {
       priority: "P1",
       risk: "high",
       summary: "Add local point-in-time market data tables for trading calendar, price bars, benchmarks, and corporate actions.",
-      design_links: ["design/local-thesis-alpha/06-market-data-pit.md"],
-      expected_files: ["migrations/*.sql", "app/institute/market_data.py", "tests/test_market_data.py"],
-      dependencies: ["M2-001"],
+      design_links: [
+        "design/local-thesis-alpha/06-market-data-pit.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "app/institute/market_data.py",
+        "tests/test_market_data.py"
+      ],
+      dependencies: [
+        "M2-001"
+      ],
       acceptance: [
         "tables carry valid_time/as_known_at where required",
         "benchmark marks are separate from securities",
         "calendar can represent closed and suspended days"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_market_data.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_market_data.py -q"
+      ]
     },
     {
       id: "M5-001",
@@ -1128,27 +1265,46 @@ var backlog_default = {
       priority: "P1",
       risk: "medium",
       summary: "Create forecasts and forecast_settlements tables with deterministic settlement rule fields.",
-      design_links: ["design/local-thesis-alpha/04-alpha-portfolio-loop.md"],
-      expected_files: ["migrations/*.sql", "app/institute/forecasts.py", "tests/test_forecasts.py"],
-      dependencies: ["M1-002", "M4-001"],
+      design_links: [
+        "design/local-thesis-alpha/04-alpha-portfolio-loop.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "app/institute/forecasts.py",
+        "tests/test_forecasts.py"
+      ],
+      dependencies: [
+        "M1-002",
+        "M4-001"
+      ],
       acceptance: [
         "forecast requires thesis, claim, horizon, direction, and settlement_rule",
         "settlement can record hit/miss/partial/invalid",
         "invalid benchmark fails closed"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_forecasts.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_forecasts.py -q"
+      ]
     },
     {
       id: "M7-001",
       title: "Add roadmap schema and seed import",
       type: "schema",
       phase: "M7 Roadmap Control Plane",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
-      design_links: ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
-      expected_files: ["migrations/*.sql", "app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      design_links: [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      expected_files: [
+        "migrations/*.sql",
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
       dependencies: [],
       acceptance: [
         "seed import upserts cards by id",
@@ -1156,85 +1312,224 @@ var backlog_default = {
         "dependencies validate known ids",
         "status/type/priority values are validated"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
     },
     {
       id: "M7-003",
       title: "Build Kanban board UI",
       type: "ui",
       phase: "M7 Roadmap Control Plane",
-      status: "inbox",
+      status: "review",
       priority: "P2",
       risk: "medium",
       summary: "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
-      design_links: ["roadmap/01-portal-design.md"],
-      expected_files: ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/main.ts", "obsidian-plugin/src/dashboard.ts", "obsidian-plugin/tsconfig.json"],
-      dependencies: ["M7-001"],
+      design_links: [
+        "roadmap/01-portal-design.md"
+      ],
+      expected_files: [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/main.ts",
+        "obsidian-plugin/src/dashboard.ts",
+        "obsidian-plugin/tsconfig.json"
+      ],
+      dependencies: [
+        "M7-001"
+      ],
       acceptance: [
         "plugin view displays cards grouped by status",
         "filters by phase/type/priority",
         "card detail panel shows checklists, dependencies, expected files, verification commands, and prompt",
         "operator can export a markdown-backed Kanban note"
       ],
-      verification: ["cd obsidian-plugin && npm run build"]
+      verification: [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       id: "M7-005",
       title: "Add coding session tracking",
       type: "feature",
       phase: "M7 Roadmap Control Plane",
-      status: "ready",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Implement coding sessions as first-class records tied to roadmap cards, commands, touched files, and completion summaries.",
-      design_links: ["roadmap/05-global-coding-process.md", "roadmap/06-agent-protocol.md", "roadmap/02-data-model.md"],
-      expected_files: ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      dependencies: ["M7-001"],
+      design_links: [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/06-agent-protocol.md",
+        "roadmap/02-data-model.md"
+      ],
+      expected_files: [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      dependencies: [
+        "M7-001"
+      ],
       acceptance: [
         "card can start a coding session",
         "session records actor, goal, planned files, touched files, status, and summary",
         "session commands can be attached as evidence",
         "card cannot move to review without a session summary unless operator overrides"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       id: "M7-006",
       title: "Add global coding process and release gate views",
       type: "ui",
       phase: "M7 Roadmap Control Plane",
-      status: "inbox",
+      status: "review",
       priority: "P1",
       risk: "medium",
       summary: "Add UI views that show active coding sessions, open decisions, release gates, and evidence readiness beyond the Kanban board.",
-      design_links: ["roadmap/05-global-coding-process.md", "roadmap/01-portal-design.md"],
-      expected_files: ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/api.ts", "app/api/roadmap.py"],
-      dependencies: ["M7-001", "M7-003", "M7-005"],
+      design_links: [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/01-portal-design.md"
+      ],
+      expected_files: [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/api.ts",
+        "app/api/roadmap.py"
+      ],
+      dependencies: [
+        "M7-001",
+        "M7-003",
+        "M7-005"
+      ],
       acceptance: [
         "roadmap view exposes sessions, decisions, and release gates",
         "release readiness is computed from card status and evidence",
         "blocked process items are visible without opening each card"
       ],
-      verification: ["cd obsidian-plugin && npm run build"]
+      verification: [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       id: "M7-007",
       title: "Generate agent prompts from roadmap cards",
       type: "feature",
       phase: "M7 Roadmap Control Plane",
-      status: "inbox",
+      status: "review",
       priority: "P2",
       risk: "low",
       summary: "Generate deterministic coding-agent prompts from card metadata, constraints, acceptance criteria, and verification commands.",
-      design_links: ["roadmap/06-agent-protocol.md"],
-      expected_files: ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      dependencies: ["M7-001"],
+      design_links: [
+        "roadmap/06-agent-protocol.md"
+      ],
+      expected_files: [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      dependencies: [
+        "M7-001"
+      ],
       acceptance: [
         "prompt includes card id, title, design links, expected files, acceptance criteria, verification commands, and constraints",
         "operator can copy the generated prompt",
         "prompt generation is deterministic for the same card state"
       ],
-      verification: [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
+    },
+    {
+      id: "M7-008",
+      title: "Roadmap decisions, claim, export, and checklist/dependency CRUD",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "review",
+      priority: "P2",
+      risk: "low",
+      summary: "Implement the 02-data-model.md surface deferred out of M7-001: decision records (roadmap_decisions and roadmap_release_gates are pre-created but unused), POST /cards and /claim, checklist item CRUD, dependency add/remove routes, and GET /export.",
+      design_links: [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      expected_files: [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
+      dependencies: [
+        "M7-001"
+      ],
+      acceptance: [
+        "decisions can be opened and resolved with decision.opened/decision.resolved events",
+        "cards can be created and claimed via the API",
+        "checklist items and dependencies have add/check/remove routes",
+        "GET /export produces a backlog-compatible JSON snapshot"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
+    },
+    {
+      id: "M7-009",
+      title: "Repair test baseline against catalog hand prefs and seed drift",
+      type: "test",
+      phase: "M7 Roadmap Control Plane",
+      status: "done",
+      priority: "P1",
+      risk: "low",
+      summary: "Tests now run against a tmp catalog copy with hand prefs neutralized (INSTITUTE_CATALOG_FILE), and roadmap tests track the seeded M7-001 review status instead of asserting ready.",
+      design_links: [
+        "roadmap/05-global-coding-process.md"
+      ],
+      expected_files: [
+        "app/config.py",
+        "tests/conftest.py",
+        "tests/test_roadmap.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "analyst CRUD tests never rewrite catalog/analysts.json",
+        "per-analyst hand preferences do not break the echo-only test env",
+        "full suite passes on a clean checkout"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q"
+      ]
+    },
+    {
+      id: "M7-010",
+      title: "Idempotency keys for roadmap mutation routes",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "inbox",
+      priority: "P3",
+      risk: "low",
+      summary: "A client that cancels mid-response and retries POST /sessions/{id}/commands (or other mutation routes) duplicates rows. Accept an optional client-supplied idempotency key and make retries safe. Residual finding from the M7-005 codex review; low urgency while the only client is the human-driven Obsidian plugin, which never auto-retries.",
+      design_links: [
+        "roadmap/02-data-model.md"
+      ],
+      expected_files: [
+        "app/api/roadmap.py",
+        "app/institute/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
+      dependencies: [
+        "M7-005"
+      ],
+      acceptance: [
+        "mutation routes accept an optional idempotency key",
+        "a retried request with the same key returns the original row instead of duplicating",
+        "keys are scoped so unrelated requests never collide"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
     }
   ]
 };
@@ -1270,6 +1565,30 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.status = "all";
     this.type = "all";
     this.selectedId = ROADMAP.cards[0]?.id ?? "";
+    this.liveStatuses = /* @__PURE__ */ new Map();
+    this.liveCards = /* @__PURE__ */ new Map();
+    this.backendReady = false;
+    /** Bumped by every refresh AND every successful/failed move: an in-flight
+     * GET whose generation is stale must be dropped, or its old snapshot would
+     * roll the board back over a move that already succeeded. */
+    this.roadmapGen = 0;
+    this.sessions = [];
+    this.sessionsCardId = "";
+    this.sessionsLoading = false;
+    this.sessionsError = "";
+    /** Same idea for the sessions panel: last STARTED load wins, not last response. */
+    this.sessionsGen = 0;
+    this.livePrompt = null;
+    // process strip (M7-006): live sessions/decisions/gates beyond the board.
+    // Section fetch failures keep last-known-good data and surface an error
+    // marker instead of masquerading as "no data".
+    this.activeSessions = [];
+    this.openDecisions = [];
+    this.liveGates = [];
+    this.processErrors = {};
+    /** Last-started-wins for light process refreshes; a full refresh also
+     * bumps this so an in-flight light snapshot cannot overwrite it. */
+    this.processGen = 0;
     this.plugin = plugin;
     this.navigation = false;
   }
@@ -1295,7 +1614,12 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       text: `roadmap/backlog.json v${ROADMAP.version} \xB7 Obsidian Kanban-compatible`
     });
     const actions = head.createDiv({ cls: "ir-actions" });
-    this.button(actions, "\u5237\u65B0", "\u91CD\u65B0\u6E32\u67D3\u5F53\u524D\u8DEF\u7EBF\u56FE", () => this.render());
+    this.button(
+      actions,
+      "\u5237\u65B0",
+      "\u4ECE\u540E\u7AEF\u5237\u65B0\u8DEF\u7EBF\u56FE\u4E0E Coding Sessions",
+      () => void this.refreshLiveRoadmap(true)
+    );
     this.button(
       actions,
       "\u5BFC\u51FA Kanban \u7B14\u8BB0",
@@ -1303,11 +1627,13 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       () => void this.exportKanbanNote()
     );
     this.summaryEl = root.createDiv({ cls: "ir-summary" });
+    this.processEl = root.createDiv({ cls: "ir-process" });
     this.buildFilters(root);
     this.boardEl = root.createDiv({ cls: "ir-board" });
     this.detailEl = root.createDiv({ cls: "ir-detail" });
     this.gatesEl = root.createDiv({ cls: "ir-gates" });
     this.render();
+    void this.refreshLiveRoadmap(false);
   }
   async onClose() {
     this.contentEl.empty();
@@ -1340,6 +1666,7 @@ var RoadmapView = class extends import_obsidian4.ItemView {
   }
   render() {
     this.renderSummary();
+    this.renderProcess();
     this.renderBoard();
     this.renderDetail();
     this.renderGates();
@@ -1358,6 +1685,93 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.stat(this.summaryEl, String(active), "\u6D3B\u8DC3");
     this.stat(this.summaryEl, String(ready), "\u53EF\u5F00\u5DE5");
     this.stat(this.summaryEl, String(blocked), "\u4F9D\u8D56\u963B\u585E");
+  }
+  /** M7-006: the global coding process at a glance — active sessions, open
+   * decisions, and blocked cards, visible without opening any card. */
+  renderProcess() {
+    this.processEl.empty();
+    if (!this.backendReady) {
+      this.processEl.hide();
+      return;
+    }
+    this.processEl.show();
+    const cards = this.cards();
+    const byId = mapById(cards);
+    const blocked = cards.map((card) => {
+      const live = this.liveCards.get(card.id);
+      const reason = live?.blocked_reason ? live.blocked_reason : isBlocked(card, byId) && card.status !== "done" ? "\u4F9D\u8D56\u672A\u5B8C\u6210" : "";
+      return { card, reason };
+    }).filter((b) => b.reason && b.card.status !== "done" && b.card.status !== "parked");
+    const sessionsBox = this.processEl.createDiv({ cls: "ir-process-box" });
+    sessionsBox.createEl("h4", {
+      text: `\u6D3B\u8DC3 Coding Sessions (${this.activeSessions.length})${this.processErrors.sessions ? " \xB7 \u5237\u65B0\u5931\u8D25\uFF0C\u663E\u793A\u65E7\u6570\u636E" : ""}`
+    });
+    if (this.processErrors.sessions) {
+      sessionsBox.createDiv({ cls: "ir-warning", text: this.processErrors.sessions });
+    }
+    if (!this.activeSessions.length && !this.processErrors.sessions) {
+      sessionsBox.createDiv({ cls: "ir-empty", text: "\u6CA1\u6709\u8FDB\u884C\u4E2D\u7684 Session\u3002" });
+    }
+    for (const session of this.activeSessions.slice(0, 6)) {
+      const row = sessionsBox.createDiv({ cls: "ir-process-row" });
+      row.createSpan({ cls: "ir-id", text: session.card_id });
+      row.createSpan({ text: `${session.actor} \xB7 ${session.goal}` });
+      row.addEventListener("click", () => this.selectCard(session.card_id));
+    }
+    const decisionsBox = this.processEl.createDiv({ cls: "ir-process-box" });
+    decisionsBox.createEl("h4", {
+      text: `\u5F85\u51B3\u7B56 (${this.openDecisions.length})${this.processErrors.decisions ? " \xB7 \u5237\u65B0\u5931\u8D25\uFF0C\u663E\u793A\u65E7\u6570\u636E" : ""}`
+    });
+    if (this.processErrors.decisions) {
+      decisionsBox.createDiv({ cls: "ir-warning", text: this.processErrors.decisions });
+    }
+    if (!this.openDecisions.length && !this.processErrors.decisions) {
+      decisionsBox.createDiv({ cls: "ir-empty", text: "\u6CA1\u6709\u5F85\u51B3\u7B56\u9879\u3002" });
+    }
+    for (const decision of this.openDecisions.slice(0, 6)) {
+      const row = decisionsBox.createDiv({ cls: "ir-process-row" });
+      if (decision.card_id) row.createSpan({ cls: "ir-id", text: decision.card_id });
+      row.createSpan({ text: `${decision.title} \u2014 ${decision.question}` });
+      const resolve = row.createEl("button", { text: "\u88C1\u51B3" });
+      resolve.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this.openResolveDecision(decision);
+      });
+    }
+    const blockedBox = this.processEl.createDiv({ cls: "ir-process-box" });
+    blockedBox.createEl("h4", { text: `\u963B\u585E\u5361\u7247 (${blocked.length})` });
+    if (!blocked.length) {
+      blockedBox.createDiv({ cls: "ir-empty", text: "\u6CA1\u6709\u963B\u585E\u9879\u3002" });
+    }
+    for (const item of blocked.slice(0, 6)) {
+      const row = blockedBox.createDiv({ cls: "ir-process-row" });
+      row.createSpan({ cls: "ir-id", text: item.card.id });
+      row.createSpan({ text: item.reason });
+      row.addEventListener("click", () => this.selectCard(item.card.id));
+    }
+  }
+  selectCard(cardId) {
+    if (!this.cards().some((c) => c.id === cardId)) return;
+    this.selectedId = cardId;
+    this.renderBoard();
+    this.renderDetail();
+  }
+  openResolveDecision(decision) {
+    new PromptModal(
+      this.app,
+      `\u88C1\u51B3\uFF1A${decision.title}`,
+      decision.options.length ? `\u53EF\u9009\uFF1A${decision.options.join(" / ")}` : "\u8F93\u5165\u88C1\u51B3\u5185\u5BB9",
+      (text) => void this.resolveDecision(decision, text)
+    ).open();
+  }
+  async resolveDecision(decision, text) {
+    try {
+      await this.plugin.api.resolveRoadmapDecision(decision.id, text);
+      new import_obsidian4.Notice(`Institute Roadmap: \u51B3\u7B56\u5DF2\u88C1\u51B3 \u2014 ${decision.title}`, 5e3);
+      await this.refreshLiveRoadmap(false);
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u65E0\u6CD5\u88C1\u51B3 \u2014 ${errMsg(e)}`, 8e3);
+    }
   }
   renderBoard() {
     const cards = this.filteredCards();
@@ -1442,7 +1856,21 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     this.block(main, "\u8BBE\u8BA1\u94FE\u63A5", card.design_links, "code");
     const side = body.createDiv();
     this.dependencyBlock(side, card, byId);
-    this.block(side, "\u6267\u884C\u63D0\u793A", [agentPrompt(card)], "pre");
+    this.sessionsEl = side.createDiv();
+    this.renderSessionPanel(card);
+    if (this.sessionsCardId !== card.id && !this.sessionsLoading) {
+      void this.loadSessions(card.id);
+    }
+    const promptText = this.livePrompt && this.livePrompt.cardId === card.id ? this.livePrompt.text : agentPrompt(card);
+    const promptBox = side.createDiv({ cls: "ir-block" });
+    const promptHead = promptBox.createDiv({ cls: "ir-session-head" });
+    promptHead.createEl("h4", {
+      text: this.livePrompt?.cardId === card.id ? "\u6267\u884C\u63D0\u793A\uFF08\u540E\u7AEF\u751F\u6210\uFF09" : "\u6267\u884C\u63D0\u793A\uFF08\u672C\u5730\uFF09"
+    });
+    this.button(promptHead, "\u590D\u5236", "\u590D\u5236\u6267\u884C\u63D0\u793A\u5230\u526A\u8D34\u677F", () => {
+      void navigator.clipboard.writeText(promptText).then(() => new import_obsidian4.Notice("Institute Roadmap: \u6267\u884C\u63D0\u793A\u5DF2\u590D\u5236\u3002", 4e3)).catch((e) => new import_obsidian4.Notice(`Institute Roadmap: \u590D\u5236\u5931\u8D25 \u2014 ${errMsg(e)}`, 6e3));
+    });
+    promptBox.createEl("pre", { text: promptText });
     if (blocked) {
       side.createDiv({
         cls: "ir-warning",
@@ -1451,15 +1879,40 @@ var RoadmapView = class extends import_obsidian4.ItemView {
     }
   }
   renderGates() {
-    const cards = this.cards();
     this.gatesEl.empty();
-    this.gatesEl.createEl("h3", { text: "Release Gates" });
+    const gatesLabel = this.liveGates.length ? "Release Gates\uFF08\u540E\u7AEF\uFF09" : "Release Gates\uFF08\u672C\u5730\u4F30\u7B97\uFF09";
+    this.gatesEl.createEl("h3", {
+      text: `${gatesLabel}${this.processErrors.gates ? " \xB7 \u5237\u65B0\u5931\u8D25\uFF0C\u663E\u793A\u65E7\u6570\u636E" : ""}`
+    });
+    const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
+    if (this.liveGates.length) {
+      for (const gate of this.liveGates) {
+        const box = wrap.createDiv({ cls: "ir-gate" });
+        box.createDiv({ cls: "ir-gate-name", text: gate.name });
+        box.createDiv({ cls: "ir-gate-desc", text: gate.description });
+        box.createDiv({ cls: "ir-progress" }).createDiv({
+          cls: "ir-progress-bar",
+          attr: { style: `width: ${gate.pct}%` }
+        });
+        box.createDiv({
+          cls: "ir-gate-meta",
+          text: `${gate.done}/${gate.total} done \xB7 ${gate.pct}%`
+        });
+        const ready = gate.evidence_ready.length;
+        const remaining = gate.remaining.length;
+        box.createDiv({
+          cls: "ir-gate-meta",
+          text: remaining ? `\u8BC1\u636E\u5C31\u7EEA ${ready}/${remaining} \u5F20\u672A\u5B8C\u6210\u5361${ready ? `\uFF1A${gate.evidence_ready.join(", ")}` : ""}` : "\u5168\u90E8\u5B8C\u6210"
+        });
+      }
+      return;
+    }
+    const cards = this.cards();
     const gates = [
       { name: "Release A", desc: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
       { name: "Release B", desc: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
       { name: "Release C", desc: "Roadmap Control Plane", prefixes: ["M7"] }
     ];
-    const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
     for (const gate of gates) {
       const scoped = cards.filter((c) => gate.prefixes.some((p) => c.phase.startsWith(p)));
       const done = scoped.filter((c) => c.status === "done").length;
@@ -1474,12 +1927,393 @@ var RoadmapView = class extends import_obsidian4.ItemView {
       box.createDiv({ cls: "ir-gate-meta", text: `${done}/${scoped.length} cards \xB7 ${pct}%` });
     }
   }
+  renderSessionPanel(card) {
+    const box = this.sessionsEl.createDiv({ cls: "ir-block ir-sessions" });
+    const head = box.createDiv({ cls: "ir-session-head" });
+    head.createEl("h4", { text: "Coding Sessions" });
+    const actions = head.createDiv({ cls: "ir-actions" });
+    this.button(
+      actions,
+      "\u5F00\u59CB Session",
+      "\u4EE5\u5F53\u524D\u5361\u7247\u9884\u671F\u6587\u4EF6\u4F5C\u4E3A\u8BA1\u5212\u6587\u4EF6",
+      () => this.openStartSession(card)
+    );
+    this.button(
+      actions,
+      "\u5237\u65B0",
+      "\u5237\u65B0\u8BE5\u5361\u7247\u7684 Coding Sessions",
+      () => void this.loadSessions(card.id)
+    );
+    box.createDiv({
+      cls: `ir-session-source ${this.backendReady ? "live" : "seed"}`,
+      text: this.backendReady ? "SQLite live" : "bundled seed / backend unavailable"
+    });
+    if (this.sessionsLoading && this.sessionsCardId === card.id) {
+      box.createDiv({ cls: "ir-empty", text: "\u6B63\u5728\u52A0\u8F7D Sessions\u2026" });
+      return;
+    }
+    if (this.sessionsCardId !== card.id) {
+      box.createDiv({ cls: "ir-empty", text: "\u7B49\u5F85\u540E\u7AEF\u6570\u636E\u2026" });
+      return;
+    }
+    if (this.sessionsError) {
+      box.createDiv({ cls: "ir-warning", text: `Sessions \u6682\u4E0D\u53EF\u7528\uFF1A${this.sessionsError}` });
+      return;
+    }
+    if (!this.sessions.length) {
+      box.createDiv({ cls: "ir-empty", text: "\u5C1A\u65E0 Coding Session\u3002" });
+      return;
+    }
+    for (const session of this.sessions) {
+      const row = box.createDiv({ cls: `ir-session status-${session.status}` });
+      const meta = row.createDiv({ cls: "ir-session-meta" });
+      meta.createSpan({ cls: `ir-pill session-${session.status}`, text: session.status });
+      meta.createSpan({ text: session.actor });
+      meta.createSpan({ text: formatSessionTime(session.started_at) });
+      meta.createSpan({ text: `${session.n_commands ?? 0} commands` });
+      row.createDiv({ cls: "ir-session-goal", text: session.goal });
+      if (session.planned_files.length) {
+        row.createDiv({
+          cls: "ir-session-files",
+          text: `\u8BA1\u5212\uFF1A${session.planned_files.join(", ")}`
+        });
+      }
+      if (session.touched_files.length) {
+        row.createDiv({
+          cls: "ir-session-files",
+          text: `\u5B9E\u9645\uFF1A${session.touched_files.join(", ")}`
+        });
+      }
+      if (session.summary) {
+        row.createDiv({ cls: "ir-session-summary", text: session.summary });
+      }
+      if (session.status === "active") {
+        const buttons = row.createDiv({ cls: "ir-session-actions" });
+        this.button(
+          buttons,
+          "\u8BB0\u5F55\u547D\u4EE4\u8BC1\u636E",
+          "\u8BB0\u5F55\u9A8C\u8BC1\u547D\u4EE4\u5E76\u9644\u52A0\u5230\u5361\u7247\u8BC1\u636E",
+          () => this.openRecordCommand(card, session)
+        );
+        this.button(
+          buttons,
+          "\u5B8C\u6210 Session",
+          "\u586B\u5199\u603B\u7ED3\u4E0E\u5B9E\u9645\u4FEE\u6539\u6587\u4EF6",
+          () => this.openCompleteSession(card, session)
+        );
+      }
+    }
+  }
+  async fetchProcessSections() {
+    const errors = {};
+    const [sessions, decisions, gates] = await Promise.all([
+      this.plugin.api.roadmapSessions(void 0, "active").catch((e) => {
+        errors.sessions = errMsg(e);
+        return null;
+      }),
+      this.plugin.api.roadmapDecisions("open").catch((e) => {
+        errors.decisions = errMsg(e);
+        return null;
+      }),
+      this.plugin.api.roadmapReleaseGates().catch((e) => {
+        errors.gates = errMsg(e);
+        return null;
+      })
+    ]);
+    return { sessions, decisions, gates, errors };
+  }
+  applyProcessSections(result) {
+    if (result.sessions !== null) this.activeSessions = result.sessions;
+    if (result.decisions !== null) this.openDecisions = result.decisions;
+    if (result.gates !== null) this.liveGates = result.gates;
+    this.processErrors = result.errors;
+  }
+  /** Light refresh after a mutation: strip + gates only, no card snapshot. */
+  async refreshProcess() {
+    if (!this.backendReady) return;
+    const gen = ++this.processGen;
+    const roadmapGenAtStart = this.roadmapGen;
+    const result = await this.fetchProcessSections();
+    if (gen !== this.processGen || roadmapGenAtStart !== this.roadmapGen) return;
+    this.applyProcessSections(result);
+    this.renderProcess();
+    this.renderGates();
+  }
+  async refreshLiveRoadmap(showNotice) {
+    const gen = ++this.roadmapGen;
+    const processGenAtStart = this.processGen;
+    try {
+      const rows = await this.plugin.api.roadmapCards();
+      const sections = await this.fetchProcessSections();
+      if (gen !== this.roadmapGen) return;
+      this.liveStatuses.clear();
+      this.liveCards.clear();
+      for (const row of rows) {
+        const status = normalizeStatus(row.status);
+        if (status) this.liveStatuses.set(row.id, status);
+        this.liveCards.set(row.id, row);
+      }
+      if (processGenAtStart === this.processGen) {
+        this.processGen++;
+        this.applyProcessSections(sections);
+      }
+      this.backendReady = rows.length > 0;
+      if (rows.length > 0) {
+        const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
+        const dropped = Object.keys(overrides).filter(
+          (id) => this.liveStatuses.has(id) && overrides[id] !== this.liveStatuses.get(id)
+        );
+        if (Object.keys(overrides).length) {
+          this.plugin.settings.roadmapStatusOverrides = {};
+          try {
+            await this.plugin.saveSettings();
+          } catch (persistErr) {
+            new import_obsidian4.Notice(
+              `Institute Roadmap: \u65E0\u6CD5\u6301\u4E45\u5316\u8BBE\u7F6E\uFF0C\u65E7\u672C\u5730\u72B6\u6001\u53EF\u80FD\u5728\u91CD\u542F\u540E\u91CD\u73B0\uFF08${errMsg(persistErr)}\uFF09\u3002`,
+              9e3
+            );
+          }
+        }
+        if (dropped.length) {
+          new import_obsidian4.Notice(
+            `Institute Roadmap: \u540E\u7AEF\u5DF2\u6062\u590D\uFF0C\u4E22\u5F03 ${dropped.length} \u4E2A\u79BB\u7EBF\u672C\u5730\u72B6\u6001\uFF08${dropped.join(", ")}\uFF09\u3002\u5982\u9700\u4FDD\u7559\u8BF7\u91CD\u65B0\u79FB\u52A8\u5361\u7247\u3002`,
+            9e3
+          );
+        }
+      }
+      this.sessionsCardId = "";
+      this.render();
+      if (showNotice) {
+        new import_obsidian4.Notice(
+          rows.length ? `Institute Roadmap: \u5DF2\u540C\u6B65 ${rows.length} \u5F20\u540E\u7AEF\u5361\u7247\u3002` : "Institute Roadmap: \u540E\u7AEF\u53EF\u8FBE\uFF0C\u4F46\u8DEF\u7EBF\u56FE\u5C1A\u672A\u5BFC\u5165\u3002",
+          5e3
+        );
+      }
+    } catch (e) {
+      if (gen !== this.roadmapGen) return;
+      this.backendReady = false;
+      this.liveStatuses.clear();
+      this.liveCards.clear();
+      this.activeSessions = [];
+      this.openDecisions = [];
+      this.liveGates = [];
+      this.processErrors = {};
+      if (showNotice) {
+        new import_obsidian4.Notice(`Institute Roadmap: \u540E\u7AEF\u4E0D\u53EF\u7528\uFF0C\u7EE7\u7EED\u663E\u793A bundled seed\uFF08${errMsg(e)}\uFF09\u3002`, 7e3);
+      }
+      this.render();
+    }
+  }
+  async loadSessions(cardId) {
+    const gen = ++this.sessionsGen;
+    this.sessionsLoading = true;
+    this.sessionsCardId = cardId;
+    this.sessionsError = "";
+    if (this.selectedId === cardId) this.renderDetail();
+    let sessions = [];
+    let error = "";
+    let prompt = null;
+    try {
+      sessions = await this.plugin.api.roadmapSessions(cardId);
+      prompt = await this.plugin.api.roadmapAgentPrompt(cardId).then((p) => ({ cardId, text: p.prompt })).catch(() => null);
+    } catch (e) {
+      error = errMsg(e);
+    }
+    if (gen !== this.sessionsGen) return;
+    this.sessions = sessions;
+    this.sessionsError = error;
+    this.sessionsLoading = false;
+    this.livePrompt = prompt;
+    if (this.selectedId === cardId) {
+      this.renderDetail();
+    } else if (this.selectedId) {
+      void this.loadSessions(this.selectedId);
+    }
+  }
+  openStartSession(card) {
+    new PromptModal(
+      this.app,
+      `\u5F00\u59CB ${card.id} Coding Session`,
+      "\u672C\u6B21\u5B9E\u73B0\u76EE\u6807",
+      (goal) => void this.startSession(card, goal)
+    ).open();
+  }
+  async startSession(card, goal) {
+    try {
+      await this.plugin.api.request(
+        `/api/roadmap/cards/${encodeURIComponent(card.id)}/sessions`,
+        {
+          method: "POST",
+          body: { actor: "human", goal, planned_files: card.expected_files }
+        }
+      );
+      this.backendReady = true;
+      new import_obsidian4.Notice(`Institute Roadmap: \u5DF2\u5F00\u59CB ${card.id} Coding Session\u3002`, 5e3);
+      await this.loadSessions(card.id);
+      void this.refreshProcess();
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u65E0\u6CD5\u5F00\u59CB Session \u2014 ${errMsg(e)}`, 8e3);
+    }
+  }
+  openCompleteSession(card, session) {
+    new PromptModal(
+      this.app,
+      `\u5B8C\u6210 ${card.id} Session`,
+      "\u5B9E\u73B0\u5185\u5BB9\u3001\u9A8C\u8BC1\u7ED3\u679C\u3001\u672A\u89E3\u51B3\u98CE\u9669",
+      (summary) => {
+        new PromptModal(
+          this.app,
+          "\u8BB0\u5F55\u5B9E\u9645\u4FEE\u6539\u6587\u4EF6",
+          session.planned_files.join(", ") || "\u4EE5\u9017\u53F7\u5206\u9694\u6587\u4EF6\u8DEF\u5F84",
+          (files) => void this.completeSession(card, session, summary, files)
+        ).open();
+      }
+    ).open();
+  }
+  async completeSession(card, session, summary, filesText) {
+    const touchedFiles = unique(
+      filesText.split(/[\n,;]+/).map((item) => item.trim()).filter(Boolean)
+    );
+    try {
+      await this.plugin.api.request(
+        `/api/roadmap/sessions/${encodeURIComponent(session.id)}`,
+        {
+          method: "PATCH",
+          body: { status: "completed", summary, touched_files: touchedFiles }
+        }
+      );
+      new import_obsidian4.Notice(`Institute Roadmap: ${card.id} Session \u5DF2\u5B8C\u6210\uFF0C\u53EF\u79FB\u52A8\u5230 Review\u3002`, 6e3);
+      await this.loadSessions(card.id);
+      void this.refreshProcess();
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u65E0\u6CD5\u5B8C\u6210 Session \u2014 ${errMsg(e)}`, 8e3);
+    }
+  }
+  openRecordCommand(card, session) {
+    if (!card.verification.length) {
+      new import_obsidian4.Notice(`Institute Roadmap: ${card.id} \u6CA1\u6709\u914D\u7F6E\u9A8C\u8BC1\u547D\u4EE4\u3002`, 5e3);
+      return;
+    }
+    new PickModal(
+      this.app,
+      card.verification,
+      (command) => command,
+      (command) => {
+        new PromptModal(
+          this.app,
+          "\u8BB0\u5F55\u547D\u4EE4\u9000\u51FA\u7801",
+          "0 \u8868\u793A\u901A\u8FC7\uFF1B\u975E 0 \u8868\u793A\u5931\u8D25",
+          (exitCode) => {
+            const parsed = Number(exitCode);
+            if (!Number.isInteger(parsed)) {
+              new import_obsidian4.Notice("Institute Roadmap: \u9000\u51FA\u7801\u5FC5\u987B\u662F\u6574\u6570\u3002", 5e3);
+              return;
+            }
+            new PromptModal(
+              this.app,
+              "\u8BB0\u5F55\u8F93\u51FA\u6458\u8981",
+              "\u6D4B\u8BD5\u6570\u91CF\u3001\u5931\u8D25\u539F\u56E0\u6216\u5173\u952E\u8F93\u51FA",
+              (output) => void this.recordCommand(card, session, command, parsed, output)
+            ).open();
+          }
+        ).open();
+      },
+      "\u9009\u62E9\u5DF2\u6267\u884C\u7684\u9A8C\u8BC1\u547D\u4EE4"
+    ).open();
+  }
+  async recordCommand(card, session, command, exitCode, output) {
+    try {
+      await this.plugin.api.request(
+        `/api/roadmap/sessions/${encodeURIComponent(session.id)}/commands`,
+        {
+          method: "POST",
+          body: {
+            command_label: "verification",
+            command_text: command,
+            exit_code: exitCode,
+            output_excerpt: output,
+            attach_as_evidence: true
+          }
+        }
+      );
+      new import_obsidian4.Notice(
+        `Institute Roadmap: \u547D\u4EE4\u5DF2\u8BB0\u5F55\u5E76\u9644\u52A0\u4E3A ${exitCode === 0 ? "pass" : "fail"} \u8BC1\u636E\u3002`,
+        6e3
+      );
+      await this.loadSessions(card.id);
+      void this.refreshProcess();
+    } catch (e) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u65E0\u6CD5\u8BB0\u5F55\u547D\u4EE4 \u2014 ${errMsg(e)}`, 8e3);
+    }
+  }
   async moveCard(card, status) {
     const byId = mapById(this.cards());
     if (status === "done" && isBlocked(card, byId)) {
       new import_obsidian4.Notice(`Institute Roadmap: ${card.id} \u4ECD\u6709\u672A\u5B8C\u6210\u4F9D\u8D56\uFF0C\u4E0D\u80FD\u6807\u8BB0 Done\u3002`, 6e3);
       return;
     }
+    let moved;
+    try {
+      moved = await this.plugin.api.request(
+        `/api/roadmap/cards/${encodeURIComponent(card.id)}/move`,
+        {
+          method: "POST",
+          body: { status, expected_status: card.status }
+        }
+      );
+    } catch (e) {
+      const message = errMsg(e);
+      if (/^HTTP 409/.test(message)) {
+        new import_obsidian4.Notice(`Institute Roadmap: \u5361\u7247\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u6B63\u5728\u91CD\u65B0\u540C\u6B65 \u2014 ${message}`, 8e3);
+        await this.refreshLiveRoadmap(false);
+        return;
+      }
+      if (/^HTTP \d+/.test(message)) {
+        new import_obsidian4.Notice(`Institute Roadmap: \u540E\u7AEF\u62D2\u7EDD\u79FB\u52A8 \u2014 ${message}`, 8e3);
+        return;
+      }
+      this.roadmapGen++;
+      this.backendReady = false;
+      this.liveStatuses.clear();
+      try {
+        await this.saveLocalMove(card, status);
+        new import_obsidian4.Notice(`Institute Roadmap: \u540E\u7AEF\u4E0D\u53EF\u7528\uFF0C\u72B6\u6001\u4EC5\u4FDD\u5B58\u5728\u672C\u5730\uFF08${message}\uFF09\u3002`, 7e3);
+      } catch (persistErr) {
+        this.render();
+        new import_obsidian4.Notice(
+          `Institute Roadmap: \u540E\u7AEF\u4E0D\u53EF\u7528\u4E14\u672C\u5730\u72B6\u6001\u65E0\u6CD5\u4FDD\u5B58\uFF08${errMsg(persistErr)}\uFF09\u3002`,
+          9e3
+        );
+      }
+      return;
+    }
+    const liveStatus = normalizeStatus(moved.status);
+    if (!liveStatus) {
+      new import_obsidian4.Notice(`Institute Roadmap: \u540E\u7AEF\u8FD4\u56DE\u672A\u77E5\u72B6\u6001 ${moved.status}\uFF0C\u6B63\u5728\u91CD\u65B0\u540C\u6B65\u3002`, 8e3);
+      await this.refreshLiveRoadmap(false);
+      return;
+    }
+    this.roadmapGen++;
+    this.liveStatuses.set(card.id, liveStatus);
+    this.backendReady = true;
+    this.selectedId = card.id;
+    const overrides = { ...this.plugin.settings.roadmapStatusOverrides ?? {} };
+    if (card.id in overrides) {
+      delete overrides[card.id];
+      this.plugin.settings.roadmapStatusOverrides = overrides;
+      try {
+        await this.plugin.saveSettings();
+      } catch (persistErr) {
+        new import_obsidian4.Notice(
+          `Institute Roadmap: \u79FB\u52A8\u5DF2\u751F\u6548\uFF0C\u4F46\u8BBE\u7F6E\u6301\u4E45\u5316\u5931\u8D25\uFF08${errMsg(persistErr)}\uFF09\u3002`,
+          8e3
+        );
+      }
+    }
+    this.render();
+    void this.refreshProcess();
+  }
+  async saveLocalMove(card, status) {
     const overrides = { ...this.plugin.settings.roadmapStatusOverrides ?? {} };
     const seed = ROADMAP.cards.find((c) => c.id === card.id);
     if (seed?.status === status) {
@@ -1494,10 +2328,31 @@ var RoadmapView = class extends import_obsidian4.ItemView {
   }
   cards() {
     const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
-    return ROADMAP.cards.map((card) => ({
+    const merged = ROADMAP.cards.map((card) => ({
       ...card,
-      status: normalizeStatus(overrides[card.id]) ?? card.status
+      status: this.liveStatuses.get(card.id) ?? normalizeStatus(overrides[card.id]) ?? card.status
     }));
+    const seedIds = new Set(ROADMAP.cards.map((c) => c.id));
+    for (const [id, live] of this.liveCards) {
+      if (seedIds.has(id)) continue;
+      merged.push({
+        id,
+        title: live.title,
+        type: live.type ?? "feature",
+        phase: live.phase ?? "",
+        status: this.liveStatuses.get(id) ?? "inbox",
+        priority: live.priority ?? "P2",
+        risk: live.risk ?? "medium",
+        summary: live.summary ?? "",
+        design_links: live.design_links ?? [],
+        expected_files: live.expected_files ?? [],
+        dependencies: live.dependencies ?? [],
+        acceptance: [],
+        // list endpoint carries no checklists; detail panel does
+        verification: live.verification ?? []
+      });
+    }
+    return merged;
   }
   filteredCards() {
     return this.cards().filter((card) => {
@@ -1609,6 +2464,16 @@ var RoadmapView = class extends import_obsidian4.ItemView {
 };
 function normalizeStatus(value) {
   return ROADMAP.columns.includes(value) ? value : null;
+}
+function formatSessionTime(iso) {
+  const time = Date.parse(iso);
+  if (Number.isNaN(time)) return iso;
+  return new Date(time).toLocaleString(void 0, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 function mapById(cards) {
   return new Map(cards.map((card) => [card.id, card]));
@@ -1746,6 +2611,54 @@ function ensureRoadmapStyles() {
 .ir-stat-label {
 	color: var(--text-muted);
 	font-size: 11px;
+}
+.ir-process {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 8px;
+	margin-bottom: 12px;
+}
+.ir-process-box {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px 10px;
+	min-width: 0;
+}
+.ir-process-box h4 {
+	margin: 0 0 6px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-process-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 0;
+	border-bottom: 1px solid var(--ir-border);
+	font-size: 12px;
+	cursor: pointer;
+	overflow: hidden;
+}
+.ir-process-row:last-child {
+	border-bottom: none;
+}
+.ir-process-row span:not(.ir-id) {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	color: var(--text-muted);
+}
+.ir-process-row button {
+	margin-left: auto;
+	font-size: 11px;
+	padding: 1px 7px;
+	flex-shrink: 0;
+}
+@media (max-width: 900px) {
+	.ir-process {
+		grid-template-columns: 1fr;
+	}
 }
 .ir-filters {
 	display: flex;
@@ -1891,6 +2804,74 @@ function ensureRoadmapStyles() {
 	border-radius: 8px;
 	padding: 8px;
 	background: var(--background-primary);
+}
+.ir-session-head, .ir-session-actions {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+.ir-session-head h4 {
+	margin: 0;
+}
+.ir-session-source {
+	margin: 5px 0 7px;
+	font-family: var(--font-monospace);
+	font-size: 10px;
+	color: var(--text-muted);
+}
+.ir-session-source.live {
+	color: var(--color-green);
+}
+.ir-session {
+	border: 1px solid var(--ir-border);
+	border-left: 3px solid var(--color-blue);
+	border-radius: 7px;
+	padding: 7px;
+	margin: 6px 0;
+	background: var(--background-primary);
+}
+.ir-session.status-completed {
+	border-left-color: var(--color-green);
+}
+.ir-session.status-blocked, .ir-session.status-partial {
+	border-left-color: var(--color-orange);
+}
+.ir-session.status-cancelled {
+	border-left-color: var(--text-faint);
+}
+.ir-session-meta {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 6px;
+	color: var(--text-muted);
+	font-size: 10px;
+}
+.ir-session-goal {
+	font-weight: 650;
+	margin: 5px 0 3px;
+}
+.ir-session-files, .ir-session-summary {
+	color: var(--text-muted);
+	font-size: 11px;
+	margin-top: 3px;
+	overflow-wrap: anywhere;
+}
+.ir-session-summary {
+	border-top: 1px solid var(--ir-border);
+	padding-top: 4px;
+	margin-top: 5px;
+	color: var(--text-normal);
+}
+.ir-session-actions {
+	justify-content: flex-start;
+	margin-top: 6px;
+}
+.ir-session-actions button, .ir-session-head button {
+	font-size: 11px;
+	padding: 2px 7px;
 }
 .ir-dep {
 	display: flex;

@@ -1,6 +1,14 @@
 import { ItemView, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import backlog from "../../roadmap/backlog.json";
+import {
+	RoadmapDecisionRow,
+	RoadmapGate,
+	RoadmapLiveCard,
+	RoadmapSessionRow,
+	errMsg,
+} from "./api";
 import type InstituteOnePlugin from "./main";
+import { PickModal, PromptModal } from "./modals";
 
 export const VIEW_TYPE_ROADMAP = "institute-roadmap";
 
@@ -39,6 +47,8 @@ interface RoadmapBacklog {
 	cards: RoadmapCard[];
 }
 
+type RoadmapSession = RoadmapSessionRow;
+
 const ROADMAP = backlog as unknown as RoadmapBacklog;
 const STATUS_ZH: Record<RoadmapStatus, string> = {
 	inbox: "收件箱",
@@ -68,11 +78,37 @@ export class RoadmapView extends ItemView {
 	private status = "all";
 	private type = "all";
 	private selectedId = ROADMAP.cards[0]?.id ?? "";
+	private liveStatuses = new Map<string, RoadmapStatus>();
+	private liveCards = new Map<string, RoadmapLiveCard>();
+	private backendReady = false;
+	/** Bumped by every refresh AND every successful/failed move: an in-flight
+	 * GET whose generation is stale must be dropped, or its old snapshot would
+	 * roll the board back over a move that already succeeded. */
+	private roadmapGen = 0;
+	private sessions: RoadmapSession[] = [];
+	private sessionsCardId = "";
+	private sessionsLoading = false;
+	private sessionsError = "";
+	/** Same idea for the sessions panel: last STARTED load wins, not last response. */
+	private sessionsGen = 0;
+	private livePrompt: { cardId: string; text: string } | null = null;
+	// process strip (M7-006): live sessions/decisions/gates beyond the board.
+	// Section fetch failures keep last-known-good data and surface an error
+	// marker instead of masquerading as "no data".
+	private activeSessions: RoadmapSession[] = [];
+	private openDecisions: RoadmapDecisionRow[] = [];
+	private liveGates: RoadmapGate[] = [];
+	private processErrors: { sessions?: string; decisions?: string; gates?: string } = {};
+	/** Last-started-wins for light process refreshes; a full refresh also
+	 * bumps this so an in-flight light snapshot cannot overwrite it. */
+	private processGen = 0;
 
 	private summaryEl!: HTMLElement;
+	private processEl!: HTMLElement;
 	private boardEl!: HTMLElement;
 	private detailEl!: HTMLElement;
 	private gatesEl!: HTMLElement;
+	private sessionsEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: InstituteOnePlugin) {
 		super(leaf);
@@ -106,17 +142,21 @@ export class RoadmapView extends ItemView {
 			text: `roadmap/backlog.json v${ROADMAP.version} · Obsidian Kanban-compatible`,
 		});
 		const actions = head.createDiv({ cls: "ir-actions" });
-		this.button(actions, "刷新", "重新渲染当前路线图", () => this.render());
+		this.button(actions, "刷新", "从后端刷新路线图与 Coding Sessions", () =>
+			void this.refreshLiveRoadmap(true),
+		);
 		this.button(actions, "导出 Kanban 笔记", "写入 Obsidian Kanban 兼容 Markdown", () =>
 			void this.exportKanbanNote(),
 		);
 
 		this.summaryEl = root.createDiv({ cls: "ir-summary" });
+		this.processEl = root.createDiv({ cls: "ir-process" });
 		this.buildFilters(root);
 		this.boardEl = root.createDiv({ cls: "ir-board" });
 		this.detailEl = root.createDiv({ cls: "ir-detail" });
 		this.gatesEl = root.createDiv({ cls: "ir-gates" });
 		this.render();
+		void this.refreshLiveRoadmap(false);
 	}
 
 	async onClose(): Promise<void> {
@@ -152,6 +192,7 @@ export class RoadmapView extends ItemView {
 
 	private render(): void {
 		this.renderSummary();
+		this.renderProcess();
 		this.renderBoard();
 		this.renderDetail();
 		this.renderGates();
@@ -172,6 +213,107 @@ export class RoadmapView extends ItemView {
 		this.stat(this.summaryEl, String(active), "活跃");
 		this.stat(this.summaryEl, String(ready), "可开工");
 		this.stat(this.summaryEl, String(blocked), "依赖阻塞");
+	}
+
+	/** M7-006: the global coding process at a glance — active sessions, open
+	 * decisions, and blocked cards, visible without opening any card. */
+	private renderProcess(): void {
+		this.processEl.empty();
+		if (!this.backendReady) {
+			this.processEl.hide();
+			return;
+		}
+		this.processEl.show();
+
+		const cards = this.cards();
+		const byId = mapById(cards);
+		const blocked = cards
+			.map((card) => {
+				const live = this.liveCards.get(card.id);
+				const reason = live?.blocked_reason
+					? live.blocked_reason
+					: isBlocked(card, byId) && card.status !== "done"
+						? "依赖未完成"
+						: "";
+				return { card, reason };
+			})
+			.filter((b) => b.reason && b.card.status !== "done" && b.card.status !== "parked");
+
+		const sessionsBox = this.processEl.createDiv({ cls: "ir-process-box" });
+		sessionsBox.createEl("h4", {
+			text: `活跃 Coding Sessions (${this.activeSessions.length})${this.processErrors.sessions ? " · 刷新失败，显示旧数据" : ""}`,
+		});
+		if (this.processErrors.sessions) {
+			sessionsBox.createDiv({ cls: "ir-warning", text: this.processErrors.sessions });
+		}
+		if (!this.activeSessions.length && !this.processErrors.sessions) {
+			sessionsBox.createDiv({ cls: "ir-empty", text: "没有进行中的 Session。" });
+		}
+		for (const session of this.activeSessions.slice(0, 6)) {
+			const row = sessionsBox.createDiv({ cls: "ir-process-row" });
+			row.createSpan({ cls: "ir-id", text: session.card_id });
+			row.createSpan({ text: `${session.actor} · ${session.goal}` });
+			row.addEventListener("click", () => this.selectCard(session.card_id));
+		}
+
+		const decisionsBox = this.processEl.createDiv({ cls: "ir-process-box" });
+		decisionsBox.createEl("h4", {
+			text: `待决策 (${this.openDecisions.length})${this.processErrors.decisions ? " · 刷新失败，显示旧数据" : ""}`,
+		});
+		if (this.processErrors.decisions) {
+			decisionsBox.createDiv({ cls: "ir-warning", text: this.processErrors.decisions });
+		}
+		if (!this.openDecisions.length && !this.processErrors.decisions) {
+			decisionsBox.createDiv({ cls: "ir-empty", text: "没有待决策项。" });
+		}
+		for (const decision of this.openDecisions.slice(0, 6)) {
+			const row = decisionsBox.createDiv({ cls: "ir-process-row" });
+			if (decision.card_id) row.createSpan({ cls: "ir-id", text: decision.card_id });
+			row.createSpan({ text: `${decision.title} — ${decision.question}` });
+			const resolve = row.createEl("button", { text: "裁决" });
+			resolve.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				this.openResolveDecision(decision);
+			});
+		}
+
+		const blockedBox = this.processEl.createDiv({ cls: "ir-process-box" });
+		blockedBox.createEl("h4", { text: `阻塞卡片 (${blocked.length})` });
+		if (!blocked.length) {
+			blockedBox.createDiv({ cls: "ir-empty", text: "没有阻塞项。" });
+		}
+		for (const item of blocked.slice(0, 6)) {
+			const row = blockedBox.createDiv({ cls: "ir-process-row" });
+			row.createSpan({ cls: "ir-id", text: item.card.id });
+			row.createSpan({ text: item.reason });
+			row.addEventListener("click", () => this.selectCard(item.card.id));
+		}
+	}
+
+	private selectCard(cardId: string): void {
+		if (!this.cards().some((c) => c.id === cardId)) return;
+		this.selectedId = cardId;
+		this.renderBoard();
+		this.renderDetail();
+	}
+
+	private openResolveDecision(decision: RoadmapDecisionRow): void {
+		new PromptModal(
+			this.app,
+			`裁决：${decision.title}`,
+			decision.options.length ? `可选：${decision.options.join(" / ")}` : "输入裁决内容",
+			(text) => void this.resolveDecision(decision, text),
+		).open();
+	}
+
+	private async resolveDecision(decision: RoadmapDecisionRow, text: string): Promise<void> {
+		try {
+			await this.plugin.api.resolveRoadmapDecision(decision.id, text);
+			new Notice(`Institute Roadmap: 决策已裁决 — ${decision.title}`, 5000);
+			await this.refreshLiveRoadmap(false);
+		} catch (e) {
+			new Notice(`Institute Roadmap: 无法裁决 — ${errMsg(e)}`, 8000);
+		}
 	}
 
 	private renderBoard(): void {
@@ -263,7 +405,29 @@ export class RoadmapView extends ItemView {
 
 		const side = body.createDiv();
 		this.dependencyBlock(side, card, byId);
-		this.block(side, "执行提示", [agentPrompt(card)], "pre");
+		this.sessionsEl = side.createDiv();
+		this.renderSessionPanel(card);
+		if (this.sessionsCardId !== card.id && !this.sessionsLoading) {
+			void this.loadSessions(card.id);
+		}
+		// M7-007: backend prompt (deterministic, from live card state) when
+		// available; bundled-seed rendering otherwise. Copy works for both.
+		const promptText =
+			this.livePrompt && this.livePrompt.cardId === card.id
+				? this.livePrompt.text
+				: agentPrompt(card);
+		const promptBox = side.createDiv({ cls: "ir-block" });
+		const promptHead = promptBox.createDiv({ cls: "ir-session-head" });
+		promptHead.createEl("h4", {
+			text: this.livePrompt?.cardId === card.id ? "执行提示（后端生成）" : "执行提示（本地）",
+		});
+		this.button(promptHead, "复制", "复制执行提示到剪贴板", () => {
+			void navigator.clipboard
+				.writeText(promptText)
+				.then(() => new Notice("Institute Roadmap: 执行提示已复制。", 4000))
+				.catch((e) => new Notice(`Institute Roadmap: 复制失败 — ${errMsg(e)}`, 6000));
+		});
+		promptBox.createEl("pre", { text: promptText });
 		if (blocked) {
 			side.createDiv({
 				cls: "ir-warning",
@@ -273,15 +437,45 @@ export class RoadmapView extends ItemView {
 	}
 
 	private renderGates(): void {
-		const cards = this.cards();
 		this.gatesEl.empty();
-		this.gatesEl.createEl("h3", { text: "Release Gates" });
+		const gatesLabel = this.liveGates.length ? "Release Gates（后端）" : "Release Gates（本地估算）";
+		this.gatesEl.createEl("h3", {
+			text: `${gatesLabel}${this.processErrors.gates ? " · 刷新失败，显示旧数据" : ""}`,
+		});
+		const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
+
+		if (this.liveGates.length) {
+			for (const gate of this.liveGates) {
+				const box = wrap.createDiv({ cls: "ir-gate" });
+				box.createDiv({ cls: "ir-gate-name", text: gate.name });
+				box.createDiv({ cls: "ir-gate-desc", text: gate.description });
+				box.createDiv({ cls: "ir-progress" }).createDiv({
+					cls: "ir-progress-bar",
+					attr: { style: `width: ${gate.pct}%` },
+				});
+				box.createDiv({
+					cls: "ir-gate-meta",
+					text: `${gate.done}/${gate.total} done · ${gate.pct}%`,
+				});
+				// evidence readiness: remaining cards that already carry evidence
+				const ready = gate.evidence_ready.length;
+				const remaining = gate.remaining.length;
+				box.createDiv({
+					cls: "ir-gate-meta",
+					text: remaining
+						? `证据就绪 ${ready}/${remaining} 张未完成卡${ready ? `：${gate.evidence_ready.join(", ")}` : ""}`
+						: "全部完成",
+				});
+			}
+			return;
+		}
+
+		const cards = this.cards();
 		const gates = [
 			{ name: "Release A", desc: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
 			{ name: "Release B", desc: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
 			{ name: "Release C", desc: "Roadmap Control Plane", prefixes: ["M7"] },
 		];
-		const wrap = this.gatesEl.createDiv({ cls: "ir-gate-grid" });
 		for (const gate of gates) {
 			const scoped = cards.filter((c) => gate.prefixes.some((p) => c.phase.startsWith(p)));
 			const done = scoped.filter((c) => c.status === "done").length;
@@ -297,12 +491,443 @@ export class RoadmapView extends ItemView {
 		}
 	}
 
+	private renderSessionPanel(card: RoadmapCard): void {
+		const box = this.sessionsEl.createDiv({ cls: "ir-block ir-sessions" });
+		const head = box.createDiv({ cls: "ir-session-head" });
+		head.createEl("h4", { text: "Coding Sessions" });
+		const actions = head.createDiv({ cls: "ir-actions" });
+		this.button(actions, "开始 Session", "以当前卡片预期文件作为计划文件", () =>
+			this.openStartSession(card),
+		);
+		this.button(actions, "刷新", "刷新该卡片的 Coding Sessions", () =>
+			void this.loadSessions(card.id),
+		);
+
+		box.createDiv({
+			cls: `ir-session-source ${this.backendReady ? "live" : "seed"}`,
+			text: this.backendReady ? "SQLite live" : "bundled seed / backend unavailable",
+		});
+		if (this.sessionsLoading && this.sessionsCardId === card.id) {
+			box.createDiv({ cls: "ir-empty", text: "正在加载 Sessions…" });
+			return;
+		}
+		if (this.sessionsCardId !== card.id) {
+			box.createDiv({ cls: "ir-empty", text: "等待后端数据…" });
+			return;
+		}
+		if (this.sessionsError) {
+			box.createDiv({ cls: "ir-warning", text: `Sessions 暂不可用：${this.sessionsError}` });
+			return;
+		}
+		if (!this.sessions.length) {
+			box.createDiv({ cls: "ir-empty", text: "尚无 Coding Session。" });
+			return;
+		}
+
+		for (const session of this.sessions) {
+			const row = box.createDiv({ cls: `ir-session status-${session.status}` });
+			const meta = row.createDiv({ cls: "ir-session-meta" });
+			meta.createSpan({ cls: `ir-pill session-${session.status}`, text: session.status });
+			meta.createSpan({ text: session.actor });
+			meta.createSpan({ text: formatSessionTime(session.started_at) });
+			meta.createSpan({ text: `${session.n_commands ?? 0} commands` });
+			row.createDiv({ cls: "ir-session-goal", text: session.goal });
+			if (session.planned_files.length) {
+				row.createDiv({
+					cls: "ir-session-files",
+					text: `计划：${session.planned_files.join(", ")}`,
+				});
+			}
+			if (session.touched_files.length) {
+				row.createDiv({
+					cls: "ir-session-files",
+					text: `实际：${session.touched_files.join(", ")}`,
+				});
+			}
+			if (session.summary) {
+				row.createDiv({ cls: "ir-session-summary", text: session.summary });
+			}
+			if (session.status === "active") {
+				const buttons = row.createDiv({ cls: "ir-session-actions" });
+				this.button(buttons, "记录命令证据", "记录验证命令并附加到卡片证据", () =>
+					this.openRecordCommand(card, session),
+				);
+				this.button(buttons, "完成 Session", "填写总结与实际修改文件", () =>
+					this.openCompleteSession(card, session),
+				);
+			}
+		}
+	}
+
+	private async fetchProcessSections(): Promise<{
+		sessions: RoadmapSession[] | null;
+		decisions: RoadmapDecisionRow[] | null;
+		gates: RoadmapGate[] | null;
+		errors: { sessions?: string; decisions?: string; gates?: string };
+	}> {
+		const errors: { sessions?: string; decisions?: string; gates?: string } = {};
+		const [sessions, decisions, gates] = await Promise.all([
+			this.plugin.api.roadmapSessions(undefined, "active").catch((e) => {
+				errors.sessions = errMsg(e);
+				return null;
+			}),
+			this.plugin.api.roadmapDecisions("open").catch((e) => {
+				errors.decisions = errMsg(e);
+				return null;
+			}),
+			this.plugin.api.roadmapReleaseGates().catch((e) => {
+				errors.gates = errMsg(e);
+				return null;
+			}),
+		]);
+		return { sessions, decisions, gates, errors };
+	}
+
+	private applyProcessSections(
+		result: Awaited<ReturnType<RoadmapView["fetchProcessSections"]>>,
+	): void {
+		// a failed section keeps its last-known-good data; only the error
+		// marker changes (a false "没有待决策项" is worse than stale data)
+		if (result.sessions !== null) this.activeSessions = result.sessions;
+		if (result.decisions !== null) this.openDecisions = result.decisions;
+		if (result.gates !== null) this.liveGates = result.gates;
+		this.processErrors = result.errors;
+	}
+
+	/** Light refresh after a mutation: strip + gates only, no card snapshot. */
+	private async refreshProcess(): Promise<void> {
+		if (!this.backendReady) return;
+		const gen = ++this.processGen;
+		const roadmapGenAtStart = this.roadmapGen;
+		const result = await this.fetchProcessSections();
+		// dropped when a newer light refresh started OR a full refresh ran
+		if (gen !== this.processGen || roadmapGenAtStart !== this.roadmapGen) return;
+		this.applyProcessSections(result);
+		this.renderProcess();
+		this.renderGates();
+	}
+
+	private async refreshLiveRoadmap(showNotice: boolean): Promise<void> {
+		const gen = ++this.roadmapGen;
+		const processGenAtStart = this.processGen;
+		try {
+			const rows = await this.plugin.api.roadmapCards();
+			// the process strip is best-effort: its failure must not discard
+			// the card snapshot we already hold
+			const sections = await this.fetchProcessSections();
+			if (gen !== this.roadmapGen) return; // a move or newer refresh superseded this snapshot
+			this.liveStatuses.clear();
+			this.liveCards.clear();
+			for (const row of rows) {
+				const status = normalizeStatus(row.status);
+				if (status) this.liveStatuses.set(row.id, status);
+				this.liveCards.set(row.id, row);
+			}
+			// sections apply ONLY when no light refresh started after us —
+			// last-started-wins holds across full and light snapshots; the
+			// bump then drops any light refresh that started before us
+			if (processGenAtStart === this.processGen) {
+				this.processGen++;
+				this.applyProcessSections(sections);
+			}
+			this.backendReady = rows.length > 0;
+			// backend is truth again: offline-only overrides would silently
+			// resurface on the NEXT offline session as a forked board state —
+			// discard them now, loudly. Persistence failures are their own
+			// problem and must not masquerade as "backend unavailable".
+			if (rows.length > 0) {
+				const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
+				const dropped = Object.keys(overrides).filter(
+					(id) => this.liveStatuses.has(id) && overrides[id] !== this.liveStatuses.get(id),
+				);
+				if (Object.keys(overrides).length) {
+					this.plugin.settings.roadmapStatusOverrides = {};
+					try {
+						await this.plugin.saveSettings();
+					} catch (persistErr) {
+						new Notice(
+							`Institute Roadmap: 无法持久化设置，旧本地状态可能在重启后重现（${errMsg(persistErr)}）。`,
+							9000,
+						);
+					}
+				}
+				if (dropped.length) {
+					new Notice(
+						`Institute Roadmap: 后端已恢复，丢弃 ${dropped.length} 个离线本地状态（${dropped.join(", ")}）。如需保留请重新移动卡片。`,
+						9000,
+					);
+				}
+			}
+			this.sessionsCardId = "";
+			this.render();
+			if (showNotice) {
+				new Notice(
+					rows.length
+						? `Institute Roadmap: 已同步 ${rows.length} 张后端卡片。`
+						: "Institute Roadmap: 后端可达，但路线图尚未导入。",
+					5000,
+				);
+			}
+		} catch (e) {
+			if (gen !== this.roadmapGen) return;
+			this.backendReady = false;
+			// stale live statuses must not shadow the local fallback the user
+			// is about to write — offline means the live map is meaningless
+			this.liveStatuses.clear();
+			this.liveCards.clear();
+			this.activeSessions = [];
+			this.openDecisions = [];
+			this.liveGates = [];
+			this.processErrors = {};
+			if (showNotice) {
+				new Notice(`Institute Roadmap: 后端不可用，继续显示 bundled seed（${errMsg(e)}）。`, 7000);
+			}
+			this.render();
+		}
+	}
+
+	private async loadSessions(cardId: string): Promise<void> {
+		const gen = ++this.sessionsGen;
+		this.sessionsLoading = true;
+		this.sessionsCardId = cardId;
+		this.sessionsError = "";
+		if (this.selectedId === cardId) this.renderDetail();
+		let sessions: RoadmapSession[] = [];
+		let error = "";
+		let prompt: { cardId: string; text: string } | null = null;
+		try {
+			sessions = await this.plugin.api.roadmapSessions(cardId);
+			// the live prompt rides along; its absence is not an error
+			prompt = await this.plugin.api
+				.roadmapAgentPrompt(cardId)
+				.then((p) => ({ cardId, text: p.prompt }))
+				.catch(() => null);
+		} catch (e) {
+			error = errMsg(e);
+		}
+		if (gen !== this.sessionsGen) return; // a newer load owns the panel now
+		this.sessions = sessions;
+		this.sessionsError = error;
+		this.sessionsLoading = false;
+		this.livePrompt = prompt;
+		if (this.selectedId === cardId) {
+			this.renderDetail();
+		} else if (this.selectedId) {
+			void this.loadSessions(this.selectedId);
+		}
+	}
+
+	private openStartSession(card: RoadmapCard): void {
+		new PromptModal(
+			this.app,
+			`开始 ${card.id} Coding Session`,
+			"本次实现目标",
+			(goal) => void this.startSession(card, goal),
+		).open();
+	}
+
+	private async startSession(card: RoadmapCard, goal: string): Promise<void> {
+		try {
+			await this.plugin.api.request<RoadmapSession>(
+				`/api/roadmap/cards/${encodeURIComponent(card.id)}/sessions`,
+				{
+					method: "POST",
+					body: { actor: "human", goal, planned_files: card.expected_files },
+				},
+			);
+			this.backendReady = true;
+			new Notice(`Institute Roadmap: 已开始 ${card.id} Coding Session。`, 5000);
+			await this.loadSessions(card.id);
+			void this.refreshProcess(); // the strip lists ALL active sessions
+		} catch (e) {
+			new Notice(`Institute Roadmap: 无法开始 Session — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	private openCompleteSession(card: RoadmapCard, session: RoadmapSession): void {
+		new PromptModal(
+			this.app,
+			`完成 ${card.id} Session`,
+			"实现内容、验证结果、未解决风险",
+			(summary) => {
+				new PromptModal(
+					this.app,
+					"记录实际修改文件",
+					session.planned_files.join(", ") || "以逗号分隔文件路径",
+					(files) => void this.completeSession(card, session, summary, files),
+				).open();
+			},
+		).open();
+	}
+
+	private async completeSession(
+		card: RoadmapCard,
+		session: RoadmapSession,
+		summary: string,
+		filesText: string,
+	): Promise<void> {
+		const touchedFiles = unique(
+			filesText
+				.split(/[\n,;]+/)
+				.map((item) => item.trim())
+				.filter(Boolean),
+		);
+		try {
+			await this.plugin.api.request<RoadmapSession>(
+				`/api/roadmap/sessions/${encodeURIComponent(session.id)}`,
+				{
+					method: "PATCH",
+					body: { status: "completed", summary, touched_files: touchedFiles },
+				},
+			);
+			new Notice(`Institute Roadmap: ${card.id} Session 已完成，可移动到 Review。`, 6000);
+			await this.loadSessions(card.id);
+			void this.refreshProcess(); // completed sessions leave the strip
+		} catch (e) {
+			new Notice(`Institute Roadmap: 无法完成 Session — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	private openRecordCommand(card: RoadmapCard, session: RoadmapSession): void {
+		if (!card.verification.length) {
+			new Notice(`Institute Roadmap: ${card.id} 没有配置验证命令。`, 5000);
+			return;
+		}
+		new PickModal<string>(
+			this.app,
+			card.verification,
+			(command) => command,
+			(command) => {
+				new PromptModal(
+					this.app,
+					"记录命令退出码",
+					"0 表示通过；非 0 表示失败",
+					(exitCode) => {
+						const parsed = Number(exitCode);
+						if (!Number.isInteger(parsed)) {
+							new Notice("Institute Roadmap: 退出码必须是整数。", 5000);
+							return;
+						}
+						new PromptModal(
+							this.app,
+							"记录输出摘要",
+							"测试数量、失败原因或关键输出",
+							(output) => void this.recordCommand(card, session, command, parsed, output),
+						).open();
+					},
+				).open();
+			},
+			"选择已执行的验证命令",
+		).open();
+	}
+
+	private async recordCommand(
+		card: RoadmapCard,
+		session: RoadmapSession,
+		command: string,
+		exitCode: number,
+		output: string,
+	): Promise<void> {
+		try {
+			await this.plugin.api.request(
+				`/api/roadmap/sessions/${encodeURIComponent(session.id)}/commands`,
+				{
+					method: "POST",
+					body: {
+						command_label: "verification",
+						command_text: command,
+						exit_code: exitCode,
+						output_excerpt: output,
+						attach_as_evidence: true,
+					},
+				},
+			);
+			new Notice(
+				`Institute Roadmap: 命令已记录并附加为 ${exitCode === 0 ? "pass" : "fail"} 证据。`,
+				6000,
+			);
+			await this.loadSessions(card.id);
+			void this.refreshProcess(); // evidence changes gate readiness
+		} catch (e) {
+			new Notice(`Institute Roadmap: 无法记录命令 — ${errMsg(e)}`, 8000);
+		}
+	}
+
 	private async moveCard(card: RoadmapCard, status: RoadmapStatus): Promise<void> {
 		const byId = mapById(this.cards());
 		if (status === "done" && isBlocked(card, byId)) {
 			new Notice(`Institute Roadmap: ${card.id} 仍有未完成依赖，不能标记 Done。`, 6000);
 			return;
 		}
+		let moved: { status: string };
+		try {
+			// the try covers ONLY the network call: a later settings-persist
+			// failure must not be misread as "backend offline" (which would
+			// wrongly clear live state and write a local fork)
+			moved = await this.plugin.api.request<{ status: string }>(
+				`/api/roadmap/cards/${encodeURIComponent(card.id)}/move`,
+				{
+					method: "POST",
+					body: { status, expected_status: card.status },
+				},
+			);
+		} catch (e) {
+			const message = errMsg(e);
+			if (/^HTTP 409/.test(message)) {
+				// stale expected_status: the board itself is stale — resync
+				new Notice(`Institute Roadmap: 卡片状态已变化，正在重新同步 — ${message}`, 8000);
+				await this.refreshLiveRoadmap(false);
+				return;
+			}
+			if (/^HTTP \d+/.test(message)) {
+				new Notice(`Institute Roadmap: 后端拒绝移动 — ${message}`, 8000);
+				return;
+			}
+			// backend unreachable: the live map is stale by definition — drop it
+			// so the local fallback below is actually visible on the board
+			this.roadmapGen++;
+			this.backendReady = false;
+			this.liveStatuses.clear();
+			try {
+				await this.saveLocalMove(card, status);
+				new Notice(`Institute Roadmap: 后端不可用，状态仅保存在本地（${message}）。`, 7000);
+			} catch (persistErr) {
+				this.render();
+				new Notice(
+					`Institute Roadmap: 后端不可用且本地状态无法保存（${errMsg(persistErr)}）。`,
+					9000,
+				);
+			}
+			return;
+		}
+		const liveStatus = normalizeStatus(moved.status);
+		if (!liveStatus) {
+			new Notice(`Institute Roadmap: 后端返回未知状态 ${moved.status}，正在重新同步。`, 8000);
+			await this.refreshLiveRoadmap(false);
+			return;
+		}
+		this.roadmapGen++; // invalidate any in-flight GET snapshot taken before this move
+		this.liveStatuses.set(card.id, liveStatus);
+		this.backendReady = true;
+		this.selectedId = card.id;
+		const overrides = { ...(this.plugin.settings.roadmapStatusOverrides ?? {}) };
+		if (card.id in overrides) {
+			delete overrides[card.id];
+			this.plugin.settings.roadmapStatusOverrides = overrides;
+			try {
+				await this.plugin.saveSettings();
+			} catch (persistErr) {
+				new Notice(
+					`Institute Roadmap: 移动已生效，但设置持久化失败（${errMsg(persistErr)}）。`,
+					8000,
+				);
+			}
+		}
+		this.render();
+		void this.refreshProcess(); // a move changes gate progress and blocked lists
+	}
+
+	private async saveLocalMove(card: RoadmapCard, status: RoadmapStatus): Promise<void> {
 		const overrides = { ...(this.plugin.settings.roadmapStatusOverrides ?? {}) };
 		const seed = ROADMAP.cards.find((c) => c.id === card.id);
 		if (seed?.status === status) {
@@ -318,10 +943,36 @@ export class RoadmapView extends ItemView {
 
 	private cards(): RoadmapCard[] {
 		const overrides = this.plugin.settings.roadmapStatusOverrides ?? {};
-		return ROADMAP.cards.map((card) => ({
+		const merged = ROADMAP.cards.map((card) => ({
 			...card,
-			status: normalizeStatus(overrides[card.id]) ?? card.status,
+			status:
+				this.liveStatuses.get(card.id) ??
+				normalizeStatus(overrides[card.id]) ??
+				card.status,
 		}));
+		// cards born through the API exist only in the backend: without this
+		// merge they would be invisible on the board, in the summary, and in
+		// the blocked strip (the bundled backlog is just the offline seed)
+		const seedIds = new Set(ROADMAP.cards.map((c) => c.id));
+		for (const [id, live] of this.liveCards) {
+			if (seedIds.has(id)) continue;
+			merged.push({
+				id,
+				title: live.title,
+				type: (live.type as RoadmapType) ?? "feature",
+				phase: live.phase ?? "",
+				status: this.liveStatuses.get(id) ?? "inbox",
+				priority: (live.priority as RoadmapPriority) ?? "P2",
+				risk: (live.risk as RoadmapRisk) ?? "medium",
+				summary: live.summary ?? "",
+				design_links: live.design_links ?? [],
+				expected_files: live.expected_files ?? [],
+				dependencies: live.dependencies ?? [],
+				acceptance: [], // list endpoint carries no checklists; detail panel does
+				verification: live.verification ?? [],
+			});
+		}
+		return merged;
 	}
 
 	private filteredCards(): RoadmapCard[] {
@@ -449,6 +1100,17 @@ export class RoadmapView extends ItemView {
 
 function normalizeStatus(value: string | undefined): RoadmapStatus | null {
 	return ROADMAP.columns.includes(value as RoadmapStatus) ? (value as RoadmapStatus) : null;
+}
+
+function formatSessionTime(iso: string): string {
+	const time = Date.parse(iso);
+	if (Number.isNaN(time)) return iso;
+	return new Date(time).toLocaleString(undefined, {
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
 }
 
 function mapById(cards: RoadmapCard[]): Map<string, RoadmapCard> {
@@ -596,6 +1258,54 @@ function ensureRoadmapStyles(): void {
 	color: var(--text-muted);
 	font-size: 11px;
 }
+.ir-process {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 8px;
+	margin-bottom: 12px;
+}
+.ir-process-box {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px 10px;
+	min-width: 0;
+}
+.ir-process-box h4 {
+	margin: 0 0 6px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-process-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 0;
+	border-bottom: 1px solid var(--ir-border);
+	font-size: 12px;
+	cursor: pointer;
+	overflow: hidden;
+}
+.ir-process-row:last-child {
+	border-bottom: none;
+}
+.ir-process-row span:not(.ir-id) {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	color: var(--text-muted);
+}
+.ir-process-row button {
+	margin-left: auto;
+	font-size: 11px;
+	padding: 1px 7px;
+	flex-shrink: 0;
+}
+@media (max-width: 900px) {
+	.ir-process {
+		grid-template-columns: 1fr;
+	}
+}
 .ir-filters {
 	display: flex;
 	flex-wrap: wrap;
@@ -740,6 +1450,74 @@ function ensureRoadmapStyles(): void {
 	border-radius: 8px;
 	padding: 8px;
 	background: var(--background-primary);
+}
+.ir-session-head, .ir-session-actions {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+.ir-session-head h4 {
+	margin: 0;
+}
+.ir-session-source {
+	margin: 5px 0 7px;
+	font-family: var(--font-monospace);
+	font-size: 10px;
+	color: var(--text-muted);
+}
+.ir-session-source.live {
+	color: var(--color-green);
+}
+.ir-session {
+	border: 1px solid var(--ir-border);
+	border-left: 3px solid var(--color-blue);
+	border-radius: 7px;
+	padding: 7px;
+	margin: 6px 0;
+	background: var(--background-primary);
+}
+.ir-session.status-completed {
+	border-left-color: var(--color-green);
+}
+.ir-session.status-blocked, .ir-session.status-partial {
+	border-left-color: var(--color-orange);
+}
+.ir-session.status-cancelled {
+	border-left-color: var(--text-faint);
+}
+.ir-session-meta {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 6px;
+	color: var(--text-muted);
+	font-size: 10px;
+}
+.ir-session-goal {
+	font-weight: 650;
+	margin: 5px 0 3px;
+}
+.ir-session-files, .ir-session-summary {
+	color: var(--text-muted);
+	font-size: 11px;
+	margin-top: 3px;
+	overflow-wrap: anywhere;
+}
+.ir-session-summary {
+	border-top: 1px solid var(--ir-border);
+	padding-top: 4px;
+	margin-top: 5px;
+	color: var(--text-normal);
+}
+.ir-session-actions {
+	justify-content: flex-start;
+	margin-top: 6px;
+}
+.ir-session-actions button, .ir-session-head button {
+	font-size: 11px;
+	padding: 2px 7px;
 }
 .ir-dep {
 	display: flex;

@@ -146,6 +146,78 @@ export interface VaultIndexRow {
 }
 
 // ---------------------------------------------------------------------------
+// Roadmap control plane (app/api/roadmap.py)
+// ---------------------------------------------------------------------------
+
+/** GET /api/roadmap/cards row (full card projection from list_cards). */
+export interface RoadmapLiveCard {
+	id: string;
+	title: string;
+	type: string;
+	phase: string;
+	status: string;
+	priority: string;
+	risk: string;
+	owner: string | null;
+	summary: string;
+	blocked_reason: string | null;
+	sort_order: number;
+	design_links: string[];
+	expected_files: string[];
+	verification: string[];
+	tags: string[];
+	dependencies: string[];
+}
+
+/** GET /api/roadmap/sessions row. */
+export interface RoadmapSessionRow {
+	id: string;
+	card_id: string;
+	actor: string;
+	goal: string;
+	status: "active" | "completed" | "partial" | "blocked" | "cancelled";
+	planned_files: string[];
+	touched_files: string[];
+	summary: string;
+	started_at: string;
+	finished_at: string | null;
+	n_commands?: number;
+}
+
+/** GET /api/roadmap/decisions row. */
+export interface RoadmapDecisionRow {
+	id: string;
+	card_id: string | null;
+	title: string;
+	question: string;
+	options: string[];
+	decision: string | null;
+	status: string;
+	created_at: string;
+	resolved_at: string | null;
+}
+
+/** GET /api/roadmap/release-gates row. */
+export interface RoadmapGate {
+	name: string;
+	description: string;
+	prefixes: string[];
+	total: number;
+	done: number;
+	pct: number;
+	status: "met" | "open";
+	remaining: string[];
+	evidence_ready: string[];
+}
+
+/** GET /api/roadmap/cards/{id}/prompt */
+export interface RoadmapPrompt {
+	card_id: string;
+	prompt: string;
+	generated: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
 
@@ -403,6 +475,44 @@ export class InstituteApi {
 	events(since: number, limit: number, types?: string): Promise<EventRow[]> {
 		const t = types ? `&types=${encodeURIComponent(types)}` : "";
 		return this.request<EventRow[]>(`/api/events?since=${since}&limit=${limit}${t}`);
+	}
+
+	// ---- roadmap -------------------------------------------------------------------
+
+	roadmapCards(): Promise<RoadmapLiveCard[]> {
+		return this.request<RoadmapLiveCard[]>("/api/roadmap/cards");
+	}
+
+	roadmapSessions(cardId?: string, status?: string, limit = 100): Promise<RoadmapSessionRow[]> {
+		const params = new URLSearchParams();
+		if (cardId) params.set("card_id", cardId);
+		if (status) params.set("status", status);
+		params.set("limit", String(limit));
+		return this.request<RoadmapSessionRow[]>(`/api/roadmap/sessions?${params.toString()}`);
+	}
+
+	roadmapDecisions(status?: string, limit = 100): Promise<RoadmapDecisionRow[]> {
+		const params = new URLSearchParams();
+		if (status) params.set("status", status);
+		params.set("limit", String(limit));
+		return this.request<RoadmapDecisionRow[]>(`/api/roadmap/decisions?${params.toString()}`);
+	}
+
+	resolveRoadmapDecision(decisionId: string, decision: string): Promise<RoadmapDecisionRow> {
+		return this.request<RoadmapDecisionRow>(
+			`/api/roadmap/decisions/${encodeURIComponent(decisionId)}`,
+			{ method: "PATCH", body: { decision } },
+		);
+	}
+
+	roadmapReleaseGates(): Promise<RoadmapGate[]> {
+		return this.request<RoadmapGate[]>("/api/roadmap/release-gates");
+	}
+
+	roadmapAgentPrompt(cardId: string): Promise<RoadmapPrompt> {
+		return this.request<RoadmapPrompt>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}/prompt`,
+		);
 	}
 
 	// ---- vault ---------------------------------------------------------------------
