@@ -1,6 +1,8 @@
 """Executor core: submit, artifacts, cancel, orphan recovery, fallback chain."""
 from __future__ import annotations
 
+import json
+
 from app import bus, db
 from app.hands import registry as registry_mod
 from app.hands.base import Hand, HandResult, RateLimitInfo
@@ -91,3 +93,54 @@ async def test_fallback_to_echo_and_cooldown(tmp_path, monkeypatch):
     registry.clear_cooldown("flaky")
     assert registry.cooling_until("flaky") is None
     assert registry.is_available("flaky")
+
+
+# ---- M8-003: execution policy + retry lineage persist on the row -------------
+
+async def test_submit_persists_fallback_chain_and_lineage_root(tmp_path):
+    """The exact chain a caller confined resolution to lands on the row (the
+    retry endpoint replays it later), as does the retry lineage root."""
+    task = await executor.submit(
+        "echo", "persist my policy", source="test", workspace=tmp_path,
+        fallback_chain=["echo"], lineage_root="roottask00001",
+    )
+    assert task.status == "completed"
+    row = await db.query_one(
+        "SELECT fallback_chain, lineage_root FROM tasks WHERE id = ?", (task.id,)
+    )
+    assert json.loads(row["fallback_chain"]) == ["echo"]
+    assert row["lineage_root"] == "roottask00001"
+    # the Task dataclass surfaces both
+    assert task.fallback_chain == ["echo"]
+    assert task.lineage_root == "roottask00001"
+
+
+async def test_submit_without_chain_persists_null(tmp_path):
+    """No explicit chain -> NULL (registry-default fallback), NOT '[]': the
+    retry endpoint distinguishes 'no confinement' from an explicit chain."""
+    task = await executor.submit("echo", "default policy", source="test", workspace=tmp_path)
+    row = await db.query_one(
+        "SELECT fallback_chain, lineage_root FROM tasks WHERE id = ?", (task.id,)
+    )
+    assert row["fallback_chain"] is None
+    assert row["lineage_root"] is None
+    assert task.fallback_chain is None
+    assert task.lineage_root is None
+
+
+async def test_spawn_persists_fallback_chain_and_lineage_root(tmp_path):
+    """spawn() (the retry endpoint's path) persists the same policy fields;
+    a tuple chain (settings.research_hand_names is a tuple) stores as JSON."""
+    task_id = await executor.spawn(
+        "echo", "spawned with policy", source="test", workspace=tmp_path,
+        fallback_chain=("echo",), lineage_root="rootspawn0001",
+    )
+    atask = executor._running.get(task_id)
+    if atask is not None:
+        await atask
+    row = await db.query_one(
+        "SELECT status, fallback_chain, lineage_root FROM tasks WHERE id = ?", (task_id,)
+    )
+    assert row["status"] == "completed"
+    assert json.loads(row["fallback_chain"]) == ["echo"]
+    assert row["lineage_root"] == "rootspawn0001"

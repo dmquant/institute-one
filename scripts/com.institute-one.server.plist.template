@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for the institute-one server (ROADMAP Phase 8).
+  The double-brace placeholders are rendered by scripts/install-service.sh; do
+  not load this file directly. Rendered target:
+  ~/Library/LaunchAgents/com.institute-one.server.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.institute-one.server</string>
+
+  <!-- Absolute venv path: launchd's bare PATH would never find uvicorn. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{VENV_DIR}}/bin/uvicorn</string>
+    <string>app.main:app</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>{{PORT}}</string>
+  </array>
+
+  <!-- CWD matters: pydantic-settings reads .env relative to the working
+       directory, so the service must start from the repo root (same as
+       scripts/start.sh) to see the same configuration. -->
+  <key>WorkingDirectory</key>
+  <string>{{REPO_DIR}}</string>
+
+  <!-- The point of this service (S2: the 8100 process once died silently):
+       restart on ANY abnormal exit (crash, OOM kill, unhandled fatal) but
+       leave clean exits alone — uvicorn shuts down gracefully on SIGTERM and
+       exits 0, so `launchctl stop` / an operator TERM does not fight the
+       keep-alive. ThrottleInterval keeps a crash loop at >=10s per attempt. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Separate from server.log (the nohup target of scripts/start.sh) so the
+       two start paths never truncate each other's logs. -->
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/launchd.err.log</string>
+
+  <!-- launchd jobs get only /usr/bin:/bin:/usr/sbin:/sbin. CLI hands recover
+       the user PATH via get_cli_env()'s login-shell capture; this is the
+       safety net underneath that (and covers any direct subprocess use). -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PATH}}</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

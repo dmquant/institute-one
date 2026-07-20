@@ -15,12 +15,43 @@ from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from . import vectors
 
 log = logging.getLogger("institute.archive")
 
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".csv"}
 FTS_SUFFIXES = {".md", ".txt"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
+
+# In-flight vector-indexing tasks (fire-and-forget; see _spawn_vector_index).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _reap_vector_task(task: asyncio.Task) -> None:
+    _bg_tasks.discard(task)
+    if not task.cancelled() and (exc := task.exception()):
+        log.warning("vector indexing task failed: %s", exc)
+
+
+def _spawn_vector_index(
+    rel_archive: str, ref_kind: str, ref_id: str, session_id: str, text: str, sha: str,
+) -> None:
+    """Kick off best-effort background embedding. NOTHING here may fail the
+    snapshot — vectors are a projection, archive rows are the truth."""
+    try:
+        task = asyncio.create_task(
+            vectors.index_file(rel_archive, ref_kind, ref_id, session_id, text, sha256=sha)
+        )
+        _bg_tasks.add(task)
+        task.add_done_callback(_reap_vector_task)
+    except Exception as exc:  # noqa: BLE001 - belt over vectors' own suspenders
+        log.warning("vector indexing failed to start for %s: %s", rel_archive, exc)
+
+
+async def flush_vector_indexing() -> None:
+    """Await in-flight embedding tasks (tests want deterministic indexing)."""
+    while _bg_tasks:
+        await asyncio.gather(*list(_bg_tasks), return_exceptions=True)
 
 
 def _write_bytes(dest: Path, data: bytes) -> None:
@@ -43,6 +74,8 @@ async def snapshot_session(session_id: str, ref_kind: str, ref_id: str | int) ->
 
     ref_id = str(ref_id)
     archived: list[str] = []
+    embed_jobs: list[tuple[str, str, str]] = []  # (rel_archive, text, sha256)
+    vectors_on = vectors._enabled()  # flag off (default reality) → zero vector tasks
     candidates = sorted(await asyncio.to_thread(lambda: list(workspace.rglob("*"))))
 
     for src in candidates:
@@ -63,6 +96,12 @@ async def snapshot_session(session_id: str, ref_kind: str, ref_id: str | int) ->
             "SELECT id FROM archive_files WHERE path = ? AND sha256 = ?", (rel_archive, sha)
         )
         if unchanged:
+            # Still queue unchanged .md for indexing: a snapshot taken while
+            # vectors were off/degraded left no projection, and skipping here
+            # would make that gap permanent. index_file no-ops (one SELECT)
+            # when the (path, sha, model) projection is already current.
+            if vectors_on and src.suffix.lower() == ".md":
+                embed_jobs.append((rel_archive, data.decode("utf-8", errors="replace"), sha))
             continue
 
         await asyncio.to_thread(_write_bytes, settings.archive_dir / rel_archive, data)
@@ -75,12 +114,22 @@ async def snapshot_session(session_id: str, ref_kind: str, ref_id: str | int) ->
             (session_id, ref_kind, ref_id, rel_archive, len(data), sha, bus.now_iso()),
         )
         if src.suffix.lower() in FTS_SUFFIXES:
+            text = data.decode("utf-8", errors="replace")
             await db.execute("DELETE FROM archive_fts WHERE path = ?", (rel_archive,))
             await db.execute(
                 "INSERT INTO archive_fts (content, path, ref_kind, ref_id, session_id) VALUES (?,?,?,?,?)",
-                (data.decode("utf-8", errors="replace"), rel_archive, ref_kind, ref_id, session_id),
+                (text, rel_archive, ref_kind, ref_id, session_id),
             )
+            if vectors_on and src.suffix.lower() == ".md":
+                embed_jobs.append((rel_archive, text, sha))
         archived.append(rel_archive)
+
+    # Best-effort vector indexing (Phase 1a), fire-and-forget: degraded
+    # (no Ollama / no sqlite-vec) means index_file returns 0. These tasks are
+    # registered in _bg_tasks, which main._drain_background cancels at
+    # shutdown alongside the other module registries.
+    for rel_archive, text, sha in embed_jobs:
+        _spawn_vector_index(rel_archive, ref_kind, ref_id, session_id, text, sha)
 
     if archived:
         await bus.emit("archive.snapshot", ref_kind, ref_id,
@@ -108,6 +157,25 @@ async def search(query: str, limit: int = 20) -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 - MATCH parse errors -> empty result
         log.warning("archive search failed for %r: %s", query, exc)
         return []
+
+
+async def search_hybrid(query: str, limit: int = 20) -> dict[str, Any]:
+    """Vector top-k merged with FTS5 when vectors are live; plain FTS5 otherwise.
+
+    Returns ``{"mode": "vector+fts" | "fts", "results": [...]}``. Vector rows
+    lead (sorted by cosine distance), FTS rows follow with same-path dupes
+    dropped. Any vector-layer failure silently degrades to mode="fts".
+    """
+    limit = min(max(limit, 1), 100)
+    fts_rows = await search(query, limit=limit)
+    for row in fts_rows:
+        row["source"] = "fts"
+    vec_rows = await vectors.search(query, k=limit)
+    if not vec_rows:
+        return {"mode": "fts", "results": fts_rows}
+    seen = {r["path"] for r in vec_rows}
+    merged = vec_rows + [r for r in fts_rows if r["path"] not in seen]
+    return {"mode": "vector+fts", "results": merged[:limit]}
 
 
 async def read_file(relpath: str) -> str:

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
+
+import pytest
 
 from app import bus, db
 from app.institute import whiteboard
@@ -52,6 +55,109 @@ async def test_kickoff_creates_board_and_first_card():
 
     # kickoff with an empty pool is a no-op
     assert await whiteboard.kickoff() is None
+
+
+async def test_kickoff_releases_topic_when_board_open_fails(monkeypatch):
+    await whiteboard.add_topic("新能源产业链", "锂价见底了吗？", source="test")
+    real_open_board = whiteboard._open_board
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("simulated board insert failure")
+
+    monkeypatch.setattr(whiteboard, "_open_board", boom)
+    assert await whiteboard.kickoff() is None  # never raises
+
+    # the topic survived the failure and is claimable again
+    pending = await whiteboard.list_topics("pending")
+    assert len(pending) == 1
+    assert pending[0]["topic"] == "新能源产业链"
+
+    monkeypatch.setattr(whiteboard, "_open_board", real_open_board)
+    board_id = await whiteboard.kickoff()
+    assert board_id is not None
+    board = await whiteboard.get_board(board_id)
+    assert board["topic"] == "新能源产业链"
+    assert await whiteboard.list_topics("pending") == []
+
+
+@pytest.mark.parametrize("needle", ["INSERT INTO whiteboard_boards", "INSERT INTO whiteboard_cards"])
+async def test_kickoff_rolls_back_board_transaction_on_insert_failure(monkeypatch, needle):
+    """Real _open_board, failure injected at one INSERT: no residue, topic released."""
+    await whiteboard.add_topic("机器人产业", "人形机器人量产元年了吗？", source="test")
+
+    real_transaction = db.transaction
+    inject = {"on": True}
+
+    class FailingConn:
+        def __init__(self, real):
+            self._real = real
+
+        async def execute(self, sql, *args, **kwargs):
+            if inject["on"] and needle in sql:
+                raise RuntimeError(f"injected failure at {needle}")
+            return await self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    @asynccontextmanager
+    async def failing_transaction():
+        async with real_transaction() as conn:
+            yield FailingConn(conn)
+
+    monkeypatch.setattr(db, "transaction", failing_transaction)
+    assert await whiteboard.kickoff() is None  # never raises
+
+    # the transaction rolled back atomically: no board, no orphan card
+    assert await db.query("SELECT id FROM whiteboard_boards") == []
+    assert await db.query("SELECT id FROM whiteboard_cards") == []
+    # and the topic went back to the pool
+    pending = await whiteboard.list_topics("pending")
+    assert len(pending) == 1
+    assert pending[0]["topic"] == "机器人产业"
+
+    inject["on"] = False  # same wiring, injection off -> the retry succeeds
+    board_id = await whiteboard.kickoff()
+    assert board_id is not None
+    board = await whiteboard.get_board(board_id)
+    assert board["topic"] == "机器人产业"
+    assert len(board["cards"]) == 1
+    assert await whiteboard.list_topics("pending") == []
+
+
+async def test_post_commit_read_failure_keeps_topic_used(monkeypatch):
+    """Once the board transaction committed, an ancillary read failure must NOT
+    release the topic claim (that would open a second board for the same topic)."""
+    await whiteboard.add_topic("半导体设备国产化", "刻蚀机的差距还有多大？", source="test")
+
+    real_query_one = db.query_one
+    inject = {"on": True}
+
+    async def flaky_query_one(sql, params=()):
+        # the final post-commit read in _open_board selects the board by id
+        if inject["on"] and "FROM whiteboard_boards WHERE id" in sql:
+            raise RuntimeError("simulated post-commit read failure")
+        return await real_query_one(sql, params)
+
+    monkeypatch.setattr(db, "query_one", flaky_query_one)
+    board_id = await whiteboard.kickoff()
+    inject["on"] = False
+
+    # the board landed and kickoff did NOT misread the failure as "nothing landed"
+    assert board_id is not None
+    boards = await db.query("SELECT * FROM whiteboard_boards")
+    assert len(boards) == 1
+    assert boards[0]["id"] == board_id
+    assert boards[0]["status"] == "active"
+
+    # the topic stays consumed
+    assert await whiteboard.list_topics("pending") == []
+    topic = (await whiteboard.list_topics("used"))[0]
+    assert topic["topic"] == "半导体设备国产化"
+
+    # a second kickoff cannot open a duplicate board for the same topic
+    assert await whiteboard.kickoff() is None
+    assert len(await db.query("SELECT id FROM whiteboard_boards")) == 1
 
 
 async def test_tick_drives_board_to_completed_on_echo():

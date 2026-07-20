@@ -1,5 +1,14 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
-import { clearHandCooldown, getMeta, listTasks } from "../api";
+import {
+  clearHandCooldown,
+  getAdminState,
+  getMeta,
+  isMaintenancePaused,
+  listTasks,
+  setMaintenance,
+} from "../api";
+import { EventFeed } from "../events";
 import { useSSE } from "../useSSE";
 import {
   Empty,
@@ -20,6 +29,9 @@ export default function Dashboard() {
   const { events, connected, lastEvent } = useSSE({ max: 60 });
   const meta = useLoad(getMeta, [lastEvent?.id ?? 0], 15000);
   const todays = useLoad(() => listTasks({ limit: 30 }), [lastEvent?.id ?? 0], 30000);
+  const admin = useLoad(getAdminState, [], 30000);
+  const [resumeErr, setResumeErr] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
 
   const byStatus = meta.data?.queue.by_status ?? {};
   const statuses = [
@@ -27,9 +39,41 @@ export default function Dashboard() {
     ...Object.keys(byStatus).filter((s) => !STATUS_ORDER.includes(s)),
   ];
 
+  const maintenancePaused = isMaintenancePaused(admin.data);
+
+  const resume = async () => {
+    setResumeErr(null);
+    setResuming(true);
+    try {
+      await setMaintenance(false);
+      admin.reload();
+    } catch (e) {
+      setResumeErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setResuming(false);
+    }
+  };
+
   return (
     <>
       <PageHead zh="总览" en="Dashboard" />
+
+      {/* a failed read must not silently pass as "未暂停" (banner gone) */}
+      {admin.error && <ErrorNote error={`维护状态读取失败：${admin.error}`} />}
+      <ErrorNote error={resumeErr} />
+      {maintenancePaused && (
+        <div className="error-note">
+          维护模式已开启：定时任务（简报/日报/白板/信箱/研究/记忆压缩）暂停发起新模型调用，在途任务继续。
+          <button
+            className="small ghost"
+            style={{ marginLeft: 10 }}
+            onClick={resume}
+            disabled={resuming}
+          >
+            {resuming ? "恢复中…" : "恢复运行"}
+          </button>
+        </div>
+      )}
 
       <div className="card">
         <h2>
@@ -89,18 +133,7 @@ export default function Dashboard() {
           <h2>
             实时事件<span className="en">live events {connected ? "· live" : "· reconnecting"}</span>
           </h2>
-          <div className="feed">
-            {events.map((e) => (
-              <div className="feed-item" key={e.id}>
-                <span className="type">{e.type}</span>
-                <span className="ref">
-                  {e.ref_kind}:{e.ref_id}
-                </span>
-                <span className="t">{ago(e.created_at)}</span>
-              </div>
-            ))}
-            {events.length === 0 && <Empty text="等待事件中…" />}
-          </div>
+          <EventFeed events={events} />
         </div>
 
         <div className="card">

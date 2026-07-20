@@ -15,10 +15,10 @@ from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..hands.registry import get_registry
 from ..router import executor
 from ..router.executor import TERMINAL
 from .analysts import get_analyst
-from .prompts import build_analyst_prompt
 
 log = logging.getLogger("institute.mailbox")
 
@@ -164,11 +164,21 @@ async def _run_dispatch(thread_id: str, message_id: int) -> None:
             "请以你的分析师身份直接回复操作员的最新留言：简明、直接、先结论后论据；"
             "事实性论断给出来源。不要写文件，直接输出回复正文。"
         )
-        prompt = build_analyst_prompt(
-            analyst, task_text, context_blocks=[context] if context else None
+        from . import memory
+        prompt = await memory.prompt_with_memory(
+            analyst, task_text, context_blocks=[context] if context else None,
         )
+        hand = analyst.hand or settings.default_hand
+        # opt-in weighted pick (settings.enable_hand_weights, default False = the
+        # line above is final): pool = available hands with a positive 'mailbox'
+        # weight row; an explicit analyst.hand is always respected.
+        if settings.enable_hand_weights and not analyst.hand:
+            reg = get_registry()
+            pool = [h for h, w in reg.weights_snapshot().get("mailbox", {}).items()
+                    if w > 0 and reg.is_available(h)]
+            hand = reg.pick_weighted_hand("mailbox", pool) or hand
         task = await executor.submit(
-            analyst.hand or settings.default_hand, prompt,
+            hand, prompt,
             source="mailbox", model=analyst.model, session_id=None,
         )
         await db.execute(

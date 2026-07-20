@@ -1,6 +1,15 @@
 import { App, ItemView, Modal, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import backlog from "../../roadmap/backlog.json";
-import { ApiError, RoadmapApiCard, RoadmapReleaseGate, RoadmapSession, errMsg } from "./api";
+import {
+	ApiError,
+	RoadmapApiCard,
+	RoadmapBlockedCard,
+	RoadmapProcessGate,
+	RoadmapProcessOverview,
+	RoadmapReleaseGate,
+	RoadmapSession,
+	errMsg,
+} from "./api";
 import type InstituteOnePlugin from "./main";
 
 export const VIEW_TYPE_ROADMAP = "institute-roadmap";
@@ -84,6 +93,8 @@ export class RoadmapView extends ItemView {
 	private status = "all";
 	private type = "all";
 	private selectedId = ROADMAP.cards[0]?.id ?? "";
+	/** "board" = Kanban + detail + gates; "process" = the M7-006 global process view. */
+	private tab: "board" | "process" = "board";
 
 	/** "api" = backend rows are truth; "offline" = bundled seed + local overrides. */
 	private mode: "api" | "offline" = "offline";
@@ -97,13 +108,19 @@ export class RoadmapView extends ItemView {
 	private sessionsFetched = new Set<string>();
 	/** null = the fetch failed; the panel renders a retry row instead of 加载中 */
 	private sessionsByCard = new Map<string, RoadmapSession[] | null>();
+	/** backend-generated agent prompts (GET /cards/{id}/prompt), keyed by card id */
+	private promptsByCard = new Map<string, string>();
+	/** undefined = not loaded yet; null = the fetch failed (retry row) */
+	private processData: RoadmapProcessOverview | null | undefined = undefined;
 
 	private subtitleEl!: HTMLElement;
 	private summaryEl!: HTMLElement;
+	private tabsEl!: HTMLElement;
 	private filtersEl!: HTMLElement;
 	private boardEl!: HTMLElement;
 	private detailEl!: HTMLElement;
 	private gatesEl!: HTMLElement;
+	private processEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: InstituteOnePlugin) {
 		super(leaf);
@@ -140,10 +157,12 @@ export class RoadmapView extends ItemView {
 		);
 
 		this.summaryEl = root.createDiv({ cls: "ir-summary" });
+		this.tabsEl = root.createDiv({ cls: "ir-tabs" });
 		this.filtersEl = root.createDiv({ cls: "ir-filters" });
 		this.boardEl = root.createDiv({ cls: "ir-board" });
 		this.detailEl = root.createDiv({ cls: "ir-detail" });
 		this.gatesEl = root.createDiv({ cls: "ir-gates" });
+		this.processEl = root.createDiv({ cls: "ir-process" });
 		this.render(); // instant paint from the bundled seed…
 		void this.reload(); // …then prefer the live backend
 	}
@@ -180,15 +199,19 @@ export class RoadmapView extends ItemView {
 				this.detailFetched.clear();
 				this.sessionsFetched.clear();
 				this.sessionsByCard.clear();
+				this.promptsByCard.clear();
 				this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
+				this.processData = await this.plugin.api.processOverview().catch(() => null);
 			} else {
 				this.apiCards = null;
 				this.apiGates = null;
+				this.processData = undefined;
 				this.mode = "offline";
 			}
 		} catch {
 			this.apiCards = null;
 			this.apiGates = null;
+			this.processData = undefined;
 			this.mode = "offline";
 		}
 		this.loading = false;
@@ -234,10 +257,40 @@ export class RoadmapView extends ItemView {
 	private render(): void {
 		this.renderSubtitle();
 		this.renderSummary();
-		this.renderFilters();
-		this.renderBoard();
-		this.renderDetail();
-		this.renderGates();
+		this.renderTabs();
+		const board = this.tab === "board";
+		for (const el of [this.filtersEl, this.boardEl, this.detailEl, this.gatesEl]) {
+			el.style.display = board ? "" : "none";
+		}
+		this.processEl.style.display = board ? "none" : "";
+		if (board) {
+			this.renderFilters();
+			this.renderBoard();
+			this.renderDetail();
+			this.renderGates();
+		} else {
+			this.renderProcess();
+		}
+	}
+
+	private renderTabs(): void {
+		this.tabsEl.empty();
+		const tabs: Array<{ id: "board" | "process"; label: string; title: string }> = [
+			{ id: "board", label: "看板", title: "Kanban 看板与卡片详情" },
+			{ id: "process", label: "流程", title: "活动会话、开放决策、release gates 与阻塞卡（M7-006）" },
+		];
+		for (const t of tabs) {
+			const btn = this.tabsEl.createEl("button", {
+				text: t.label,
+				cls: `ir-tab${this.tab === t.id ? " is-active" : ""}`,
+			});
+			btn.setAttribute("title", t.title);
+			btn.addEventListener("click", () => {
+				if (this.tab === t.id) return;
+				this.tab = t.id;
+				this.render();
+			});
+		}
 	}
 
 	private renderSubtitle(): void {
@@ -341,6 +394,7 @@ export class RoadmapView extends ItemView {
 		this.selectedId = card.id;
 		this.hydrateDetail(card);
 		this.hydrateSessions(card);
+		this.hydratePrompt(card);
 		const blocked = isBlocked(card, byId);
 
 		const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
@@ -366,7 +420,7 @@ export class RoadmapView extends ItemView {
 		const side = body.createDiv();
 		this.dependencyBlock(side, card, byId);
 		if (this.mode === "api") this.sessionsBlock(side, card);
-		this.block(side, "执行提示", [agentPrompt(card)], "pre");
+		this.promptBlock(side, card);
 		if (blocked) {
 			const reasons: string[] = [];
 			if (hasOpenDeps(card, byId)) {
@@ -425,6 +479,59 @@ export class RoadmapView extends ItemView {
 				if (this.selectedId === card.id) this.renderDetail();
 			},
 		);
+	}
+
+	/** API mode: lazily fetch the backend's deterministic agent prompt
+	 * (GET /cards/{id}/prompt, M7-007) so the panel previews what 复制 copies.
+	 * Offline keeps the local seed-derived template as the fallback. */
+	private hydratePrompt(card: RoadmapCard): void {
+		if (this.mode !== "api" || this.promptsByCard.has(card.id)) return;
+		void this.plugin.api.cardPrompt(card.id).then(
+			(res) => {
+				this.promptsByCard.set(card.id, res.prompt);
+				if (this.selectedId === card.id) this.renderDetail();
+			},
+			() => {
+				/* keep the local fallback; retried on the next reselect */
+			},
+		);
+	}
+
+	/** Agent prompt panel (M7-007): preview + a copy button. API mode copies the
+	 * backend's deterministic prompt; offline copies the bundled-seed template. */
+	private promptBlock(parent: HTMLElement, card: RoadmapCard): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		const head = box.createDiv({ cls: "ir-sessions-head" });
+		head.createEl("h4", { text: "Agent Prompt" });
+		this.button(head, "复制 Agent Prompt", "生成并复制该卡的 agent prompt 到剪贴板", () =>
+			void this.copyAgentPrompt(card),
+		);
+		box.createEl("pre", { text: this.promptsByCard.get(card.id) ?? agentPrompt(card) });
+	}
+
+	private async copyAgentPrompt(card: RoadmapCard): Promise<void> {
+		let prompt: string;
+		let source = "后端生成";
+		if (this.mode === "api") {
+			try {
+				prompt = (await this.plugin.api.cardPrompt(card.id)).prompt;
+				this.promptsByCard.set(card.id, prompt);
+				if (this.selectedId === card.id) this.renderDetail();
+			} catch (e) {
+				new Notice(`Institute Roadmap: 获取 Agent Prompt 失败 — ${errMsg(e)}`, 8000);
+				return;
+			}
+		} else {
+			prompt = agentPrompt(card);
+			source = "离线模板";
+		}
+		try {
+			await navigator.clipboard.writeText(prompt);
+		} catch (e) {
+			new Notice(`Institute Roadmap: 写入剪贴板失败 — ${errMsg(e)}`, 8000);
+			return;
+		}
+		new Notice(`Institute Roadmap: 已复制 ${card.id} 的 Agent Prompt（${source}）。`, 5000);
 	}
 
 	/** Sessions panel (API mode only): the backend refuses moving a card to
@@ -526,6 +633,156 @@ export class RoadmapView extends ItemView {
 			});
 			box.createDiv({ cls: "ir-gate-meta", text: `${gate.done}/${gate.total} cards · ${gate.pct}%` });
 		}
+	}
+
+	/** 流程 tab (M7-006): active sessions, open decisions, release-gate
+	 * readiness (status + evidence), and blocked cards — one aggregate fetch
+	 * (GET /api/roadmap/process), no per-card drilling. Offline falls back to
+	 * what the bundled seed can compute (gates + blocked); sessions/decisions
+	 * live only in the backend. */
+	private renderProcess(): void {
+		const root = this.processEl;
+		root.empty();
+
+		if (this.mode !== "api") {
+			root.createDiv({
+				cls: "ir-warning",
+				text:
+					"离线模式 — 编码会话与决策需要后端连接。以下 release gates 与阻塞卡由内置 " +
+					"roadmap/backlog.json 本地计算（无 evidence 数据）。",
+			});
+			this.processGates(root, localProcessGates(this.cards()), true);
+			this.processBlocked(root, localBlockedCards(this.cards()));
+			return;
+		}
+		if (this.processData === undefined) {
+			root.createDiv({ cls: "ir-empty", text: "加载中…" });
+			return;
+		}
+		if (this.processData === null) {
+			root.createDiv({ cls: "ir-empty", text: "流程数据加载失败。" });
+			this.button(root, "重试", "重新加载流程聚合", () => void this.reloadProcess());
+			return;
+		}
+		const data = this.processData;
+
+		const sessBox = root.createDiv({ cls: "ir-block" });
+		sessBox.createEl("h4", { text: `活动编码会话（${data.active_sessions.length}）` });
+		if (!data.active_sessions.length) {
+			sessBox.createDiv({ cls: "ir-empty", text: "无活动会话。" });
+		}
+		for (const sess of data.active_sessions) {
+			const row = sessBox.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			meta.createSpan({ cls: "ir-id", text: sess.actor });
+			this.cardLink(meta, sess.card_id, sess.card_title);
+			meta.createSpan({ text: `${sess.n_commands ?? 0} 条命令` });
+			row.createDiv({ cls: "ir-session-goal", text: sess.goal });
+		}
+
+		const decBox = root.createDiv({ cls: "ir-block" });
+		decBox.createEl("h4", { text: `开放决策（${data.open_decisions.length}）` });
+		if (!data.open_decisions.length) {
+			decBox.createDiv({ cls: "ir-empty", text: "无开放决策。" });
+		}
+		for (const dec of data.open_decisions) {
+			const row = decBox.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			meta.createSpan({ cls: "ir-pill decision-open", text: "open" });
+			if (dec.card_id) this.cardLink(meta, dec.card_id, dec.card_title ?? undefined);
+			else meta.createSpan({ text: "（板级决策）" });
+			row.createDiv({ cls: "ir-session-goal", text: dec.title });
+			row.createDiv({ cls: "ir-session-summary", text: dec.question });
+			if (dec.options.length) {
+				row.createDiv({ cls: "ir-session-summary", text: `选项：${dec.options.join(" / ")}` });
+			}
+		}
+
+		this.processGates(root, data.release_gates, false);
+		this.processBlocked(root, data.blocked_cards);
+	}
+
+	/** Release-gate readiness cards. Offline mode has no evidence rows, so the
+	 * evidence column and the ready verdict are suppressed there. */
+	private processGates(parent: HTMLElement, gates: RoadmapProcessGate[], offline: boolean): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		box.createEl("h4", { text: "Release Gates（状态 + evidence）" });
+		const wrap = box.createDiv({ cls: "ir-gate-grid" });
+		for (const gate of gates) {
+			const g = wrap.createDiv({ cls: "ir-gate" });
+			const head = g.createDiv({ cls: "ir-sessions-head" });
+			head.createDiv({ cls: "ir-gate-name", text: gate.gate });
+			if (!offline) {
+				head.createSpan({
+					cls: `ir-pill ${gate.ready ? "gate-ready" : "gate-open"}`,
+					text: gate.ready ? "ready" : "open",
+				});
+			}
+			g.createDiv({ cls: "ir-gate-desc", text: gate.description });
+			const pct = gate.cards_total
+				? Math.round((100 * gate.cards_done) / gate.cards_total)
+				: 0;
+			g.createDiv({ cls: "ir-progress" }).createDiv({
+				cls: "ir-progress-bar",
+				attr: { style: `width: ${pct}%` },
+			});
+			const meta = offline
+				? `done ${gate.cards_done}/${gate.cards_total}`
+				: `done ${gate.cards_done}/${gate.cards_total} · evidence ${gate.evidence_ready}/${gate.cards_total}`;
+			g.createDiv({ cls: "ir-gate-meta", text: meta });
+			if (gate.blockers.length) {
+				g.createDiv({
+					cls: "ir-gate-meta ir-gate-blockers",
+					text: `阻塞：${gate.blockers.join(", ")}`,
+				});
+			}
+		}
+	}
+
+	private processBlocked(parent: HTMLElement, blocked: RoadmapBlockedCard[]): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		box.createEl("h4", { text: `阻塞卡片（${blocked.length}）` });
+		if (!blocked.length) {
+			box.createDiv({ cls: "ir-empty", text: "没有被阻塞的卡片。" });
+			return;
+		}
+		for (const c of blocked) {
+			const row = box.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			this.cardLink(meta, c.id, c.title);
+			meta.createSpan({ cls: "ir-pill", text: STATUS_ZH[c.status as RoadmapStatus] ?? c.status });
+			if (c.owner) meta.createSpan({ text: c.owner });
+			const reasons: string[] = [];
+			if (c.blocked_reason) reasons.push(`标记阻塞：${c.blocked_reason}`);
+			if (c.open_dependencies.length) reasons.push(`未完成依赖：${c.open_dependencies.join(", ")}`);
+			row.createDiv({ cls: "ir-session-summary is-missing", text: reasons.join(" · ") });
+		}
+	}
+
+	/** Clickable card reference: jumps back to the 看板 tab with the card selected. */
+	private cardLink(parent: HTMLElement, cardId: string, title?: string): void {
+		const link = parent.createEl("a", {
+			cls: "ir-card-link",
+			text: title ? `${cardId} · ${title}` : cardId,
+		});
+		link.setAttribute("title", "在看板中打开该卡片");
+		link.addEventListener("click", (ev) => {
+			ev.preventDefault();
+			this.tab = "board";
+			this.selectedId = cardId;
+			this.render();
+		});
+	}
+
+	private async reloadProcess(): Promise<void> {
+		this.processData = undefined;
+		this.renderProcess();
+		try {
+			this.processData = await this.plugin.api.processOverview();
+		} catch {
+			this.processData = null;
+		}
+		if (this.tab === "process") this.renderProcess();
 	}
 
 	private async moveCard(card: RoadmapCard, status: RoadmapStatus): Promise<void> {
@@ -908,6 +1165,45 @@ function localReleaseGates(cards: RoadmapCard[]): RoadmapReleaseGate[] {
 	});
 }
 
+/** Offline fallback for the 流程 tab's gate panel — evidence rows live only in
+ * the backend, so evidence_ready is 0 and ready is never claimed offline. */
+function localProcessGates(cards: RoadmapCard[]): RoadmapProcessGate[] {
+	const byId = mapById(cards);
+	return RELEASE_GATES.map((gate) => {
+		const scoped = cards.filter((c) => gate.prefixes.includes(c.phase.split(" ")[0]));
+		return {
+			gate: gate.name,
+			description: gate.description,
+			prefixes: gate.prefixes,
+			cards_total: scoped.length,
+			cards_done: scoped.filter((c) => c.status === "done").length,
+			evidence_ready: 0,
+			blockers: scoped
+				.filter((c) => c.status !== "done" && isBlocked(c, byId))
+				.map((c) => c.id)
+				.sort(),
+			ready: false,
+		};
+	});
+}
+
+/** Offline fallback for the 流程 tab's blocked list — mirrors the backend rule:
+ * blocked_reason or an open dependency, done cards excluded. */
+function localBlockedCards(cards: RoadmapCard[]): RoadmapBlockedCard[] {
+	const byId = mapById(cards);
+	return cards
+		.filter((c) => c.status !== "done" && isBlocked(c, byId))
+		.map((c) => ({
+			id: c.id,
+			title: c.title,
+			phase: c.phase,
+			status: c.status,
+			owner: null,
+			blocked_reason: c.blocked_reason ?? null,
+			open_dependencies: c.dependencies.filter((id) => byId.get(id)?.status !== "done"),
+		}));
+}
+
 function cardSort(a: RoadmapCard, b: RoadmapCard): number {
 	// API mode: the backend's sort_order is the operator-controlled ordering
 	if (a.sort_order !== undefined && b.sort_order !== undefined && a.sort_order !== b.sort_order) {
@@ -1083,6 +1379,47 @@ function ensureRoadmapStyles(): void {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
+}
+.ir-tabs {
+	display: flex;
+	gap: 6px;
+	margin-bottom: 12px;
+}
+.ir-tab {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px 8px 0 0;
+	background: var(--ir-panel);
+	color: var(--text-muted);
+	padding: 4px 14px;
+	cursor: pointer;
+}
+.ir-tab.is-active {
+	background: var(--ir-panel-2);
+	color: var(--text-normal);
+	font-weight: 700;
+	border-bottom-color: transparent;
+}
+.ir-process {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 12px;
+	margin-bottom: 12px;
+}
+.ir-card-link {
+	font-family: var(--font-monospace);
+	font-weight: 700;
+	cursor: pointer;
+}
+.ir-pill.gate-ready {
+	color: var(--color-green);
+}
+.ir-pill.gate-open, .ir-pill.decision-open {
+	color: var(--color-orange);
+}
+.ir-gate-blockers {
+	color: var(--color-orange);
+	margin-top: 4px;
 }
 .ir-summary {
 	display: grid;

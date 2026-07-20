@@ -11,15 +11,16 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..hands.registry import get_registry
 from ..router import executor
 from . import sessions
 from .analysts import get_analyst
 from .prompts import (
-    build_analyst_prompt,
     extract_summary,
     previous_steps_block,
     substitute_variables,
@@ -28,11 +29,47 @@ from .prompts import (
 
 log = logging.getLogger("institute.workflows")
 
+# workflow_runs.status enum — canonical code constant mirroring the CHECK in
+# migrations/0001_init.sql. Import point for API surfaces (/api/contract).
+RUN_STATUSES = ("running", "completed", "failed", "cancelled")
+
 # keep strong references to fire-and-forget drivers
 _driving: set[asyncio.Task] = set()
 
+# ${WEEK_DISPUTES} rendering caps (committee workflow, Phase 7)
+WEEK_DISPUTES_DAYS = 7
+WEEK_DISPUTES_MAX_BYTES = 3072      # UTF-8 bytes, like the ${DATA_BUNDLE} cap
+WEEK_DISPUTES_MAX_BOARDS = 50       # backstop; the byte cap bites first
+
 
 # ---- definitions ---------------------------------------------------------
+
+def _normalize_steps(workflow_id: str, steps: list[Any]) -> list[Any]:
+    """Fold the legacy ``analyst`` step key into the canonical ``analyst_id``.
+
+    Unknown analyst ids get a loud warning (runs fall back to chief-strategist,
+    documented behaviour) but never raise — reconcile happens at boot.
+    """
+    out: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict):  # malformed step: keep as-is, _drive deals with it
+            out.append(step)
+            continue
+        step = dict(step)
+        legacy = step.pop("analyst", None)
+        # canonical analyst_id wins over the legacy alias when both are present
+        # (matches the runtime lookup order in _drive)
+        aid = str(step.get("analyst_id") or legacy or "").strip()
+        if aid:
+            step["analyst_id"] = aid
+            if get_analyst(aid) is None:
+                log.warning(
+                    "workflow %s step %s: unknown analyst %r — runs will fall back to chief-strategist",
+                    workflow_id, step.get("id"), aid,
+                )
+        out.append(step)
+    return out
+
 
 async def reconcile_from_disk() -> int:
     """Upsert every workflows/*.json into the workflows table. Never raises."""
@@ -44,6 +81,7 @@ async def reconcile_from_disk() -> int:
     for path in sorted(wf_dir.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            steps = _normalize_steps(data["id"], data["steps"])
             await db.execute(
                 """INSERT INTO workflows (id, name, description, variables, steps, updated_at)
                    VALUES (?,?,?,?,?,?)
@@ -54,7 +92,7 @@ async def reconcile_from_disk() -> int:
                 (
                     data["id"], data["name"], data.get("description", ""),
                     json.dumps(data.get("variables", []), ensure_ascii=False),
-                    json.dumps(data["steps"], ensure_ascii=False),
+                    json.dumps(steps, ensure_ascii=False),
                     bus.now_iso(),
                 ),
             )
@@ -80,6 +118,51 @@ async def list_workflows() -> list[dict[str, Any]]:
 async def get_workflow(workflow_id: str) -> dict[str, Any] | None:
     row = await db.query_one("SELECT * FROM workflows WHERE id = ?", (workflow_id,))
     return _parse_workflow(row) if row else None
+
+
+# ---- lazy prompt variables --------------------------------------------------
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    cut = raw[: max_bytes - len("…".encode("utf-8"))].decode("utf-8", errors="ignore")
+    return cut + "…"
+
+
+async def week_disputes_variable() -> str:
+    """${WEEK_DISPUTES} value: topics + closing summaries of whiteboard boards
+    completed in the last WEEK_DISPUTES_DAYS days (newest first), ≤3KB UTF-8.
+
+    Reads the whiteboard tables directly (read-only projection; whiteboard.py
+    owns the write path and stays untouched). The closing summary is the
+    highest-idx completed card's summary — the board's wrap-up card. Never
+    raises — no boards / no data renders as "" so the committee prompt
+    degrades to its documented「材料为空」branch.
+    """
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=WEEK_DISPUTES_DAYS)
+        ).isoformat(timespec="seconds")
+        boards = await db.query(
+            "SELECT b.topic, b.work_date, "
+            "       (SELECT c.summary FROM whiteboard_cards c "
+            "         WHERE c.board_id = b.id AND c.status = 'completed' "
+            "           AND c.summary IS NOT NULL AND c.summary != '' "
+            "         ORDER BY c.idx DESC LIMIT 1) AS closing_summary "
+            "FROM whiteboard_boards b "
+            "WHERE b.status = 'completed' AND b.updated_at >= ? "
+            "ORDER BY b.updated_at DESC LIMIT ?",
+            (cutoff, WEEK_DISPUTES_MAX_BOARDS),
+        )
+        lines = []
+        for b in boards:
+            summary = (b["closing_summary"] or "").replace("\n", " ").strip() or "（无收尾摘要）"
+            lines.append(f"- 「{b['topic']}」（{b['work_date']} 研讨）：{summary}")
+        return _truncate_utf8("\n".join(lines), WEEK_DISPUTES_MAX_BYTES)
+    except Exception:  # noqa: BLE001 - the prompt path must never break on data
+        log.exception("week disputes render failed")
+        return ""
 
 
 # ---- runs -----------------------------------------------------------------
@@ -122,6 +205,91 @@ async def run_workflow_and_wait(
     return await get_run(run_id)  # type: ignore[return-value]
 
 
+# ---- committee (Phase 7): once-per-week idempotent kickoff -------------------
+
+COMMITTEE_WORKFLOW_ID = "committee"
+COMMITTEE_CLAIM_PREFIX = "committee"
+# a claim that never recorded a run_id (kickoff crashed between claim and
+# insert) is retryable after this long
+COMMITTEE_CLAIM_STALE_S = 3600
+
+
+def committee_week(wd: str | None = None) -> str:
+    """ISO-week key for the committee claim, from the SGT work date."""
+    y, w, _ = date.fromisoformat(wd or work_date()).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+async def run_committee_once(*, source: str = "scheduler") -> str | None:
+    """Idempotent committee kickoff: at most ONE run per ISO week (SGT).
+
+    Durable atomic claim (hard rule 2): INSERT ... ON CONFLICT DO NOTHING on
+    the admin_state row ``committee:<iso-week>`` makes one winner per week —
+    scheduler misfires/coalesce replays, restarts and manual run-now triggers
+    all collapse into it. Retry semantics: if the claimed week's run ended
+    'failed'/'cancelled' (or the claim never recorded a run_id and is older
+    than COMMITTEE_CLAIM_STALE_S), the claim is taken over via CAS UPDATE and
+    the week reruns; a running/completed run keeps the week closed. Returns
+    the new run id, or None when the week is already taken.
+
+    Escape hatch: POST /api/workflows/committee/run bypasses this guard (the
+    operator's explicit intent), same as the generic run endpoint vs
+    daily.py's _ran_today guard.
+    """
+    week = committee_week()
+    key = f"{COMMITTEE_CLAIM_PREFIX}:{week}"
+    token = json.dumps({"status": "claimed", "claimed_at": bus.now_iso()})
+    won = await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+        (key, token),
+    )
+    if not won:
+        row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
+        if row is None:  # released between INSERT and SELECT — don't race it, just skip
+            return None
+        stale = False
+        try:
+            held = json.loads(row["value"])
+            run_id = held.get("run_id")
+            if run_id:
+                run = await db.query_one(
+                    "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
+                )
+                stale = run is None or run["status"] in ("failed", "cancelled")
+            else:
+                claimed_at = datetime.fromisoformat(held["claimed_at"])
+                stale = (
+                    datetime.now(timezone.utc) - claimed_at
+                ).total_seconds() > COMMITTEE_CLAIM_STALE_S
+        except (ValueError, KeyError, TypeError):
+            stale = True  # a corrupt claim must not wedge the week forever
+        if not stale:
+            log.info("committee already ran/running for %s; skipping", week)
+            return None
+        taken = await db.execute(
+            "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
+            (token, key, row["value"]),
+        )
+        if not taken:
+            return None  # lost the takeover race — exactly one retryer wins
+    try:
+        run_id = await run_workflow(
+            COMMITTEE_WORKFLOW_ID, variables={"WORK_DATE": work_date()}, source=source,
+        )
+    except Exception:
+        # release our own claim (CAS) so the week stays retryable
+        await db.execute("DELETE FROM admin_state WHERE key = ? AND value = ?", (key, token))
+        raise
+    recorded = await db.execute(
+        "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
+        (json.dumps({"status": "started", "run_id": run_id, "claimed_at": bus.now_iso()}),
+         key, token),
+    )
+    if not recorded:  # taken over mid-kickoff (only possible after the stale window)
+        log.warning("committee claim %s changed under us; run %s continues anyway", key, run_id)
+    return run_id
+
+
 async def _finish_run(run_id: str, status: str, *, error: str | None = None) -> None:
     claimed = await db.execute(
         "UPDATE workflow_runs SET status = ?, error = ?, finished_at = ? WHERE id = ? AND status = 'running'",
@@ -152,6 +320,15 @@ def _workflow_hand_policy(
     settings = get_settings()
     if workflow_id == "research":
         hands = settings.research_hand_names
+        # opt-in weighted pick (settings.enable_hand_weights, default False = the
+        # round-robin below): the pool is intersected with research_hand_names
+        # (hard rule 10 — weights only reorder INSIDE the chain); an explicit
+        # step hand still wins and the fallback chain is unchanged either way.
+        if settings.enable_hand_weights and not step.get("hand"):
+            live = [h for h in hands if get_registry().is_available(h)]
+            picked = get_registry().pick_weighted_hand("research", live)
+            if picked:
+                return picked, hands
         return str(step.get("hand") or hands[step_index % len(hands)]), hands
     return str(step.get("hand") or analyst_hand or settings.default_hand), None
 
@@ -173,6 +350,38 @@ async def _drive(run_id: str) -> None:
             return
         workspace = sessions.workspace_path(session)
         variables: dict[str, str] = json.loads(run["variables"] or "{}")
+        # ${DATA_BUNDLE}: local market-data digest for ${TOPIC} (Phase 1b).
+        # Computed lazily — only when some step prompt references it and the
+        # caller did not pass an explicit value; missing/failed data renders
+        # as "" so prompts degrade without a trace (never raises).
+        if "DATA_BUNDLE" not in variables and any(
+            isinstance(s, dict) and "${DATA_BUNDLE}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            from . import market_fetchers  # lazy: engine stays importable without the fetcher stack
+            variables["DATA_BUNDLE"] = await market_fetchers.data_bundle_variable(variables)
+            # persist the computed value on the run row so what the prompts
+            # actually saw stays inspectable. json_set touches ONLY this key —
+            # a whole-blob write would clobber keys landed by a concurrent
+            # writer (REVIEW-C5 P2 lost update); the status guard still keeps
+            # terminal rows immutable (cancel-safety, not concurrency safety).
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.DATA_BUNDLE', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["DATA_BUNDLE"], run_id),
+            )
+        # ${WEEK_DISPUTES}: last-7-days completed whiteboard digest (Phase 7
+        # committee). Same lazy contract as ${DATA_BUNDLE}: only computed when
+        # a step prompt references it and no explicit value was passed; empty
+        # data renders as "" so the prompt degrades without a trace.
+        if "WEEK_DISPUTES" not in variables and any(
+            isinstance(s, dict) and "${WEEK_DISPUTES}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            variables["WEEK_DISPUTES"] = await week_disputes_variable()
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.WEEK_DISPUTES', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["WEEK_DISPUTES"], run_id),
+            )
         prior: list[tuple[str, str]] = []
         results: list[dict[str, Any]] = []
 
@@ -182,11 +391,20 @@ async def _drive(run_id: str) -> None:
                 return  # cancelled between steps
 
             prompt = substitute_variables(step.get("prompt", ""), variables)
-            analyst = get_analyst(step.get("analyst") or step.get("analyst_id") or "") or get_analyst("chief-strategist")
+            # canonical key first; 'analyst' tolerated for rows predating normalization
+            aid = str(step.get("analyst_id") or step.get("analyst") or "").strip()
+            analyst = get_analyst(aid) if aid else None
+            if analyst is None and aid:
+                log.warning(
+                    "run %s step %s: unknown analyst %r; falling back to chief-strategist",
+                    run_id, step.get("id"), aid,
+                )
+            analyst = analyst or get_analyst("chief-strategist")
             if analyst is None:
                 await _finish_run(run_id, "failed", error=f"step {step.get('id')}: no analyst available")
                 return
-            full_prompt = build_analyst_prompt(
+            from . import memory
+            full_prompt = await memory.prompt_with_memory(
                 analyst, prompt,
                 context_blocks=[previous_steps_block(prior)],
                 output_file=step.get("output_file"),

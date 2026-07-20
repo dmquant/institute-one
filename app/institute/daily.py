@@ -17,8 +17,9 @@ log = logging.getLogger("institute.daily")
 
 async def _ran_today(workflow_id: str, wd: str) -> bool:
     # variables are stored via json.dumps default separators -> '"WORK_DATE": "<date>"'
+    # failed and cancelled runs both leave the day open for a rerun
     row = await db.query_one(
-        "SELECT id FROM workflow_runs WHERE workflow_id = ? AND status != 'failed' AND variables LIKE ? LIMIT 1",
+        "SELECT id FROM workflow_runs WHERE workflow_id = ? AND status NOT IN ('failed','cancelled') AND variables LIKE ? LIMIT 1",
         (workflow_id, f'%"WORK_DATE": "{wd}"%'),
     )
     return row is not None
@@ -27,7 +28,7 @@ async def _ran_today(workflow_id: str, wd: str) -> bool:
 async def _run_once(workflow_id: str) -> str | None:
     wd = work_date()
     if await _ran_today(workflow_id, wd):
-        log.info("%s already has a non-failed run for %s; skipping", workflow_id, wd)
+        log.info("%s already has a running/completed run for %s; skipping", workflow_id, wd)
         return None
     run = await workflows.run_workflow_and_wait(
         workflow_id, variables={"WORK_DATE": wd}, source="daily",

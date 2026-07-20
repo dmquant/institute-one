@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import random
 import time
 from pathlib import Path
 
@@ -21,6 +23,10 @@ from ..config import Settings
 from .base import Hand, RateLimitInfo
 
 log = logging.getLogger("institute.registry")
+
+# hand_weights.scope enum (kept in sync with migrations/0009_hand_weights.sql
+# and the Literal in app/api/hands.py). 'default' is the fallback scope.
+WEIGHT_SCOPES = ("whiteboard", "research", "daily", "mailbox", "default")
 
 DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
     "claude": ["codex", "gemini", "claude-api"],
@@ -46,6 +52,10 @@ class HandRegistry:
         self._cooldowns: dict[str, dict] = {}   # name -> {until: epoch, reason, marked_at}
         self._consecutive_failures: dict[str, int] = {}
         self._degraded: set[str] = set()
+        # None = never loaded (fresh process; warn once, run neutral 1.0);
+        # {} = loaded and DB has no rows. Pushed by async code, see below.
+        self._weights_cache: dict[str, dict[str, float]] | None = None
+        self._weights_warned = False
         self._load_cooldowns()
 
     # ---- registration ----------------------------------------------------
@@ -146,6 +156,100 @@ class HandRegistry:
             if self.is_available(cand, allow_degraded=True):
                 return self._hands[cand], tried
         return None, tried
+
+    # ---- weighted pick (opt-in; NOT wired into resolve/resolve_chain) --------
+    #
+    # Weights live in the hand_weights table (migrations/0009) but this module
+    # is synchronous and resolve() runs inside executor locks, so the registry
+    # never touches the DB itself. Instead it holds a process-local cache that
+    # async callers push into: the weights API (app/api/hands.py) refreshes it
+    # on every PUT (and opportunistically on GET), and boot code must pre-warm
+    # it once after init_registry() (see PATCH-NOTES-B2.md). The cache starts
+    # as None ("never loaded", REVIEW-B2 M3): picks still work — every hand
+    # weighs a neutral 1.0, exactly the DB-empty behaviour — but the first use
+    # logs ONE warning so a missing pre-warm is visible instead of silently
+    # ignoring persisted weights. A sync sqlite fallback read was rejected: it
+    # would block the event loop and open a second DB access path.
+
+    def set_weights_cache(self, scope_weights: dict[str, dict[str, float]]) -> None:
+        """Replace the in-process weights cache: {scope: {hand: weight}}.
+
+        Called by async code that owns the DB read (weights API PUT/GET, boot
+        pre-warm). An empty dict means "loaded, no rows" and clears the
+        never-loaded warning state.
+        """
+        self._weights_cache = {s: dict(w) for s, w in scope_weights.items()}
+        self._weights_warned = False
+
+    def weights_loaded(self) -> bool:
+        """False until the first set_weights_cache() push (fresh process)."""
+        return self._weights_cache is not None
+
+    def weights_snapshot(self) -> dict[str, dict[str, float]]:
+        return {s: dict(w) for s, w in (self._weights_cache or {}).items()}
+
+    def _warn_cold_cache_once(self) -> None:
+        if not self._weights_warned:
+            self._weights_warned = True
+            log.warning(
+                "hand_weights cache never loaded in this process — picking with "
+                "neutral 1.0 weights; pre-warm via refresh_weights_cache() at boot "
+                "(PATCH-NOTES-B2.md) or PUT /api/hands/weights"
+            )
+
+    def weight_for(self, scope: str, hand: str) -> float:
+        """Effective weight: scope row -> 'default' scope row -> 1.0."""
+        if self._weights_cache is None:
+            self._warn_cold_cache_once()
+            return 1.0
+        for s in (scope, "default"):
+            w = self._weights_cache.get(s, {}).get(hand)
+            if w is not None:
+                return w
+        return 1.0
+
+    def pick_weighted_hand(
+        self,
+        scope: str,
+        live_pool: list[str],
+        *,
+        weights: dict[str, float] | None = None,
+        rng: random.Random | None = None,
+    ) -> str | None:
+        """Weighted-random pick of one hand from ``live_pool``.
+
+        Opt-in for scope callers (whiteboard/research/daily/mailbox rotations):
+        resolve()/resolve_chain() keep their deterministic first-available
+        semantics and do NOT call this. Wiring call sites is a follow-up card.
+
+        - ``live_pool``: hand names the caller already established as usable
+          (e.g. filtered through ``is_available``). Order does not matter.
+        - ``weights``: explicit {hand: weight} override; when None, weights
+          come from the process cache (scope row -> 'default' row -> 1.0; a
+          never-loaded cache logs one warning and behaves as all-1.0).
+        - Missing weight row = 1.0; an all-zero pool degrades to a uniform
+          pick rather than failing. Non-finite explicit weights (inf/nan)
+          clamp to 0 (the API rejects them at the boundary); huge finite
+          weights are normalized by the max before sampling so the sum can't
+          overflow to inf inside random.choices.
+        - ``rng``: injectable for deterministic tests.
+        """
+        if scope not in WEIGHT_SCOPES:
+            raise ValueError(f"unknown weight scope {scope!r} (expected one of {WEIGHT_SCOPES})")
+        pool = [h for h in live_pool if h]
+        if not pool:
+            return None
+        if weights is None:
+            w = [self.weight_for(scope, h) for h in pool]
+        else:
+            w = [weights.get(h, 1.0) for h in pool]
+        w = [x if math.isfinite(x) and x > 0 else 0.0 for x in (float(x) for x in w)]
+        pick = rng or random
+        top = max(w)
+        if top <= 0:
+            return pick.choice(pool)
+        w = [x / top for x in w]  # normalize: sum stays finite for any finite inputs
+        return pick.choices(pool, weights=w, k=1)[0]
 
     # ---- introspection -------------------------------------------------------
     def status_snapshot(self) -> list[dict]:

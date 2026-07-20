@@ -29,6 +29,10 @@ _scheduler: AsyncIOScheduler | None = None
 
 
 # ---- maintenance switch ----------------------------------------------------
+#
+# admin_state is the operator-config surface. Two keys matter to metered():
+# 'maintenance' (global pause of every gated job) and 'feature_switches'
+# (per-job kill switches, key convention 'job:<name>', consumed below).
 
 async def get_maintenance() -> bool:
     row = await db.query_one("SELECT value FROM admin_state WHERE key = 'maintenance'")
@@ -49,34 +53,125 @@ async def set_maintenance(paused: bool) -> None:
     log.info("maintenance %s", "paused" if paused else "resumed")
 
 
+async def job_switch_enabled(name: str) -> bool:
+    """Per-job feature switch (M8-006 enforcement): admin_state key
+    'feature_switches', switch name convention ``job:<name>``.
+
+    A missing row, missing key, or corrupt value all mean ENABLED — switches
+    are explicit opt-out, so the default is open and pre-switch deployments
+    keep running unchanged (same fail-open posture as get_maintenance).
+    Both value shapes are accepted: the versioned envelope the CAS PUT writes
+    ({"version": N, "switches": {...}}) and the legacy flat {name: bool} map.
+    """
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = 'feature_switches'")
+    if row is None:
+        return True
+    try:
+        raw = json.loads(row["value"])
+    except Exception:  # noqa: BLE001 - corrupt state means enabled
+        return True
+    if not isinstance(raw, dict):
+        return True
+    switches = raw.get("switches") if isinstance(raw.get("switches"), dict) else raw
+    return bool(switches.get(f"job:{name}", True))
+
+
+async def _record_metric(
+    name: str, fired_at: str, *, duration_ms: int = 0, ok: bool = True,
+    error: str | None = None, skipped: bool = False,
+) -> None:
+    """One cron_metrics row per firing (GET /api/cron/health aggregates them).
+
+    Metrics are observability, never control flow: a failed write is logged
+    and swallowed so it can't break the job or the never-raise guarantee.
+
+    skipped=True reuses the 0008 skipped_by_maintenance column for BOTH skip
+    causes (maintenance pause and feature switch): every consumer (cron_health,
+    doctor, SPA) already treats that flag as "did not execute — neither ok nor
+    failed", which is exactly the semantics a switch skip needs; a new column
+    would force the same rule into every aggregation for zero behavior gain.
+    The cause is disambiguated per-row via ``error`` (switch skips carry a
+    'skipped by feature switch' marker; ok=1 keeps them out of last_error).
+    """
+    try:
+        await db.execute(
+            "INSERT INTO cron_metrics (job, fired_at, duration_ms, ok, error, skipped_by_maintenance) "
+            "VALUES (?,?,?,?,?,?)",
+            (name, fired_at, duration_ms, int(ok), error, int(skipped)),
+        )
+    except Exception:  # noqa: BLE001 - metrics must never break a job
+        log.exception("cron metric write failed for job %s", name)
+
+
+def _error_summary(exc: BaseException, cap: int = 500) -> str:
+    return f"{type(exc).__name__}: {exc}"[:cap]
+
+
 def metered(name: str, *, gated: bool = False) -> Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[None]]]:
-    """Wrap a scheduler job: logs duration, never raises; gated jobs skip under maintenance."""
+    """Wrap a scheduler job: logs duration, never raises; gated jobs skip under
+    maintenance; EVERY job (gated or not) skips while its feature switch
+    ``job:<name>`` is off — a missing switch means enabled. Every firing
+    writes one cron_metrics row (skips included)."""
     def deco(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[None]]:
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> None:
+            fired_at = bus.now_iso()
             try:
                 if gated and await get_maintenance():
                     log.debug("job %s skipped (maintenance paused)", name)
+                    await _record_metric(name, fired_at, skipped=True)
+                    return
+                if not await job_switch_enabled(name):
+                    log.debug("job %s skipped (feature switch job:%s off)", name, name)
+                    await _record_metric(
+                        name, fired_at, skipped=True,
+                        error=f"skipped by feature switch job:{name}=false",
+                    )
                     return
                 t0 = time.monotonic()
-                await fn(*args, **kwargs)
+                try:
+                    await fn(*args, **kwargs)
+                except Exception as exc:
+                    await _record_metric(
+                        name, fired_at, duration_ms=int((time.monotonic() - t0) * 1000),
+                        ok=False, error=_error_summary(exc),
+                    )
+                    raise
                 dt = time.monotonic() - t0
                 log.log(logging.INFO if dt >= 1.0 else logging.DEBUG, "job %s finished in %.1fs", name, dt)
+                await _record_metric(name, fired_at, duration_ms=int(dt * 1000), ok=True)
             except Exception:  # noqa: BLE001 - scheduler jobs must never raise
                 log.exception("job %s failed", name)
+        wrapper.job_name = name  # type: ignore[attr-defined] - introspection for tests/ops
+        wrapper.gated = gated  # type: ignore[attr-defined]
         return wrapper
     return deco
 
 
 # ---- jobs (domain modules imported lazily inside) --------------------------
+#
+# Gating semantics: gated=True for every job that submits NEW model calls —
+# briefing/daily/analyst-dailies open the day's runs, whiteboard-kickoff opens
+# boards, whiteboard-tick claims the next card (+ handoff), mailbox-sweep
+# re-drives orphaned dispatches, research-tick claims queue items,
+# research-tree-tick claims BFS explore nodes (executor.submit),
+# factcheck-tick runs extraction/verification tasks, chain-tick runs entity
+# extraction, operator-fast-route/operator-deep-route classify actions through
+# executor.submit, committee opens the weekly debate run. In-flight work still
+# drains under maintenance: card/dispatch/workflow drivers are plain asyncio
+# tasks outside the scheduler. Ungated jobs — janitor, hand-scorecard,
+# market-refresh, operator-vault-sweep, paper-opener, paper-mtm — never spend
+# model quota (cleanup, task QA over terminal rows, market data fetching,
+# vault conflict sweeps, paper-book ledger DB reads/writes) and keep running
+# while paused.
 
-@metered("briefing")
+@metered("briefing", gated=True)
 async def _briefing_job() -> None:
     from . import daily
     await daily.run_briefing()
 
 
-@metered("daily-report")
+@metered("daily-report", gated=True)
 async def _daily_job() -> None:
     from . import daily
     await daily.run_daily()
@@ -94,13 +189,13 @@ async def _whiteboard_kickoff_job() -> None:
     await whiteboard.kickoff()
 
 
-@metered("whiteboard-tick")
+@metered("whiteboard-tick", gated=True)
 async def _whiteboard_tick_job() -> None:
     from . import whiteboard
     await whiteboard.tick()
 
 
-@metered("mailbox-sweep")
+@metered("mailbox-sweep", gated=True)
 async def _mailbox_sweep_job() -> None:
     from . import mailbox
     await mailbox.sweep()
@@ -110,6 +205,79 @@ async def _mailbox_sweep_job() -> None:
 async def _research_tick_job() -> None:
     from . import research
     await research.tick()
+
+
+@metered("research-tree-tick", gated=True)
+async def _research_tree_tick_job() -> None:
+    from . import research_tree
+    await research_tree.tick()
+
+
+@metered("factcheck-tick", gated=True)
+async def _factcheck_tick_job() -> None:
+    from . import factcheck
+    await factcheck.tick()
+
+
+@metered("chain-tick", gated=True)
+async def _chain_tick_job() -> None:
+    from . import chain
+    await chain.tick()
+
+
+@metered("memory-compact", gated=True)
+async def _memory_compact_job() -> None:
+    from . import memory
+    await memory.compact_all()
+
+
+@metered("committee", gated=True)
+async def _committee_job() -> None:
+    from . import workflows
+    await workflows.run_committee_once(source="scheduler")
+
+
+@metered("operator-fast-route", gated=True)
+async def _operator_fast_route_job() -> None:
+    from . import operator
+    await operator.route_actions(cap=5, proposed_by="fast_loop")  # 便宜 hand = settings.default_hand
+
+
+@metered("operator-deep-route", gated=True)
+async def _operator_deep_route_job() -> None:
+    from . import operator
+    # 强 hand 的旋钮：hand="claude"（或主代理属意的强 hand）；不传则同 default_hand
+    await operator.route_actions(cap=10, proposed_by="deep_loop")
+
+
+@metered("operator-vault-sweep")
+async def _operator_vault_sweep_job() -> None:
+    from . import operator
+    await operator.sweep_vault_conflicts()
+
+
+@metered("paper-opener")
+async def _paper_opener_job() -> None:
+    from . import paper_book
+    await paper_book.opener_tick()
+
+
+@metered("paper-mtm")
+async def _paper_mtm_job() -> None:
+    from . import paper_book
+    await paper_book.mark_to_market()
+
+
+@metered("hand-scorecard")
+async def _scorecard_job() -> None:
+    from . import scorecard
+    await scorecard.run_once()   # no-arg = settle the previous SGT day (closed set)
+
+
+@metered("market-refresh")
+async def _market_refresh_job() -> None:
+    from . import market_fetchers
+    await market_fetchers.refresh_all(limit=get_settings().market_refresh_limit)
 
 
 @metered("janitor")
@@ -165,7 +333,13 @@ async def _janitor() -> None:
     if removed:
         log.info("janitor removed %d old adhoc workspaces", removed)
 
-    # 4) nightly DB backup during the 03:00-05:00 SGT window (once per date)
+    # 4) cron metrics older than 30 days (the table IS the health window)
+    metrics_cutoff = (now_utc - timedelta(days=30)).isoformat(timespec="seconds")
+    n = await db.execute("DELETE FROM cron_metrics WHERE fired_at < ?", (metrics_cutoff,))
+    if n:
+        log.info("janitor removed %d old cron metrics", n)
+
+    # 5) nightly DB backup during the 03:00-05:00 SGT window (once per date)
     if 3 <= now_sgt().hour < 5:
         target = settings.backups_dir / f"institute-{work_date()}.db"
         if not target.exists():
@@ -184,14 +358,15 @@ def start() -> None:
     settings = get_settings()
     sched = AsyncIOScheduler(timezone=settings.timezone)
 
-    def cron(job: Callable, name: str, hhmm: str) -> None:
+    def cron(job: Callable, name: str, hhmm: str, day_of_week: str | None = None) -> None:
         hhmm = (hhmm or "").strip()
         if not hhmm:
             log.info("job %s disabled (empty time)", name)
             return
         try:
             h, m = hhmm.split(":")
-            trigger = CronTrigger(hour=int(h), minute=int(m), timezone=settings.timezone)
+            trigger = CronTrigger(day_of_week=day_of_week, hour=int(h), minute=int(m),
+                                  timezone=settings.timezone)
         except (ValueError, TypeError):
             log.error("job %s: cannot parse time %r; disabled", name, hhmm)
             return
@@ -209,15 +384,82 @@ def start() -> None:
     cron(_briefing_job, "briefing", settings.briefing_time)
     cron(_daily_job, "daily-report", settings.daily_time)
     cron(_analyst_dailies_job, "analyst-dailies", settings.analyst_daily_time)
+    cron(_memory_compact_job, "memory-compact", settings.memory_compact_time)
+    cron(_scorecard_job, "hand-scorecard", "00:05")
+    cron(_committee_job, "committee", settings.committee_time, day_of_week="fri")
+    cron(_paper_mtm_job, "paper-mtm", "00:00")   # 00:00 SGT，ROADMAP 原文
     every(_whiteboard_kickoff_job, "whiteboard-kickoff", minutes=settings.whiteboard_kickoff_minutes)
     every(_whiteboard_tick_job, "whiteboard-tick", seconds=settings.whiteboard_tick_seconds)
     every(_mailbox_sweep_job, "mailbox-sweep", seconds=settings.mailbox_sweep_seconds)
     every(_research_tick_job, "research-tick", minutes=settings.research_tick_minutes)
+    every(_research_tree_tick_job, "research-tree-tick", minutes=5)
+    every(_factcheck_tick_job, "factcheck-tick", minutes=settings.factcheck_tick_minutes)
+    every(_chain_tick_job, "chain-tick", minutes=60)
+    every(_operator_fast_route_job, "operator-fast-route", minutes=15)
+    every(_operator_deep_route_job, "operator-deep-route", minutes=60)
+    every(_operator_vault_sweep_job, "operator-vault-sweep", minutes=60)
+    every(_paper_opener_job, "paper-opener", minutes=5)
+    every(_market_refresh_job, "market-refresh", minutes=settings.market_refresh_minutes)
     every(_janitor, "janitor", minutes=settings.janitor_minutes)
 
     sched.start()
     _scheduler = sched
     log.info("scheduler started: %d jobs (tz=%s)", len(sched.get_jobs()), settings.timezone)
+
+
+def job_registry() -> list[dict[str, Any]]:
+    """Public snapshot of every @metered job, sorted by name.
+
+    The definition surface (name, gated) comes from this module's @metered
+    functions, so it is complete even with the scheduler stopped (tests,
+    doctor). The live surface (registered, trigger, next_run_time) comes from
+    APScheduler's get_jobs(): registered=False either means the scheduler is
+    not running or the job was disabled by configuration (empty time /
+    non-positive interval), and trigger/next_run_time are None then.
+    """
+    live: dict[str, Any] = {}
+    if _scheduler is not None:
+        live = {j.id: j for j in _scheduler.get_jobs()}
+    metered_fns = {
+        fn.job_name: fn
+        for fn in globals().values()
+        if callable(fn) and hasattr(fn, "job_name")
+    }
+    snapshot: list[dict[str, Any]] = []
+    for name in sorted(metered_fns):
+        job = live.get(name)
+        next_run = getattr(job, "next_run_time", None)
+        snapshot.append({
+            "name": name,
+            "gated": bool(metered_fns[name].gated),
+            "registered": job is not None,
+            "trigger": str(job.trigger) if job is not None else None,
+            "next_run_time": next_run.isoformat() if next_run is not None else None,
+        })
+    return snapshot
+
+
+def inflight_jobs() -> set[asyncio.Task]:
+    """Snapshot in-flight job tasks. Call BEFORE shutdown() (it clears them).
+
+    ``shutdown(wait=False)`` cancels the AsyncIOExecutor's pending futures but
+    never awaits them AND clears the set — callers (main's shutdown drain) need
+    this snapshot to await their cancellation before db.close(). This is the
+    ONE place that touches APScheduler private internals (``_executors`` /
+    ``_pending_futures``); if they drift on an upgrade, degrade to an empty
+    set — jobs are still cancelled by shutdown, just not awaited.
+    """
+    tasks: set[asyncio.Task] = set()
+    if _scheduler is None:
+        return tasks
+    try:
+        for ex in _scheduler._executors.values():
+            for f in getattr(ex, "_pending_futures", ()):
+                if isinstance(f, asyncio.Task) and not f.done():
+                    tasks.add(f)
+    except Exception:  # noqa: BLE001 - internals drift must not break shutdown
+        log.exception("could not snapshot in-flight scheduler jobs")
+    return tasks
 
 
 def shutdown() -> None:

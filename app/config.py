@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8100
     timezone: str = "Asia/Singapore"
+    # Optional bearer auth (ROADMAP Phase 0). None/empty = auth disabled.
+    token: str | None = None            # INSTITUTE_TOKEN
 
     # Obsidian vault export. None disables the vault layer entirely.
     # Point at the *subtree the institute owns*, e.g. ~/Obsidian/Main/Institute
@@ -43,6 +45,10 @@ class Settings(BaseSettings):
     enable_ollama: bool = False
     enable_echo: bool = True  # trivial built-in hand used by tests/smoke checks
 
+    # Weighted hand selection (ROADMAP Phase 2; hand_weights table, migrations/0009).
+    # Opt-in: False (default) keeps every call site's pre-weights behaviour unchanged.
+    enable_hand_weights: bool = False
+
     # Per-hand default models (None -> the CLI's own default)
     claude_model: str | None = None
     codex_model: str | None = None
@@ -51,6 +57,19 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.2"
     ollama_host: str = "http://localhost:11434"
 
+    # Vector search (Phase 1a). Off by default: without Ollama + sqlite-vec the
+    # system runs the documented FTS5-only degradation path.
+    enable_vectors: bool = False
+    embed_model: str = "bge-m3"
+
+    # Market data fetchers (Phase 1b). The ladder is FMP -> Stooq -> Sina;
+    # Stooq/Sina are keyless, so fetching works with no key at all.
+    fmp_api_key: str | None = None          # INSTITUTE_FMP_API_KEY
+    fetch_proxy: str | None = None          # INSTITUTE_FETCH_PROXY, e.g. http://127.0.0.1:7897 (mihomo)
+    market_fetch_enabled: bool = True       # INSTITUTE_MARKET_FETCH_ENABLED — kill switch for the hourly job
+    market_refresh_minutes: int = 60        # hourly per ROADMAP; 0/negative disables
+    market_refresh_limit: int = 20          # securities per sweep (stalest first)
+
     # Direct-API fallback hands (only registered when the key is present)
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
@@ -58,11 +77,18 @@ class Settings(BaseSettings):
     anthropic_api_model: str = "claude-sonnet-4-6"
     openai_api_model: str = "gpt-5.2"
     google_api_model: str = "gemini-2.5-pro"
+    # Base URLs — override to point a hand at an OpenAI/Anthropic/Gemini-compatible
+    # local gateway (e.g. CLIProxyAPI / litellm) instead of the official endpoint.
+    anthropic_api_base_url: str = "https://api.anthropic.com"
+    openai_api_base_url: str = "https://api.openai.com/v1"
+    google_api_base_url: str = "https://generativelanguage.googleapis.com"
 
     # Scheduler (cron-ish times, SGT). Set to "" to disable a job.
     briefing_time: str = "08:30"        # 晨会简报
     daily_time: str = "23:00"           # 每日日报
     analyst_daily_time: str = "19:00"   # 分析师观察日报（跟进项喂白板与信箱）
+    memory_compact_time: str = "23:30"  # 常备记忆压缩（analyst memory nightly compact）
+    committee_time: str = "20:00"       # 每周委员会（仅周五触发；"" 禁用）
     whiteboard_kickoff_minutes: int = 60   # try to open a new board every N minutes
     whiteboard_tick_seconds: int = 60      # advance running boards
     mailbox_sweep_seconds: int = 120
@@ -70,6 +96,12 @@ class Settings(BaseSettings):
     research_daily_cap: int = 4
     research_cooldown_days: int = 30
     janitor_minutes: int = 60
+    # Phase 3 fact-check (factcheck.py reads both defensively)
+    factcheck_tick_minutes: int = 30    # 0/negative disables the job
+    # Verification ATTEMPTS per SGT work date. None -> factcheck's built-in
+    # default (10); a concrete value here would shadow the module constant the
+    # factcheck tests monkeypatch, so only the env override materialises one.
+    factcheck_daily_cap: int | None = None  # INSTITUTE_FACTCHECK_DAILY_CAP
 
     # ---- derived paths -------------------------------------------------
     @property

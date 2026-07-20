@@ -1,10 +1,11 @@
 """Roadmap control plane — durable backend for the global coding process.
 
-Cards, checklists, dependencies, evidence, and coding sessions live in SQLite
-(rows are truth). ``roadmap/backlog.json`` is a seed/import/export artifact:
-``import_backlog()`` upserts by card id, merges checklist items by text,
-reconciles dependencies to the seed, and preserves local status unless
-``force`` is set. Contract: roadmap/02-data-model.md.
+Cards, checklists, dependencies, evidence, coding sessions, and decisions live
+in SQLite (rows are truth). ``roadmap/backlog.json`` is a seed/import/export
+artifact: ``import_backlog()`` upserts by card id, merges checklist items by
+text, reconciles dependencies to the seed, and preserves local status unless
+``force`` is set; ``export_backlog()`` produces a seed-compatible snapshot.
+Contract: roadmap/02-data-model.md.
 
 Every move is a conditional-claim transition (``UPDATE … WHERE status = <the
 status we validated against>``) so concurrent movers can never double-apply.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,9 @@ EVIDENCE_KINDS = {"command", "test", "screenshot", "diff", "doc", "operator"}
 EVIDENCE_STATUSES = {"pass", "fail", "info", "override"}
 SESSION_STATUSES = {"active", "completed", "partial", "blocked", "cancelled"}
 SESSION_TERMINAL = {"completed", "partial", "blocked", "cancelled"}
+DECISION_STATUSES = {"open", "resolved"}
+# new cards start at the top of the funnel; anything further requires move() gates
+CREATE_STATUSES = {"inbox", "ready"}
 
 # gate scopes match the Obsidian plugin (obsidian-plugin/src/roadmap.ts renderGates)
 RELEASE_GATES = (
@@ -125,6 +130,12 @@ def _session_out(row: dict[str, Any]) -> dict[str, Any]:
     return sess
 
 
+def _decision_out(row: dict[str, Any]) -> dict[str, Any]:
+    dec = dict(row)
+    dec["options"] = _loads_list(dec.pop("options_json", None))
+    return dec
+
+
 async def _record_event(event_type: str, card_id: str | None, payload: dict[str, Any]) -> None:
     """Append to roadmap_events and mirror onto the bus as roadmap.<event_type>."""
     await db.execute(
@@ -192,6 +203,8 @@ async def import_backlog(path: str | Path | None = None, force: bool = False) ->
                 raise RoadmapError(f"card {cid}: {field} must be a string")
         if c.get("owner") is not None and not isinstance(c["owner"], str):
             raise RoadmapError(f"card {cid}: owner must be a string")
+        if c.get("blocked_reason") is not None and not isinstance(c["blocked_reason"], str):
+            raise RoadmapError(f"card {cid}: blocked_reason must be a string")
         if "sort_order" in c:
             _require_number(c["sort_order"], f"card {cid}: sort_order")
         for field in ("acceptance", "dependencies", *_CARD_JSON_FIELDS):
@@ -228,9 +241,10 @@ async def import_backlog(path: str | Path | None = None, force: bool = False) ->
                 await conn.execute(
                     "INSERT INTO roadmap_cards (id, title, type, phase, priority, risk, summary, problem, "
                     "implementation, agent_prompt, design_links_json, expected_files_json, verification_json, "
-                    "tags_json, status, owner, sort_order, created_at, updated_at, completed_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (cid, *fields, status, c.get("owner"), float(c.get("sort_order", (i + 1) * 10)),
+                    "tags_json, status, owner, blocked_reason, sort_order, created_at, updated_at, completed_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (cid, *fields, status, c.get("owner"), c.get("blocked_reason"),
+                     float(c.get("sort_order", (i + 1) * 10)),
                      now, now, now if status == "done" else None),
                 )
                 created += 1
@@ -250,6 +264,14 @@ async def import_backlog(path: str | Path | None = None, force: bool = False) ->
                 )
                 forced.append({"card_id": cid, "from": row["status"], "to": status})
                 changed = True
+            # blocked_reason travels with status: local wins unless forced (the
+            # blocker gates claim/move, so a seed must not silently unblock a card)
+            if force and c.get("blocked_reason") != row["blocked_reason"]:
+                await conn.execute(
+                    "UPDATE roadmap_cards SET blocked_reason=?, updated_at=? WHERE id=?",
+                    (c.get("blocked_reason"), now, cid),
+                )
+                changed = True
             if changed:
                 updated += 1
             else:
@@ -264,8 +286,10 @@ async def import_backlog(path: str | Path | None = None, force: bool = False) ->
                     "created_at, updated_at) VALUES (?,?,?,?,0,?,?,?)",
                     (_det_id(cid, "acceptance", text), cid, "acceptance", text, (j + 1) * 10.0, now, now),
                 )
-            # reconcile: import is the only dependency writer, so deps dropped from
-            # the seed are deleted (a stale dep would block move-to-done forever)
+            # reconcile: the seed is authoritative for its cards' edges, so deps
+            # dropped from the seed are deleted (a stale dep would block
+            # move-to-done forever); edges added via add_dependency() survive
+            # only if the seed (e.g. an export snapshot) carries them
             deps = c.get("dependencies") or []
             if deps:
                 marks = ",".join("?" for _ in deps)
@@ -289,7 +313,141 @@ async def import_backlog(path: str | Path | None = None, force: bool = False) ->
     return result
 
 
+async def export_backlog() -> dict[str, Any]:
+    """Seed-compatible snapshot of the live board (GET /api/roadmap/export).
+
+    Re-importing the snapshot is a no-op (every card reports ``unchanged``),
+    and importing it into an empty database rebuilds the board — including
+    ``blocked_reason``, which gates claim/move (import reads it on INSERT and,
+    like status, local wins unless ``force``). One known loss, outside the
+    seed format: checklist ``checked`` state exports as bare text.
+    """
+    cards = await db.query("SELECT * FROM roadmap_cards ORDER BY sort_order, id")
+    acceptance: dict[str, list[str]] = {}
+    for r in await db.query(
+        "SELECT card_id, text FROM roadmap_checklists WHERE kind = 'acceptance' ORDER BY sort_order, rowid"
+    ):
+        acceptance.setdefault(r["card_id"], []).append(r["text"])
+    deps: dict[str, list[str]] = {}
+    for r in await db.query("SELECT card_id, depends_on_id FROM roadmap_dependencies ORDER BY depends_on_id"):
+        deps.setdefault(r["card_id"], []).append(r["depends_on_id"])
+
+    out: list[dict[str, Any]] = []
+    phases: list[str] = []
+    for row in cards:
+        card = _card_out(row)
+        if card["phase"] and card["phase"] not in phases:
+            phases.append(card["phase"])
+        item: dict[str, Any] = {
+            "id": card["id"], "title": card["title"], "type": card["type"], "phase": card["phase"],
+            "status": card["status"], "priority": card["priority"], "risk": card["risk"],
+        }
+        if card["owner"]:
+            item["owner"] = card["owner"]
+        for field in ("summary", "problem", "implementation", "agent_prompt"):
+            if card[field]:
+                item[field] = card[field]
+        item["design_links"] = card["design_links"]
+        item["expected_files"] = card["expected_files"]
+        item["dependencies"] = deps.get(card["id"], [])
+        item["acceptance"] = acceptance.get(card["id"], [])
+        item["verification"] = card["verification"]
+        item["tags"] = card["tags"]
+        item["sort_order"] = card["sort_order"]
+        if card["blocked_reason"]:
+            item["blocked_reason"] = card["blocked_reason"]
+        out.append(item)
+    return {"version": 1, "columns": list(STATUSES), "phases": phases, "cards": out}
+
+
 # ---- cards -----------------------------------------------------------------
+
+async def create_card(fields: dict[str, Any]) -> dict[str, Any]:
+    """Create a card (POST /api/roadmap/cards). New cards start in inbox/ready;
+    anything further must go through move() so the gates apply."""
+    card_id = str(fields.get("id") or "").strip() or _new_id()
+    title = str(fields.get("title") or "").strip()
+    if not title:
+        raise RoadmapError("a card needs a title")
+    status = fields.get("status", "inbox")
+    _validate_enum(status, CREATE_STATUSES, "create status")
+    type_ = fields.get("type", "feature")
+    _validate_enum(type_, TYPES, "type")
+    priority = fields.get("priority", "P2")
+    _validate_enum(priority, PRIORITIES, "priority")
+    risk = fields.get("risk", "medium")
+    _validate_enum(risk, RISKS, "risk")
+    owner = fields.get("owner")
+    if owner is not None and not isinstance(owner, str):
+        raise RoadmapError("owner must be a string")
+    for key in ("phase", "summary", "problem", "implementation", "agent_prompt"):
+        if not isinstance(fields.get(key, ""), str):
+            raise RoadmapError(f"{key} must be a string")
+    lists = {key: _require_str_list(fields.get(key), key) for key in _CARD_JSON_FIELDS}
+    acceptance = [t.strip() for t in _require_str_list(fields.get("acceptance"), "acceptance")]
+    if any(not t for t in acceptance):  # a whitespace item would sneak past the ready gate
+        raise RoadmapError("acceptance items need text")
+    if len(set(acceptance)) != len(acceptance):  # duplicates share a deterministic id
+        raise RoadmapError("acceptance items must be unique")
+    if status == "ready" and not acceptance:
+        raise RoadmapError("cannot create in ready: acceptance checklist is empty")
+    sort_order = _require_number(fields.get("sort_order", 0), "sort_order")
+
+    now = bus.now_iso()
+    try:
+        # one transaction so a duplicate id can't leave a card without its checklist
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO roadmap_cards (id, title, type, phase, priority, risk, summary, problem, "
+                "implementation, agent_prompt, design_links_json, expected_files_json, verification_json, "
+                "tags_json, status, owner, sort_order, created_at, updated_at, completed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                (card_id, title, type_, fields.get("phase", ""), priority, risk,
+                 fields.get("summary", ""), fields.get("problem", ""), fields.get("implementation", ""),
+                 fields.get("agent_prompt", ""), _dumps(lists["design_links"]), _dumps(lists["expected_files"]),
+                 _dumps(lists["verification"]), _dumps(lists["tags"]), status, owner, sort_order, now, now),
+            )
+            for j, text in enumerate(acceptance):
+                await conn.execute(
+                    "INSERT INTO roadmap_checklists (id, card_id, kind, text, checked, sort_order, "
+                    "created_at, updated_at) VALUES (?,?,?,?,0,?,?,?)",
+                    (_det_id(card_id, "acceptance", text), card_id, "acceptance", text, (j + 1) * 10.0, now, now),
+                )
+    except sqlite3.IntegrityError:
+        raise RoadmapError(f"card {card_id} already exists") from None
+    await _record_event("card.created", card_id, {"title": title, "status": status})
+    return await get_card(card_id)
+
+
+async def claim_card(card_id: str, owner: str) -> dict[str, Any] | None:
+    """Claim an unowned ready/inbox card and move it to in_progress.
+
+    Conditional claim: ``UPDATE … WHERE owner is empty AND status = <seen>``
+    guarantees exactly one concurrent claimer wins (the rest get MoveConflict).
+    """
+    if not str(owner).strip():
+        raise RoadmapError("claim needs an owner")
+    owner = owner.strip()
+    card = await db.query_one("SELECT * FROM roadmap_cards WHERE id = ?", (card_id,))
+    if card is None:
+        return None
+    if card["owner"]:
+        raise MoveConflict(f"card {card_id} is already owned by {card['owner']}")
+    from_status = card["status"]
+    if from_status not in ("inbox", "ready"):
+        raise RoadmapError(f"cannot claim a card in {from_status!r}; only inbox/ready cards are claimable")
+    if card["blocked_reason"]:  # claim is a forward move — same gate as move()
+        raise RoadmapError(f"card {card_id} is blocked ({card['blocked_reason']}); resolve or override via move")
+    claimed = await db.execute(
+        "UPDATE roadmap_cards SET owner = ?, status = 'in_progress', updated_at = ? "
+        "WHERE id = ? AND (owner IS NULL OR owner = '') AND status = ?",
+        (owner, bus.now_iso(), card_id, from_status),
+    )
+    if not claimed:
+        raise MoveConflict(f"card {card_id} changed concurrently; reload and retry")
+    await _record_event("card.claimed", card_id, {"owner": owner, "from": from_status, "to": "in_progress"})
+    return await get_card(card_id)
+
 
 async def list_cards(
     status: str | None = None,
@@ -339,7 +497,9 @@ async def get_card(card_id: str) -> dict[str, Any] | None:
         return None
     card = _card_out(row)
     card["checklists"] = await db.query(
-        "SELECT * FROM roadmap_checklists WHERE card_id = ? ORDER BY kind, sort_order", (card_id,)
+        # id as tie-breaker: equal sort_order must not float on query-plan changes
+        # (generate_agent_prompt's byte-determinism depends on this ordering)
+        "SELECT * FROM roadmap_checklists WHERE card_id = ? ORDER BY kind, sort_order, id", (card_id,)
     )
     card["dependencies"] = await db.query(
         "SELECT d.*, c.status AS depends_on_status FROM roadmap_dependencies d "
@@ -491,6 +651,70 @@ async def move(
     return await get_card(card_id)
 
 
+# ---- agent prompt (M7-007) ---------------------------------------------------
+
+# Hard-rule digest for coding agents: CLAUDE.md pointers + the migration/test
+# discipline + roadmap/06-agent-protocol.md guardrails. A tuple of constants —
+# no clock, no randomness — so the prompt for an unchanged card is
+# byte-identical across calls (M7-007 acceptance: deterministic generation).
+_PROMPT_CONSTRAINTS = (
+    "read CLAUDE.md first and follow its hard rules (one execution path, "
+    "conditional-claim transitions, bus.now_iso() timestamps)",
+    "keep changes scoped to this card and its expected files",
+    "migrations are additive only: add a new numbered migrations/*.sql file, never edit old ones",
+    "add or update tests for every behavior change and run the card's verification commands before finishing",
+    "do not git push, do not introduce hosted infrastructure, preserve unrelated user changes",
+    "record follow-up work as roadmap cards instead of silently expanding scope",
+)
+
+
+def _prompt_section(label: str, items: list[str]) -> list[str]:
+    lines = [f"{label}:"]
+    if items:
+        lines.extend(f"- {item}" for item in items)
+    else:
+        lines.append("- (none)")
+    return lines
+
+
+async def generate_agent_prompt(card_id: str) -> str | None:
+    """Deterministic coding-agent prompt from the card's current state (M7-007).
+
+    Template: roadmap/06-agent-protocol.md. Renders only durable card state
+    (metadata, checklists, dependencies + their live status) — never
+    timestamps or generated ids — so the same card state always produces the
+    same bytes and card edits are diffable across generations.
+    """
+    card = await get_card(card_id)
+    if card is None:
+        return None
+    acceptance = [c["text"] for c in card["checklists"] if c["kind"] == "acceptance"]
+    dependencies = [
+        f"{d['depends_on_id']} ({d['depends_on_status'] or 'missing'})"
+        for d in card["dependencies"]
+    ]
+    lines = [
+        f"You are implementing roadmap card {card['id']}: {card['title']}.",
+        "",
+        f"Phase: {card['phase'] or '(none)'}",
+        f"Type: {card['type']} | Priority: {card['priority']} | Risk: {card['risk']}",
+    ]
+    if card["summary"]:
+        lines += ["", "Summary:", card["summary"]]
+    if card["problem"]:
+        lines += ["", "Problem:", card["problem"]]
+    lines += ["", *_prompt_section("Design links", card["design_links"])]
+    lines += ["", *_prompt_section("Expected files", card["expected_files"])]
+    lines += ["", *_prompt_section("Dependencies", dependencies)]
+    lines += ["", *_prompt_section("Acceptance criteria", acceptance)]
+    lines += ["", *_prompt_section("Verification", card["verification"])]
+    lines += ["", *_prompt_section("Constraints", list(_PROMPT_CONSTRAINTS))]
+    if card["agent_prompt"]:  # operator-written notes on the card ride along
+        lines += ["", "Card notes:", card["agent_prompt"]]
+    lines += ["", "Implement the card, run verification, and summarize changed files and results."]
+    return "\n".join(lines)
+
+
 # ---- evidence ---------------------------------------------------------------
 
 async def add_evidence(
@@ -516,6 +740,167 @@ async def add_evidence(
     )
     await _record_event("evidence.added", card_id, {"evidence_id": eid, "kind": kind, "status": status})
     return await db.query_one("SELECT * FROM roadmap_evidence WHERE id = ?", (eid,))
+
+
+# ---- checklists ---------------------------------------------------------------
+
+async def add_checklist_item(
+    card_id: str, kind: str, text: str, sort_order: float | None = None
+) -> dict[str, Any] | None:
+    _validate_enum(kind, CHECKLIST_KINDS, "checklist kind")
+    if not str(text).strip():
+        raise RoadmapError("a checklist item needs text")
+    text = text.strip()
+    card = await db.query_one("SELECT id FROM roadmap_cards WHERE id = ?", (card_id,))
+    if card is None:
+        return None
+    if sort_order is None:
+        tail = await db.query_one(
+            "SELECT COALESCE(MAX(sort_order), 0) AS m FROM roadmap_checklists WHERE card_id = ? AND kind = ?",
+            (card_id, kind),
+        )
+        sort_order = (tail["m"] if tail else 0) + 10.0
+    now = bus.now_iso()
+    item_id = _det_id(card_id, kind, text)  # same identity as import -> merge, not duplicate
+    try:
+        await db.execute(
+            "INSERT INTO roadmap_checklists (id, card_id, kind, text, checked, sort_order, created_at, updated_at) "
+            "VALUES (?,?,?,?,0,?,?,?)",
+            (item_id, card_id, kind, text, _require_number(sort_order, "sort_order"), now, now),
+        )
+    except sqlite3.IntegrityError:
+        raise RoadmapError(f"checklist item already exists on {card_id}: {text!r}") from None
+    await _record_event("checklist.added", card_id, {"checklist_id": item_id, "kind": kind, "text": text})
+    return await db.query_one("SELECT * FROM roadmap_checklists WHERE id = ?", (item_id,))
+
+
+async def update_checklist_item(item_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """PATCH a checklist item. Renaming re-derives the deterministic id from the
+    new text in the same UPDATE (id == _det_id(card, kind, text) is the seed
+    merge key — a stale id would make the next import duplicate the item), so
+    the old id stops resolving; the response and a ``checklist.renamed`` event
+    carry the new id."""
+    row = await db.query_one("SELECT * FROM roadmap_checklists WHERE id = ?", (item_id,))
+    if row is None:
+        return None
+    unknown = set(fields) - {"checked", "text", "sort_order"}
+    if unknown:
+        raise RoadmapError(f"unknown checklist fields: {', '.join(sorted(unknown))}")
+    sets, params = [], []
+    new_id, new_text = item_id, None
+    if "checked" in fields:
+        sets.append("checked = ?")
+        params.append(1 if fields["checked"] else 0)
+    if "text" in fields:
+        if not isinstance(fields["text"], str) or not fields["text"].strip():
+            raise RoadmapError("text must be a non-empty string")
+        text = fields["text"].strip()
+        if text != row["text"]:
+            new_text = text
+            new_id = _det_id(row["card_id"], row["kind"], text)
+            sets.extend(["id = ?", "text = ?"])
+            params.extend([new_id, text])
+    if "sort_order" in fields:
+        sets.append("sort_order = ?")
+        params.append(_require_number(fields["sort_order"], "sort_order"))
+    if not sets:
+        return row
+    sets.append("updated_at = ?")
+    params.extend([bus.now_iso(), item_id])
+    try:
+        await db.execute(f"UPDATE roadmap_checklists SET {', '.join(sets)} WHERE id = ?", params)
+    except sqlite3.IntegrityError:  # text collides with a sibling item (unique per card+kind)
+        raise RoadmapError(f"checklist item already exists on {row['card_id']}: {fields['text']!r}") from None
+    if new_text is not None:
+        await _record_event(
+            "checklist.renamed", row["card_id"],
+            {"from_id": item_id, "to_id": new_id, "from_text": row["text"], "to_text": new_text},
+        )
+    if "checked" in fields:
+        await _record_event(
+            "checklist.checked", row["card_id"],
+            {"checklist_id": new_id, "checked": bool(fields["checked"])},
+        )
+    return await db.query_one("SELECT * FROM roadmap_checklists WHERE id = ?", (new_id,))
+
+
+async def delete_checklist_item(item_id: str) -> bool:
+    row = await db.query_one("SELECT card_id, kind, text FROM roadmap_checklists WHERE id = ?", (item_id,))
+    if row is None:
+        return False
+    await db.execute("DELETE FROM roadmap_checklists WHERE id = ?", (item_id,))
+    await _record_event(
+        "checklist.removed", row["card_id"],
+        {"checklist_id": item_id, "kind": row["kind"], "text": row["text"]},
+    )
+    return True
+
+
+# ---- dependencies ---------------------------------------------------------------
+
+async def add_dependency(card_id: str, depends_on_id: str, relation: str = "blocks") -> dict[str, Any] | None:
+    """Add a dependency edge (02-data-model.md: ids must be known; a self-edge
+    or a cycle would deadlock the move-to-done gate, so both are rejected).
+
+    NB: import_backlog() reconciles edges to the seed — a manually added edge
+    survives until the next import unless the seed also carries it.
+    """
+    relation = str(relation).strip()  # normalize BEFORE deriving the id, or
+    if not relation:                  # " blocks " and "blocks" would split identities
+        raise RoadmapError("relation must be a non-empty string")
+    card = await db.query_one("SELECT id FROM roadmap_cards WHERE id = ?", (card_id,))
+    if card is None:
+        return None
+    if depends_on_id == card_id:
+        raise RoadmapError(f"card {card_id} cannot depend on itself")
+    target = await db.query_one("SELECT id FROM roadmap_cards WHERE id = ?", (depends_on_id,))
+    if target is None:
+        raise RoadmapError(f"depends on unknown card {depends_on_id!r}")
+
+    dep_id = _det_id(card_id, "dep", depends_on_id, relation)  # same identity as import
+    # cycle check + insert under the write lock, so two concurrent adds cannot
+    # both pass the check and close a loop between them
+    async with db.transaction() as conn:
+        cur = await conn.execute("SELECT card_id, depends_on_id FROM roadmap_dependencies")
+        rows = await cur.fetchall()
+        await cur.close()
+        edges: dict[str, list[str]] = {}
+        for r in rows:
+            edges.setdefault(r["card_id"], []).append(r["depends_on_id"])
+        # if card_id is reachable from depends_on_id, the new edge closes a loop
+        seen, frontier = set(), [depends_on_id]
+        while frontier:
+            node = frontier.pop()
+            if node == card_id:
+                raise RoadmapError(f"dependency cycle: {depends_on_id} already depends on {card_id}")
+            if node in seen:
+                continue
+            seen.add(node)
+            frontier.extend(edges.get(node, ()))
+        cur = await conn.execute(
+            "INSERT OR IGNORE INTO roadmap_dependencies (id, card_id, depends_on_id, relation, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (dep_id, card_id, depends_on_id, relation, bus.now_iso()),
+        )
+        created = cur.rowcount
+        await cur.close()
+    if created:  # idempotent: re-adding an existing edge emits no duplicate event
+        await _record_event(
+            "dependency.added", card_id, {"dependency_id": dep_id, "depends_on_id": depends_on_id},
+        )
+    return await db.query_one("SELECT * FROM roadmap_dependencies WHERE id = ?", (dep_id,))
+
+
+async def remove_dependency(dep_id: str) -> bool:
+    row = await db.query_one("SELECT card_id, depends_on_id FROM roadmap_dependencies WHERE id = ?", (dep_id,))
+    if row is None:
+        return False
+    await db.execute("DELETE FROM roadmap_dependencies WHERE id = ?", (dep_id,))
+    await _record_event(
+        "dependency.removed", row["card_id"],
+        {"dependency_id": dep_id, "depends_on_id": row["depends_on_id"]},
+    )
+    return True
 
 
 # ---- coding sessions ---------------------------------------------------------
@@ -622,10 +1007,14 @@ async def append_command(
     command_text: str,
     exit_code: int | None = None,
     output_excerpt: str | None = None,
+    as_evidence: bool = False,
 ) -> dict[str, Any] | None:
+    """Record a command run inside a session; ``as_evidence`` additionally
+    attaches it to the session's card as command evidence (M7-005 acceptance:
+    exit code 0 -> pass, non-zero -> fail, unknown -> info)."""
     if not str(command_label).strip() or not str(command_text).strip():
         raise RoadmapError("a session command needs a label and the command text")
-    sess = await db.query_one("SELECT id FROM roadmap_coding_sessions WHERE id = ?", (session_id,))
+    sess = await db.query_one("SELECT id, card_id FROM roadmap_coding_sessions WHERE id = ?", (session_id,))
     if sess is None:
         return None
     cid = _new_id()
@@ -634,7 +1023,16 @@ async def append_command(
         "output_excerpt, created_at) VALUES (?,?,?,?,?,?,?)",
         (cid, session_id, command_label.strip(), command_text.strip(), exit_code, output_excerpt, bus.now_iso()),
     )
-    return await db.query_one("SELECT * FROM roadmap_session_commands WHERE id = ?", (cid,))
+    row = await db.query_one("SELECT * FROM roadmap_session_commands WHERE id = ?", (cid,))
+    if as_evidence:
+        status = "info" if exit_code is None else ("pass" if exit_code == 0 else "fail")
+        body = command_text.strip() if output_excerpt is None else f"{command_text.strip()}\n{output_excerpt}"
+        evidence = await add_evidence(
+            sess["card_id"], "command", command_label.strip(),
+            body=body, status=status, artifact_ref=f"session_command:{cid}",
+        )
+        row["evidence_id"] = evidence["id"]
+    return row
 
 
 async def list_sessions(
@@ -658,6 +1056,118 @@ async def list_sessions(
     return [_session_out(r) for r in await db.query(sql, params)]
 
 
+# ---- decisions -----------------------------------------------------------------
+
+async def open_decision(
+    title: str,
+    question: str,
+    card_id: str | None = None,
+    options: list[str] | None = None,
+) -> dict[str, Any]:
+    if not str(title).strip() or not str(question).strip():
+        raise RoadmapError("a decision needs a title and a question")
+    options = _require_str_list(options, "options")
+    if card_id:
+        card = await db.query_one("SELECT id FROM roadmap_cards WHERE id = ?", (card_id,))
+        if card is None:
+            raise RoadmapError(f"unknown card {card_id!r}")
+    else:
+        card_id = None  # normalize "" -> NULL (board-level decision)
+    did = _new_id()
+    await db.execute(
+        "INSERT INTO roadmap_decisions (id, card_id, title, question, options_json, decision, status, "
+        "created_at, resolved_at) VALUES (?,?,?,?,?,NULL,'open',?,NULL)",
+        (did, card_id, title.strip(), question.strip(), _dumps(options), bus.now_iso()),
+    )
+    await _record_event("decision.opened", card_id, {"decision_id": did, "title": title.strip()})
+    return _decision_out(await db.query_one("SELECT * FROM roadmap_decisions WHERE id = ?", (did,)))
+
+
+async def get_decision(decision_id: str) -> dict[str, Any] | None:
+    row = await db.query_one("SELECT * FROM roadmap_decisions WHERE id = ?", (decision_id,))
+    return _decision_out(row) if row else None
+
+
+async def list_decisions(
+    card_id: str | None = None, status: str | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if card_id:
+        clauses.append("card_id = ?")
+        params.append(card_id)
+    if status:
+        _validate_enum(status, DECISION_STATUSES, "decision status")
+        clauses.append("status = ?")
+        params.append(status)
+    sql = "SELECT * FROM roadmap_decisions"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+    params.append(min(max(limit, 1), 500))
+    return [_decision_out(r) for r in await db.query(sql, params)]
+
+
+_DECISION_UPDATABLE = {"status", "decision", "title", "question", "options"}
+
+
+async def update_decision(decision_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """PATCH a decision; ``status='resolved'`` (with the ``decision`` text) is a
+    conditional claim — an open decision resolves exactly once.
+
+    A resolved decision is immutable (05-global-coding-process: do not rewrite
+    history) — every field write below is therefore guarded by
+    ``WHERE status = 'open'``, so a lost race surfaces as MoveConflict."""
+    row = await db.query_one("SELECT * FROM roadmap_decisions WHERE id = ?", (decision_id,))
+    if row is None:
+        return None
+    unknown = set(fields) - _DECISION_UPDATABLE
+    if unknown:
+        raise RoadmapError(f"unknown decision fields: {', '.join(sorted(unknown))}")
+    if row["status"] != "open" and fields:
+        raise MoveConflict(f"decision {decision_id} is resolved and immutable")
+    to_status = fields.get("status")
+    if to_status is not None and to_status != "resolved":
+        _validate_enum(to_status, DECISION_STATUSES, "decision status")
+        raise RoadmapError("a decision can only be patched to resolved")
+
+    sets, params = [], []
+    for key in ("title", "question", "decision"):
+        if key in fields:
+            val = fields[key]
+            if not isinstance(val, str) or (key != "decision" and not val.strip()):
+                raise RoadmapError(f"{key} must be a non-empty string")
+            sets.append(f"{key} = ?")
+            params.append(val.strip() if key != "decision" else val)
+    if "options" in fields:
+        sets.append("options_json = ?")
+        params.append(_dumps(_require_str_list(fields["options"], "options")))
+
+    if to_status == "resolved":
+        if not str(fields.get("decision", "")).strip():
+            raise RoadmapError("resolving a decision requires the decision text")
+        sets.extend(["status = 'resolved'", "resolved_at = ?"])
+        params.extend([bus.now_iso(), decision_id])
+        claimed = await db.execute(
+            f"UPDATE roadmap_decisions SET {', '.join(sets)} WHERE id = ? AND status = 'open'", params
+        )
+        if not claimed:
+            raise MoveConflict(f"decision {decision_id} is not open; cannot resolve it")
+        await _record_event(
+            "decision.resolved", row["card_id"],
+            {"decision_id": decision_id, "decision": fields["decision"].strip()},
+        )
+    elif sets:
+        # field edits are also conditional on open: the pre-check above can go
+        # stale between the read and this write (concurrent resolve)
+        params.append(decision_id)
+        claimed = await db.execute(
+            f"UPDATE roadmap_decisions SET {', '.join(sets)} WHERE id = ? AND status = 'open'", params
+        )
+        if not claimed:
+            raise MoveConflict(f"decision {decision_id} is resolved and immutable")
+    return await get_decision(decision_id)
+
+
 # ---- release gates -----------------------------------------------------------
 
 async def release_gates() -> list[dict[str, Any]]:
@@ -679,3 +1189,93 @@ async def release_gates() -> list[dict[str, Any]]:
             "remaining": sorted(c["id"] for c in scoped if c["status"] != "done"),
         })
     return gates
+
+
+# ---- global process view (M7-006) ---------------------------------------------
+
+async def process_overview() -> dict[str, Any]:
+    """Global coding process aggregate (GET /api/roadmap/process).
+
+    One payload the portal renders without opening each card: active coding
+    sessions, open decisions, release-gate readiness, and every blocked card.
+    Release readiness is computed from card status AND evidence
+    (05-global-coding-process: a gate is a projection over cards and
+    evidence): ``evidence_ready`` counts scoped cards carrying at least one
+    pass-verdict evidence row, and a gate is ``ready`` only when every scoped
+    card is done and evidence-backed.
+    """
+    cards = await db.query(
+        "SELECT id, title, phase, status, owner, blocked_reason FROM roadmap_cards ORDER BY sort_order, id"
+    )
+
+    # open dependency edges (dependency target not done) per card
+    open_deps: dict[str, list[str]] = {}
+    for r in await db.query(
+        "SELECT d.card_id, d.depends_on_id FROM roadmap_dependencies d "
+        "JOIN roadmap_cards c ON c.id = d.depends_on_id "
+        "WHERE c.status != 'done' ORDER BY d.depends_on_id"
+    ):
+        open_deps.setdefault(r["card_id"], []).append(r["depends_on_id"])
+
+    # cards backed by at least one pass-verdict evidence row
+    evidence_pass = {
+        r["card_id"]
+        for r in await db.query("SELECT DISTINCT card_id FROM roadmap_evidence WHERE status = 'pass'")
+    }
+
+    active_sessions = [
+        _session_out(r) for r in await db.query(
+            "SELECT s.*, c.title AS card_title, "
+            "(SELECT COUNT(*) FROM roadmap_session_commands sc WHERE sc.session_id = s.id) AS n_commands "
+            "FROM roadmap_coding_sessions s JOIN roadmap_cards c ON c.id = s.card_id "
+            "WHERE s.status = 'active' ORDER BY s.started_at DESC, s.rowid DESC"
+        )
+    ]
+
+    open_decisions = [
+        _decision_out(r) for r in await db.query(
+            "SELECT d.*, c.title AS card_title FROM roadmap_decisions d "
+            "LEFT JOIN roadmap_cards c ON c.id = d.card_id "
+            "WHERE d.status = 'open' ORDER BY d.created_at DESC, d.rowid DESC"
+        )
+    ]
+
+    # blocked process items: operator-set blocked_reason or open dependencies.
+    # done cards passed their gates already, so they are not process blockers.
+    blocked_cards = [
+        {
+            "id": c["id"], "title": c["title"], "phase": c["phase"], "status": c["status"],
+            "owner": c["owner"], "blocked_reason": c["blocked_reason"],
+            "open_dependencies": open_deps.get(c["id"], []),
+        }
+        for c in cards
+        if c["status"] != "done" and (c["blocked_reason"] or open_deps.get(c["id"]))
+    ]
+
+    gates = []
+    for name, description, prefixes in RELEASE_GATES:
+        scoped = [c for c in cards if _phase_token(c["phase"]) in prefixes]
+        total = len(scoped)
+        done = sum(1 for c in scoped if c["status"] == "done")
+        evidence_ready = sum(1 for c in scoped if c["id"] in evidence_pass)
+        blockers = sorted(
+            c["id"] for c in scoped
+            if c["status"] != "done" and (c["blocked_reason"] or open_deps.get(c["id"]))
+        )
+        gates.append({
+            "gate": name,
+            "description": description,
+            "prefixes": list(prefixes),
+            "cards_total": total,
+            "cards_done": done,
+            "evidence_ready": evidence_ready,
+            "blockers": blockers,
+            "ready": bool(total) and done == total and evidence_ready == total,
+        })
+
+    return {
+        "active_sessions": active_sessions,
+        "open_decisions": open_decisions,
+        "release_gates": gates,
+        "blocked_cards": blocked_cards,
+    }

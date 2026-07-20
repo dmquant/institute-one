@@ -137,12 +137,13 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
-.venv/bin/python -m pytest tests -q        # 39 tests, run on the echo hand
+.venv/bin/python -m pytest tests -q        # test suite, runs on the echo hand (no quota)
 ```
 
-- **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.
+- **Pause everything new**: `POST /api/admin/maintenance {"paused": true}` (also a Dashboard switch; state readable at `GET /api/admin/state`). Every job that would submit new model calls skips — briefing, daily report, analyst dailies, whiteboard kickoff/tick, mailbox sweep, research tick, memory compact — while no-quota jobs (janitor, hand scorecard, market refresh) keep running; in-flight work drains.
+- **Cron health**: `GET /api/cron/health` — per-job last fire, ok-rate, duration trend and last error, aggregated from `cron_metrics` (30-day window).
 - **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), tasks fall back along `claude ↔ codex ↔ gemini → *-api` (`gemini` and `agy` chain into each other first). Clear manually: `POST /api/hands/{name}/cooldown/clear`.
-- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically. Deep-research steps round-robin the configured research hands (`INSTITUTE_RESEARCH_HANDS`, default `codex,agy`), and their rate-limit fallback stays inside that chain.
+- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically. Deep-research steps round-robin the configured research hands (`INSTITUTE_RESEARCH_HANDS`, default `codex,agy`), and their rate-limit fallback stays inside that chain. Optionally, `INSTITUTE_ENABLE_HAND_WEIGHTS=true` turns those rotations into weighted picks driven by `GET/PUT /api/hands/weights` (per scope: whiteboard/research/daily/mailbox; explicit analyst hands always win; research weights stay inside the research chain).
 - **Backups**: nightly SQLite backup to `~/.institute-one/backups/` (03:00–05:00 SGT); the vault is a human-readable second copy of every product.
 - **Vault safety**: notes carry `managed: institute`; if you hand-edit a note the institute never clobbers it — updates arrive as `… (institute update <date>).md` siblings; `POST /api/vault/doctor` reports drift.
 - **Restarts are safe but not free**: in-flight tasks are marked `orphaned by restart` at boot and domain loops re-drive from durable rows — still, prefer restarting when the queue is idle (`GET /api/tasks/queue`).

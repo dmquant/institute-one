@@ -1,11 +1,28 @@
 import { useState } from "react";
-import { clearHandCooldown, getMeta, getVaultStatus, vaultDoctor } from "../api";
+import { Link } from "react-router-dom";
+import {
+  clearHandCooldown,
+  getAdminState,
+  getCronHealth,
+  getMeta,
+  getTask,
+  getVaultStatus,
+  isBilingualEnabled,
+  isMaintenancePaused,
+  listEvents,
+  setMaintenance,
+  vaultDoctor,
+} from "../api";
+import type { TwinReadyPayload } from "../api";
+import { useSSE } from "../useSSE";
 import {
   Empty,
   ErrorNote,
   Loading,
+  Markdown,
   PageHead,
   StatusBadge,
+  ago,
   countdown,
   fmtBytes,
   useLoad,
@@ -16,9 +33,35 @@ export default function Settings() {
   const now = useNow(1000);
   const meta = useLoad(getMeta, [], 10000);
   const vault = useLoad(getVaultStatus, [], 30000);
+  const admin = useLoad(getAdminState, [], 15000);
+  const cron = useLoad(getCronHealth, [], 60000);
+
+  // gate lists come from /api/cron/health's registry fields (gated flag set
+  // in app/institute/scheduler.py) — no hardcoded job names here
+  const cronJobs = Object.entries(cron.data?.jobs ?? {});
+  const gatedJobs = cronJobs.filter(([, j]) => j.gated === true).map(([name]) => name);
+  const ungatedJobs = cronJobs.filter(([, j]) => j.gated === false).map(([name]) => name);
 
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
+
+  const paused = isMaintenancePaused(admin.data);
+
+  const toggleMaintenance = async () => {
+    setErr(null);
+    setNote(null);
+    setSwitching(true);
+    try {
+      const r = await setMaintenance(!paused);
+      setNote(r.paused ? "维护模式已开启：受控定时任务将跳过" : "维护模式已关闭：定时任务恢复");
+      admin.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSwitching(false);
+    }
+  };
 
   const clearCooldown = async (name: string) => {
     setErr(null);
@@ -53,6 +96,39 @@ export default function Settings() {
       <PageHead zh="设置" en="Settings" />
       {note && <div className="ok-note">{note}</div>}
       <ErrorNote error={err} />
+
+      <div className="card">
+        <h2>
+          维护模式<span className="en">maintenance</span>
+        </h2>
+        <ErrorNote error={admin.error} />
+        <div className="form-row" style={{ alignItems: "center" }}>
+          <span>
+            当前状态：
+            {paused ? (
+              <b style={{ color: "var(--amber)" }}>已暂停</b>
+            ) : (
+              <b style={{ color: "var(--green)" }}>正常运行</b>
+            )}
+          </span>
+          <button className={paused ? undefined : "danger"} onClick={toggleMaintenance} disabled={switching || admin.loading}>
+            {switching ? "切换中…" : paused ? "恢复运行" : "暂停定时任务"}
+          </button>
+          <Link to="/cron" className="faint">
+            查看定时任务健康 →
+          </Link>
+        </div>
+        <p className="dim" style={{ fontSize: 12.5, margin: "10px 0 0" }}>
+          暂停期间以下受控任务跳过（不再发起新模型调用），在途任务照常收尾：
+          {" "}
+          <span className="mono">{gatedJobs.length > 0 ? gatedJobs.join(" · ") : "…"}</span>
+          ；不耗模型额度的任务（
+          <span className="mono">{ungatedJobs.length > 0 ? ungatedJobs.join(" · ") : "…"}</span>
+          ）不受影响。
+        </p>
+      </div>
+
+      <BilingualCard enabled={isBilingualEnabled(admin.data)} />
 
       <div className="card">
         <h2>
@@ -205,5 +281,98 @@ function Fragment2({ k, v }: { k: string; v: number }) {
       <dt>{k}</dt>
       <dd style={k.startsWith("冲突") && v > 0 ? { color: "var(--red)" } : undefined}>{v}</dd>
     </>
+  );
+}
+
+/** Bilingual twins (Phase 7): read-only switch state + twin_ready feed.
+ * The switch has NO write endpoint yet (PATCH-NOTES-D5 §3 follow-up), so
+ * this card only mirrors admin_state and explains how to flip the row.
+ * Full twin text is BY REFERENCE: payload.task_id -> GET /api/tasks/{id}. */
+function BilingualCard({ enabled }: { enabled: boolean }) {
+  const { lastEvent } = useSSE({ types: ["bilingual."], max: 1 });
+  const twins = useLoad(() => listEvents(0, "bilingual.twin_ready", 200), [lastEvent?.id ?? 0]);
+  const [viewing, setViewing] = useState<{ taskId: string; text: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const openTwin = async (taskId: string) => {
+    setErr(null);
+    try {
+      const t = await getTask(taskId);
+      setViewing({ taskId, text: t.output || "（任务输出为空）" });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const recent = (twins.data ?? []).slice(-10).reverse(); // newest first
+
+  return (
+    <div className="card">
+      <h2>
+        双语孪生<span className="en">bilingual twins</span>
+      </h2>
+      <ErrorNote error={err} />
+      <div className="form-row" style={{ alignItems: "center" }}>
+        <span>
+          当前状态：
+          {enabled ? (
+            <b style={{ color: "var(--green)" }}>已开启</b>
+          ) : (
+            <b style={{ color: "var(--amber)" }}>已关闭（默认）</b>
+          )}
+        </span>
+        <span className="faint">此开关暂为只读展示（后端尚无写端点）</span>
+      </div>
+      <p className="dim" style={{ fontSize: 12.5, margin: "10px 0 0" }}>
+        开启后，briefing / daily 工作流完成时自动把编译报告翻译成英文孪生（走默认执行手，
+        消耗模型额度；维护暂停期间跳过）。开关存于 <span className="mono">admin_state</span> 的{" "}
+        <span className="mono">bilingual:enabled</span> 行，开启方法（服务器上执行，默认 DB 路径
+        <span className="mono"> ~/.institute-one/institute.db</span>，写{" "}
+        <span className="mono">'false'</span> 即关闭）：
+      </p>
+      <pre className="file-pre" style={{ marginTop: 8 }}>
+        {`sqlite3 ~/.institute-one/institute.db "INSERT INTO admin_state (key, value) VALUES ('bilingual:enabled','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"`}
+      </pre>
+
+      <h2 style={{ marginTop: 16 }}>
+        英文孪生产出<span className="en">twin_ready events</span>
+      </h2>
+      <ErrorNote error={twins.error} />
+      {twins.loading && !twins.data && <Loading />}
+      <div className="feed">
+        {recent.map((e) => {
+          const p = e.payload as TwinReadyPayload;
+          return (
+            <div className="feed-item" key={e.id}>
+              <span className="type">{p.workflow_id ?? "?"}</span>
+              <span className="ref mono">
+                {p.work_date ?? "—"} · run {p.run_id ?? e.ref_id} ·{" "}
+                {typeof p.text_bytes === "number" ? fmtBytes(p.text_bytes) : "—"}
+              </span>
+              {p.task_id && (
+                <button className="small ghost" onClick={() => openTwin(p.task_id!)}>
+                  查看全文
+                </button>
+              )}
+              <span className="t">{ago(e.created_at)}</span>
+              {p.summary && <div className="faint" style={{ flexBasis: "100%", fontSize: 12 }}>{p.summary}</div>}
+            </div>
+          );
+        })}
+        {recent.length === 0 && <Empty text="还没有英文孪生产出" />}
+      </div>
+
+      {viewing && (
+        <>
+          <h2 style={{ marginTop: 16 }}>
+            孪生全文<span className="en">task {viewing.taskId}</span>
+            <button className="small ghost" style={{ marginLeft: 12 }} onClick={() => setViewing(null)}>
+              关闭
+            </button>
+          </h2>
+          <Markdown text={viewing.text} />
+        </>
+      )}
+    </div>
   );
 }

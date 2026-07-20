@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`app/` contains the FastAPI backend. Key areas are `api/` for REST routers, `institute/` for domain workflows, `hands/` for CLI/model executors, `router/` for task execution, and `vault/` for Obsidian export logic. `frontend/src/` is the React operator UI, and `obsidian-plugin/src/` is the Obsidian plugin. Tests live in `tests/`. Durable schema changes go in `migrations/`; analyst and workflow configuration lives in `catalog/` and `workflows/`. `roadmap/` is the roadmap control plane (design docs plus the `backlog.json` card board). `market-thesis-data/` is a local, intentionally untracked dataset. Screenshots are under `docs/screenshots/`; longer docs are the root-level `README.md` and `ROADMAP.md`.
+`app/` contains the FastAPI backend. Key areas are `api/` for REST routers, `institute/` for domain workflows, `hands/` for CLI/model executors, `router/` for task execution, and `vault/` for Obsidian export logic. `frontend/src/` is the React operator UI, and `obsidian-plugin/src/` is the Obsidian plugin. Tests live in `tests/`. Durable schema changes go in `migrations/` — additive numbered files only (gaps are fine), each applied as one transaction, so never put `BEGIN`/`COMMIT`/`ROLLBACK`/`ATTACH`/`VACUUM` inside a migration (a test enforces this); analyst and workflow configuration lives in `catalog/` and `workflows/`. `roadmap/` is the roadmap control plane (design docs plus the `backlog.json` card board). `market-thesis-data/` is a local, intentionally untracked dataset. Screenshots are under `docs/screenshots/`; longer docs are the root-level `README.md` and `ROADMAP.md`.
 
 ## Build, Test, and Development Commands
 
@@ -21,7 +21,7 @@ Use Python 3.11+, four-space indentation, async-aware code, and type hints where
 
 ## Testing Guidelines
 
-Tests use `pytest` and `pytest-asyncio`; name files `tests/test_*.py`. `tests/conftest.py` redirects state to a temporary home, disables every real CLI hand (keep its disable loop in sync when adding a hand), and pins `INSTITUTE_DEFAULT_HAND` and `INSTITUTE_RESEARCH_HANDS` to echo, so new tests should avoid consuming external model quota. Add focused tests for new loops, API behavior, migrations, and vault-writing rules.
+Tests use `pytest` and `pytest-asyncio`; name files `tests/test_*.py`. `tests/conftest.py` redirects state to a temporary home, disables every real CLI hand (keep its disable loop in sync when adding a hand), and pins `INSTITUTE_DEFAULT_HAND` and `INSTITUTE_RESEARCH_HANDS` to echo, so new tests should avoid consuming external model quota. Its teardown cancels every background-task registry — keep that sweep in sync with `main._drain_background` when adding a new registry. Add focused tests for new loops, API behavior, migrations, and vault-writing rules.
 
 ## Commit & Pull Request Guidelines
 

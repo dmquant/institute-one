@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -49,6 +50,29 @@ def test_create_update_delete_roundtrip():
     assert analysts.delete_analyst("quant-analyst") is True
     assert analysts.get_analyst("quant-analyst") is None
     assert len(analysts.roster()) == before
+
+
+def test_manual_edit_reloads_via_mtime():
+    """A manual catalog edit (mtime change) is picked up without reload()/restart."""
+    path = get_settings().catalog_path
+    first = analysts.roster()[0]  # prime the cache
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["analysts"][0]["name"] = first.name + "·手工改"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    st = path.stat()  # force the mtime forward in case the write landed in the same tick
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    assert analysts.roster()[0].name == first.name + "·手工改"
+    assert analysts.get_analyst(first.id).name == first.name + "·手工改"
+
+
+def test_unchanged_mtime_serves_cache():
+    """Same mtime -> no re-parse: the cached roster object is returned."""
+    analysts.reload()
+    a = analysts._load()
+    b = analysts._load()
+    assert a is b
 
 
 def test_validation_and_conflicts():

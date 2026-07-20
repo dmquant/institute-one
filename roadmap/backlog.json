@@ -1,6 +1,14 @@
 {
   "version": 1,
-  "columns": ["inbox", "ready", "in_progress", "review", "verify", "done", "parked"],
+  "columns": [
+    "inbox",
+    "ready",
+    "in_progress",
+    "review",
+    "verify",
+    "done",
+    "parked"
+  ],
   "phases": [
     "M0 Research Hand Policy",
     "M1 Thesis Registry",
@@ -9,7 +17,8 @@
     "M4 Market Data & PIT Store",
     "M5 Forecast Ledger",
     "M6 Alpha & Paper Book",
-    "M7 Roadmap Control Plane"
+    "M7 Roadmap Control Plane",
+    "M8 Post-Audit Hardening"
   ],
   "cards": [
     {
@@ -21,15 +30,25 @@
       "priority": "P0",
       "risk": "medium",
       "summary": "Default deep research to codex and agy, and constrain research fallback to the configured research hand chain.",
-      "design_links": ["design/local-thesis-alpha/01-local-architecture.md", "design/local-thesis-alpha/05-implementation-roadmap.md"],
-      "expected_files": ["app/config.py", "app/institute/workflows.py", "app/router/executor.py", "app/hands/registry.py"],
+      "design_links": [
+        "design/local-thesis-alpha/01-local-architecture.md",
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      "expected_files": [
+        "app/config.py",
+        "app/institute/workflows.py",
+        "app/router/executor.py",
+        "app/hands/registry.py"
+      ],
       "dependencies": [],
       "acceptance": [
         "INSTITUTE_RESEARCH_HANDS defaults to codex,agy",
         "research workflow steps rotate through the configured research hands",
         "research fallback does not use non-research hands"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_workflows.py tests/test_research.py -q"
+      ]
     },
     {
       "id": "M0-002",
@@ -40,14 +59,23 @@
       "priority": "P0",
       "risk": "low",
       "summary": "Add a focused workflow test with fake codex and agy hands to prove research uses only the configured research hand list.",
-      "design_links": ["design/local-thesis-alpha/05-implementation-roadmap.md"],
-      "expected_files": ["tests/conftest.py", "tests/test_workflows.py"],
-      "dependencies": ["M0-001"],
+      "design_links": [
+        "design/local-thesis-alpha/05-implementation-roadmap.md"
+      ],
+      "expected_files": [
+        "tests/conftest.py",
+        "tests/test_workflows.py"
+      ],
+      "dependencies": [
+        "M0-001"
+      ],
       "acceptance": [
         "tests can override research hands to echo",
         "focused test asserts requested and actual hands are limited to codex/agy"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_workflows.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_workflows.py -q"
+      ]
     },
     {
       "id": "M1-000",
@@ -58,15 +86,24 @@
       "priority": "P0",
       "risk": "low",
       "summary": "Treat market-thesis-data as the bootstrap source for the local thesis registry and document import mappings, validation, and warnings.",
-      "design_links": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      "expected_files": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
+      "design_links": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      "expected_files": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
       "dependencies": [],
       "acceptance": [
         "bundle counts and schema are documented",
         "lane/thesis/stock/edge field mappings are documented",
         "import validation and warning policy are documented"
       ],
-      "verification": ["python3 -m json.tool market-thesis-data/manifest.json", "python3 -m json.tool market-thesis-data/bundle.json"]
+      "verification": [
+        "python3 -m json.tool market-thesis-data/manifest.json",
+        "python3 -m json.tool market-thesis-data/bundle.json"
+      ]
     },
     {
       "id": "M1-001",
@@ -77,16 +114,30 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Create additive SQLite migration for theses, thesis_versions, thesis metadata, and market_thesis_import provenance.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "tests/test_theses.py", "tests/test_market_thesis_import.py"],
-      "dependencies": ["M0-001", "M1-000"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "tests/test_theses.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      "dependencies": [
+        "M0-001",
+        "M1-000"
+      ],
       "acceptance": [
         "migration is additive",
         "thesis lifecycle status is represented",
         "version table can preserve view history",
         "import batch and import item provenance are represented"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_theses.py -q", ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q", ".venv/bin/python -m compileall app -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_theses.py -q",
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
     },
     {
       "id": "M1-002",
@@ -97,16 +148,27 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Add thesis CRUD/list/tree behavior behind domain functions and REST routes.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md"],
-      "expected_files": ["app/institute/theses.py", "app/api/theses.py", "app/main.py", "tests/test_theses.py"],
-      "dependencies": ["M1-001"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md"
+      ],
+      "expected_files": [
+        "app/institute/theses.py",
+        "app/api/theses.py",
+        "app/main.py",
+        "tests/test_theses.py"
+      ],
+      "dependencies": [
+        "M1-001"
+      ],
       "acceptance": [
         "GET /api/theses returns tree data",
         "POST /api/theses creates candidate or active thesis",
         "PATCH /api/theses/{id} updates projection fields",
         "tests cover create, update, duplicate slug, and tree listing"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_theses.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_theses.py -q"
+      ]
     },
     {
       "id": "M1-003",
@@ -116,17 +178,30 @@
       "status": "review",
       "priority": "P1",
       "risk": "medium",
-      "summary": "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe.",
-      "design_links": ["design/local-thesis-alpha/10-market-thesis-data-bootstrap.md", "roadmap/07-market-thesis-data-kickoff.md"],
-      "expected_files": ["app/institute/theses.py", "app/institute/market_thesis_import.py", "tests/test_market_thesis_import.py"],
-      "dependencies": ["M1-001", "M1-002", "M2-001"],
+      "summary": "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe. 数据集经 INSTITUTE_THESIS_BUNDLE 环境变量指向外部路径导入（数据集含商业数据不入库）。",
+      "design_links": [
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md",
+        "roadmap/07-market-thesis-data-kickoff.md"
+      ],
+      "expected_files": [
+        "app/institute/theses.py",
+        "app/institute/market_thesis_import.py",
+        "tests/test_market_thesis_import.py"
+      ],
+      "dependencies": [
+        "M1-001",
+        "M1-002",
+        "M2-001"
+      ],
       "acceptance": [
         "dry-run validates schema and reports counts/warnings",
         "apply import inserts lanes, theses, securities, and thesis-stock edges",
         "import preserves practical metadata",
         "import is idempotent"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_market_thesis_import.py -q"
+      ]
     },
     {
       "id": "M2-001",
@@ -137,74 +212,117 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Create securities, security_aliases, and thesis_security_edges tables with market-thesis-data market normalization.",
-      "design_links": ["design/local-thesis-alpha/02-thesis-stock-model.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "tests/test_securities.py"],
-      "dependencies": ["M1-001"],
+      "design_links": [
+        "design/local-thesis-alpha/02-thesis-stock-model.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "tests/test_securities.py"
+      ],
+      "dependencies": [
+        "M1-001"
+      ],
       "acceptance": [
         "canonical ids support CN_A, HK, and US suffixes",
         "aliases can map Chinese names and unsuffixed tickers",
         "thesis-security edge stores role, exposure, confidence, and rationale",
         "market-thesis-data markets normalize into local market and instrument_type"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_securities.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_securities.py -q"
+      ]
     },
     {
       "id": "M3-001",
       "title": "Extend research queue for thesis-aware tasks",
       "type": "schema",
       "phase": "M3 Thesis-Aware Research Queue",
-      "status": "inbox",
+      "status": "done",
       "priority": "P1",
       "risk": "high",
       "summary": "Add thesis_id, security_id, question, output_type, priority_reason, and cooldown fields while preserving current research behavior and supporting imported market-thesis-data theses.",
-      "design_links": ["design/local-thesis-alpha/03-infinite-research-loop.md", "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/research.py", "tests/test_research.py"],
-      "dependencies": ["M1-002", "M2-001"],
+      "design_links": [
+        "design/local-thesis-alpha/03-infinite-research-loop.md",
+        "design/local-thesis-alpha/10-market-thesis-data-bootstrap.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/research.py",
+        "tests/test_research.py"
+      ],
+      "dependencies": [
+        "M1-002",
+        "M2-001"
+      ],
       "acceptance": [
         "old topic-only enqueue still works",
         "structured enqueue stores thesis/security/question",
         "dedup uses thesis, security, and normalized question",
         "imported practical.actionCode can seed research candidates"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_research.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_research.py -q"
+      ]
     },
     {
       "id": "M4-001",
       "title": "Add market calendar, bars, and benchmark schema",
       "type": "schema",
       "phase": "M4 Market Data & PIT Store",
-      "status": "inbox",
+      "status": "done",
       "priority": "P1",
       "risk": "high",
       "summary": "Add local point-in-time market data tables for trading calendar, price bars, benchmarks, and corporate actions.",
-      "design_links": ["design/local-thesis-alpha/06-market-data-pit.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/market_data.py", "tests/test_market_data.py"],
-      "dependencies": ["M2-001"],
+      "design_links": [
+        "design/local-thesis-alpha/06-market-data-pit.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/market_data.py",
+        "tests/test_market_data.py"
+      ],
+      "dependencies": [
+        "M2-001"
+      ],
       "acceptance": [
         "tables carry valid_time/as_known_at where required",
         "benchmark marks are separate from securities",
         "calendar can represent closed and suspended days"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_market_data.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_market_data.py -q"
+      ]
     },
     {
       "id": "M5-001",
       "title": "Add forecast and settlement schema",
       "type": "schema",
       "phase": "M5 Forecast Ledger",
-      "status": "inbox",
+      "status": "done",
       "priority": "P1",
       "risk": "medium",
       "summary": "Create forecasts and forecast_settlements tables with deterministic settlement rule fields.",
-      "design_links": ["design/local-thesis-alpha/04-alpha-portfolio-loop.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/forecasts.py", "tests/test_forecasts.py"],
-      "dependencies": ["M1-002", "M4-001"],
+      "design_links": [
+        "design/local-thesis-alpha/04-alpha-portfolio-loop.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/forecasts.py",
+        "tests/test_forecasts.py"
+      ],
+      "dependencies": [
+        "M1-002",
+        "M4-001"
+      ],
       "acceptance": [
         "forecast requires thesis, claim, horizon, direction, and settlement_rule",
         "settlement can record hit/miss/partial/invalid",
         "invalid benchmark fails closed"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_forecasts.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_forecasts.py -q"
+      ]
     },
     {
       "id": "M7-001",
@@ -215,8 +333,16 @@
       "priority": "P1",
       "risk": "medium",
       "summary": "Create roadmap card/checklist/dependency/evidence/session/event tables and import roadmap/backlog.json.",
-      "design_links": ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
-      "expected_files": ["migrations/*.sql", "app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
+      "design_links": [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
       "dependencies": [],
       "acceptance": [
         "seed import upserts cards by id",
@@ -224,7 +350,9 @@
         "dependencies validate known ids",
         "status/type/priority values are validated"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
     },
     {
       "id": "M7-003",
@@ -235,94 +363,713 @@
       "priority": "P2",
       "risk": "medium",
       "summary": "Add an Obsidian roadmap view with columns, filters, swimlanes, card detail panel, and Kanban-compatible markdown export.",
-      "design_links": ["roadmap/01-portal-design.md"],
-      "expected_files": ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/main.ts", "obsidian-plugin/src/dashboard.ts", "obsidian-plugin/tsconfig.json"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/01-portal-design.md"
+      ],
+      "expected_files": [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/main.ts",
+        "obsidian-plugin/src/dashboard.ts",
+        "obsidian-plugin/tsconfig.json"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "plugin view displays cards grouped by status",
         "filters by phase/type/priority",
         "card detail panel shows checklists, dependencies, expected files, verification commands, and prompt",
         "operator can export a markdown-backed Kanban note"
       ],
-      "verification": ["cd obsidian-plugin && npm run build"]
+      "verification": [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-005",
       "title": "Add coding session tracking",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "review",
+      "status": "done",
       "priority": "P1",
       "risk": "medium",
       "summary": "Implement coding sessions as first-class records tied to roadmap cards, commands, touched files, and completion summaries.",
-      "design_links": ["roadmap/05-global-coding-process.md", "roadmap/06-agent-protocol.md", "roadmap/02-data-model.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/06-agent-protocol.md",
+        "roadmap/02-data-model.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "card can start a coding session",
         "session records actor, goal, planned files, touched files, status, and summary",
         "session commands can be attached as evidence",
         "card cannot move to review without a session summary unless operator overrides"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-006",
       "title": "Add global coding process and release gate views",
       "type": "ui",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "done",
       "priority": "P1",
       "risk": "medium",
       "summary": "Add UI views that show active coding sessions, open decisions, release gates, and evidence readiness beyond the Kanban board.",
-      "design_links": ["roadmap/05-global-coding-process.md", "roadmap/01-portal-design.md"],
-      "expected_files": ["obsidian-plugin/src/roadmap.ts", "obsidian-plugin/src/api.ts", "app/api/roadmap.py"],
-      "dependencies": ["M7-001", "M7-003", "M7-005"],
+      "design_links": [
+        "roadmap/05-global-coding-process.md",
+        "roadmap/01-portal-design.md"
+      ],
+      "expected_files": [
+        "obsidian-plugin/src/roadmap.ts",
+        "obsidian-plugin/src/api.ts",
+        "app/api/roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001",
+        "M7-003",
+        "M7-005"
+      ],
       "acceptance": [
         "roadmap view exposes sessions, decisions, and release gates",
         "release readiness is computed from card status and evidence",
         "blocked process items are visible without opening each card"
       ],
-      "verification": ["cd obsidian-plugin && npm run build"]
+      "verification": [
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-007",
       "title": "Generate agent prompts from roadmap cards",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "done",
       "priority": "P2",
       "risk": "low",
       "summary": "Generate deterministic coding-agent prompts from card metadata, constraints, acceptance criteria, and verification commands.",
-      "design_links": ["roadmap/06-agent-protocol.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "obsidian-plugin/src/roadmap.ts", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/06-agent-protocol.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "prompt includes card id, title, design links, expected files, acceptance criteria, verification commands, and constraints",
         "operator can copy the generated prompt",
         "prompt generation is deterministic for the same card state"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q", "cd obsidian-plugin && npm run build"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
     },
     {
       "id": "M7-008",
       "title": "Roadmap decisions, claim, export, and checklist/dependency CRUD",
       "type": "feature",
       "phase": "M7 Roadmap Control Plane",
-      "status": "inbox",
+      "status": "done",
       "priority": "P2",
       "risk": "low",
       "summary": "Implement the 02-data-model.md surface deferred out of M7-001: decision records (roadmap_decisions and roadmap_release_gates are pre-created but unused), POST /cards and /claim, checklist item CRUD, dependency add/remove routes, and GET /export.",
-      "design_links": ["roadmap/02-data-model.md", "roadmap/05-global-coding-process.md"],
-      "expected_files": ["app/institute/roadmap.py", "app/api/roadmap.py", "tests/test_roadmap.py"],
-      "dependencies": ["M7-001"],
+      "design_links": [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      "expected_files": [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "tests/test_roadmap.py"
+      ],
+      "dependencies": [
+        "M7-001"
+      ],
       "acceptance": [
         "decisions can be opened and resolved with decision.opened/decision.resolved events",
         "cards can be created and claimed via the API",
         "checklist items and dependencies have add/check/remove routes",
         "GET /export produces a backlog-compatible JSON snapshot"
       ],
-      "verification": [".venv/bin/python -m pytest tests/test_roadmap.py -q"]
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q"
+      ]
+    },
+    {
+      "id": "M8-001",
+      "title": "Compare CHECK/REFERENCES in ADD COLUMN crash-recovery guard",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P0",
+      "risk": "medium",
+      "summary": "S4-P0-01 (R2 B1, the only PARTIALLY of 75 must-fix): _skip_add_column() only compares type/NOT NULL/DEFAULT, so a crash-recovered column whose migration declares CHECK or REFERENCES can be silently recorded as applied. Parse sqlite_master for the table DDL and compare (or fail closed on constraint declarations the parser cannot prove). Coordinate with the round-5 E1 partition before starting — verify it is still open.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/db.py",
+        "tests/test_db_migrate.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "replaying an ADD COLUMN with a matching CHECK/REFERENCES declaration is skipped",
+        "a same-name column whose CHECK/REFERENCES differ raises MigrationRecoveryError",
+        "constraint declarations the parser cannot prove fail closed instead of being skipped"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_db_migrate.py -q"
+      ]
+    },
+    {
+      "id": "M8-002",
+      "title": "Deterministic fixture for the D4 restart-recovery probe",
+      "type": "test",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P1",
+      "risk": "low",
+      "summary": "S4-P0-02 (second half; the marker split over test_market_thesis_import.py belongs to the round-5 E1 partition): the D4 restart-recovery probe still skips with exploratory schema guesses ('could not seed a running research-tree row'). Replace the probe with a deterministic running-tree fixture against the real 0020 schema so orphan recovery is actually asserted on every run.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "tests/test_restart_recovery.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "the research-tree restart test seeds a running tree deterministically and never skips on this checkout",
+        "boot-time recovery of orphaned running nodes is asserted"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_restart_recovery.py -q -rs"
+      ]
+    },
+    {
+      "id": "M8-003",
+      "title": "Durable executor retry lineage and idempotency",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P1",
+      "risk": "high",
+      "summary": "S4-P1-01 (A1/F1): retry does not persist the original fallback chain/lineage, so a cross-process retry after restart loses hand confinement and has no idempotency key; rate_limited tasks still terminate permanently after one fallback retry (ROADMAP Phase 2 'Executor depth'). Persist retry lineage + idempotency key, add the cooldown-expiry resurrection job, and lock the exact output-cap/marker boundary with tests.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/router/executor.py",
+        "migrations/*.sql",
+        "tests/test_executor.py",
+        "tests/test_tasks_retry.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a retried task after process restart keeps the original fallback confinement",
+        "duplicate in-flight submissions dedup on the idempotency key",
+        "rate_limited tasks whose cooldown expired are resurrected by a scheduler job"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_executor.py tests/test_tasks_retry.py -q"
+      ]
+    },
+    {
+      "id": "M8-004",
+      "title": "Calibrate similarity gates against real bge-m3 (50+ pairs)",
+      "type": "test",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P1",
+      "risk": "low",
+      "summary": "ROADMAP Phase 1a acceptance debt: the whiteboard similarity gate (0.85/14d skip, 0.65/30d build-on) shipped with uncalibrated default thresholds — the one-off distribution sanity check against ~50 known duplicate/related/unrelated pairs with real bge-m3 embeddings was never run. Run it against local Ollama, record the distribution, and adjust the config-row thresholds if the defaults misclassify.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/vectors.py",
+        "app/institute/whiteboard.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a 50+ known-pair distribution report exists (duplicate / build-on / unrelated buckets)",
+        "config thresholds are confirmed or corrected from the measured distribution"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_whiteboard_similarity.py tests/test_vectors.py -q"
+      ]
+    },
+    {
+      "id": "M8-005",
+      "title": "Unify memory injection entrypoints and compact claim",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "S4-P1-08 (B3/C8) + ROADMAP Phase 2 gap: analyst standing memory is injected only at the four workflow prompt-assembly points; ad-hoc /api/ask, ask_stream, sessions and MCP asks run memory-less, and concurrent compacts can double-burn the model. Decide the unified injection entrypoint first, then wire the remaining callers and add a conditional-claim around compact_one.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/memory.py",
+        "app/api/tasks.py",
+        "app/api/ask_stream.py",
+        "app/mcp.py",
+        "tests/test_memory.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "one documented decision on where memory_block() is injected for ad-hoc asks/sessions/MCP",
+        "the decided entrypoints inject standing memory",
+        "concurrent compact_one calls for the same analyst burn the model at most once"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_memory.py -q"
+      ]
+    },
+    {
+      "id": "M8-006",
+      "title": "Operator product surface: enforcement, CAS, SPA routes",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "S4-P2-05 + ROADMAP Phase 6 partials: feature switches are stored/displayed but never enforced and PUT is not CAS; the SPA has no operator route, so the actions kanban and triage page exist only as backend JSON. Deliver switch enforcement + compare-and-swap PUT, the operator kanban/triage SPA pages, and define the human-auth boundary and shadow-exit policy before any unshadow.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/api/operator.py",
+        "app/institute/operator.py",
+        "frontend/src/App.tsx",
+        "frontend/src/pages/Operator.tsx",
+        "tests/test_operator.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "feature switches gate their subsystems and PUT is CAS (version or old-value check)",
+        "SPA has operator kanban + triage routes fed by the existing APIs",
+        "shadow-exit policy is documented and approve flow keeps the live-floor recheck"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_operator.py -q",
+        "cd frontend && npm run build"
+      ]
+    },
+    {
+      "id": "M8-007",
+      "title": "Frontend test runner and useSSE state-machine tests",
+      "type": "test",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "S4-P2-10 (C7/S3): useSSE has no automated tests for bootstrap, pagination, reconnect-with-cursor, ring eviction or the watchdog; event grouping staleness and error rendering are unlocked. Introduce a frontend test runner (vitest) and lock the cursor state machine and UI edges.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "frontend/package.json",
+        "frontend/src/useSSE.ts",
+        "frontend/src/useSSE.test.ts"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a frontend test runner runs in CI-equivalent local command",
+        "useSSE bootstrap/reconnect/cursor/ring-eviction paths are covered",
+        "the SPA build stays green"
+      ],
+      "verification": [
+        "cd frontend && npm test",
+        "cd frontend && npm run build"
+      ]
+    },
+    {
+      "id": "M8-008",
+      "title": "Recipes, observations, proposals, effect measurement loop",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "high",
+      "summary": "ROADMAP Phase 6 L item, still schema-only (0018 recipes placeholder): recurring fixes become recipes; observations feed proposals; proposals require explicit human approval in the web UI (never via vault frontmatter or MCP — proposal §8.2 invariant); parameter history + effect measurement close the self-improvement loop.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "migrations/*.sql",
+        "app/institute/operator.py",
+        "app/api/operator.py",
+        "tests/test_operator.py"
+      ],
+      "dependencies": [
+        "M8-006"
+      ],
+      "acceptance": [
+        "observations and proposals are durable rows linked to recipes",
+        "proposals apply only through explicit web-UI human approval",
+        "parameter changes record before/after effect measurements"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_operator.py -q"
+      ]
+    },
+    {
+      "id": "M8-009",
+      "title": "Research tree product surface: viewer, retry, scoring",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-13/14/15 + ROADMAP Phase 7 partial: the BFS engine is server-side only — no SSE tree viewer page, failed nodes have no retry policy, the score column is never written (no ranking), child replay is only exact-topic idempotent (normalized child key or documented contract), the daily booked counter is never cleaned and cap refusal returns 200 instead of 429.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/research_tree.py",
+        "app/api/research_tree.py",
+        "frontend/src/App.tsx",
+        "frontend/src/pages/ResearchTree.tsx",
+        "tests/test_research_tree.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "SPA tree viewer shows live node states over SSE",
+        "failed nodes have a bounded retry policy (no manual completed-parent surgery)",
+        "score is written and children/trees are rankable",
+        "booked counters older than 30 days are janitored and cap refusal uses 429"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_research_tree.py -q",
+        "cd frontend && npm run build"
+      ]
+    },
+    {
+      "id": "M8-010",
+      "title": "Projects product surface: operations API, SPA page, MCP project_id",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-16/17 + ROADMAP Phase 7 partial: projects are backend containers only — no SPA page, no archive/unlink API routes, no project digest endpoint; MCP research_queue_add has no optional project_id so the write side cannot attach a project (keep the 3-write-tool boundary).",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/projects.py",
+        "app/api/projects.py",
+        "app/mcp.py",
+        "frontend/src/App.tsx",
+        "frontend/src/pages/Projects.tsx",
+        "tests/test_projects.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "archive/unlink routes exist with conditional-claim semantics",
+        "SPA project page lists links and status",
+        "project digest endpoint ships",
+        "MCP research_queue_add accepts optional project_id without adding a fourth write tool"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_projects.py tests/test_mcp.py -q",
+        "cd frontend && npm run build"
+      ]
+    },
+    {
+      "id": "M8-011",
+      "title": "Bilingual twins read API, locale toggle, retry policy",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-18 + ROADMAP Phase 7 partial: bilingual twins ship as by-reference events only — no per-run+locale read endpoint or twin index, no SPA/admin locale toggle, failed translations are not retried, and replayed events can duplicate work. Add a stable read API, the locale toggle UI, and a bounded retry/idempotency policy.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/bilingual.py",
+        "app/api/workflows.py",
+        "frontend/src/App.tsx",
+        "tests/test_bilingual.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a twin can be read by (run_id, locale) without scanning events",
+        "SPA exposes a locale toggle for briefing/daily products",
+        "failed translations retry boundedly; replay does not duplicate twins"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_bilingual.py -q",
+        "cd frontend && npm run build"
+      ]
+    },
+    {
+      "id": "M8-012",
+      "title": "Persistent multi-agent groups and Committee Vault",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-06/07 + ROADMAP Phase 7 partial: multi-agent runs have no persistent group/run rows (no reconnect or partial-spawn recovery), committee has no Committee Vault export or input snapshot, workflow output files are not an engine contract, and majority verdicts stay free-text. Unify the group/run/file/verdict persistence protocol and add the missing API contract tests.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/multi_agent.py",
+        "app/institute/workflows.py",
+        "app/vault/exporter.py",
+        "tests/test_multi_agent.py",
+        "tests/test_committee.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "multi-agent groups/runs are durable rows supporting reconnect",
+        "committee runs export a Committee/ vault note with an input snapshot",
+        "majority verdicts are structured, not free-text"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_multi_agent.py tests/test_committee.py -q"
+      ]
+    },
+    {
+      "id": "M8-013",
+      "title": "Durable outbox for disputed-claim delivery",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-01 (C1/S3): the factcheck disputed handler is best-effort — a crash between verdict and mailbox/vault delivery loses the dispute notification. Add a durable outbox with idempotent retry; optionally split extract/verify hand config and extend the parser oracle with production-shaped adversarial cases.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/factcheck.py",
+        "migrations/*.sql",
+        "tests/test_factcheck.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "disputed verdicts survive a crash before delivery and are retried idempotently",
+        "delivery failures are observable, not swallowed"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_factcheck.py -q"
+      ]
+    },
+    {
+      "id": "M8-014",
+      "title": "Forecast seeding, settlement reconciliation, risk enforcement",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "high",
+      "summary": "S4-P1-10 + S4-P2-03 (B6/C3/S3): scheduled forecast seeding, batch settlement reconciliation (repeatable command over history), benchmark-base backfill, historical MTM/backfill-price recomputation, strict risk/cap enforcement and the forecast Vault export are all incomplete. Split into seeding / reconciliation / risk-enforcement work items when claimed.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/forecasts.py",
+        "app/institute/paper_book.py",
+        "app/institute/forecast_extract.py",
+        "tests/test_forecasts.py",
+        "tests/test_paper_book.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a repeatable reconciliation command settles/repairs historical positions deterministically",
+        "risk/caps are enforced at open time, not advisory",
+        "forecast history exports to the vault"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_forecasts.py tests/test_paper_book.py -q"
+      ]
+    },
+    {
+      "id": "M8-015",
+      "title": "launchd soak: install/restart/uninstall cycle and log rotation",
+      "type": "ops",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "low",
+      "summary": "S4-P2-08 (C6/S3): the launchd service is installed and running but no long soak has validated install → crash → KeepAlive restart → stop → uninstall, log rotation/growth, or failure-retention plist behavior. Run the soak on the real machine and record evidence; do not fake results from a read-only audit.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "scripts/install-service.sh",
+        "scripts/uninstall-service.sh",
+        "scripts/com.institute-one.server.plist.template"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "48h soak: KeepAlive restarts after a kill, cron_metrics clean, no orphans",
+        "log growth is bounded or rotated",
+        "uninstall leaves no loaded job and no stale plist"
+      ],
+      "verification": [
+        "launchctl print gui/$UID/com.institute-one.server",
+        ".venv/bin/python -m app.cli doctor"
+      ]
+    },
+    {
+      "id": "M8-016",
+      "title": "Whiteboard session/workspace claim lease and reaper",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P1-03 (A5/F1): a failed board transaction can orphan the session/workspace it created, and a hard kill leaves a used topic claim with no lease/recovery. Add a claim lease + reaper (or widen the session+board atomic boundary) so crashes never leak workspaces or strand topics.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/whiteboard.py",
+        "tests/test_whiteboard.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a crash between session create and board insert is reaped (no orphan workspace)",
+        "a hard-killed kickoff releases or recovers the consumed topic claim"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_whiteboard.py -q"
+      ]
+    },
+    {
+      "id": "M8-017",
+      "title": "Vector health: degradation reasons, content reuse, model GC",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "low",
+      "summary": "S4-P1-04 (A8/S1): vector search mode cannot distinguish a healthy zero-hit from a degraded (Ollama-down) result; identical content embedded via different paths is not reused; superseded-model projections are hidden but never garbage-collected. Add a degradation reason/health surface, content-addressed embedding reuse, and old-model GC.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/vectors.py",
+        "tests/test_vectors.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "search responses expose why results degraded (fallback reason)",
+        "same content hash reuses its embedding across paths",
+        "old-model chunks are GC-able via an explicit maintenance path"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_vectors.py -q"
+      ]
+    },
+    {
+      "id": "M8-018",
+      "title": "Events retention policy and stale counter janitor",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P2-19 + S4-P2-15 (partial): the events table has no global retention (long-run growth), and per-day research-tree booked counters accumulate forever. Define the audit-retention requirement first, then extend the janitor with age-based event retention and 30-day counter cleanup.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/institute/scheduler.py",
+        "tests/test_cron_metrics.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "a documented retention window prunes events by age without breaking SSE cursors or exporter replays",
+        "booked counters older than 30 days are removed by the janitor"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_cron_metrics.py tests/test_research_tree.py -q"
+      ]
+    },
+    {
+      "id": "M8-019",
+      "title": "Interactive ask cancellation and optional bearer auth",
+      "type": "feature",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "done",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "S4-P3-01 = the two remaining ROADMAP Phase 0 opens: interactive asks still queue behind long workflow steps with no timeout/cancel/recoverable-task protocol (busy-hand preference or an interactive lane for source=api), and there is no optional INSTITUTE_TOKEN bearer middleware while INSTITUTE_HOST is settable.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/router/executor.py",
+        "app/api/tasks.py",
+        "app/main.py",
+        "app/config.py",
+        "tests/test_api_routes.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "an interactive ask can be cancelled and does not wait 30 min on a busy hand by default",
+        "INSTITUTE_TOKEN, when set (or host != 127.0.0.1), enforces bearer auth on the API"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_api_routes.py tests/test_executor.py -q"
+      ]
+    },
+    {
+      "id": "M8-020",
+      "title": "Deprecation, stale-comment and internal-convergence sweep",
+      "type": "ops",
+      "phase": "M8 Post-Audit Hardening",
+      "status": "inbox",
+      "priority": "P3",
+      "risk": "low",
+      "summary": "S4-P2-12 + S4-P1-05/02/06/07 + S4-P2-04 rolled up: burn down FastAPI lifespan/Pydantic v2/timezone-aware datetime/httpx transport deprecation warnings in batches; remove stale comments (e.g. the outdated 'A2 patch not landed' note in app/mcp.py) and re-verify README/CLAUDE/test-mount claims; converge internal APIs — public scheduler.inflight_jobs(), scorecard_time config instead of hardcoded 00:05, shared sync/stream ask prepare helper, one shared price helper for _usable_price/_adj_close. Facts-only sweep, never mixed with feature patches.",
+      "design_links": [
+        "ROUND4-AUDIT-S4.md"
+      ],
+      "expected_files": [
+        "app/mcp.py",
+        "app/institute/scheduler.py",
+        "app/institute/scorecard.py",
+        "app/api/tasks.py",
+        "app/api/ask_stream.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "deprecation warnings reduced batch by batch with no behavior change",
+        "stale comments/docs corrected against current code",
+        "shutdown stops probing APScheduler private structures"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
     }
   ]
 }

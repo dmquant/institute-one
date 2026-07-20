@@ -18,13 +18,23 @@ import {
 	errMsg,
 	exportSlug,
 	fileSlug,
+	isMissingEndpoint,
 	researchStatusIcon,
 	researchStatusZh,
 	sgtDate,
 	todayStr,
 } from "./api";
+import { AskStreamView, VIEW_TYPE_ASK_STREAM } from "./askstream";
 import { InstituteDashboardView, VIEW_TYPE_DASHBOARD } from "./dashboard";
-import { AskModal, MailModal, PickModal, PromptModal, VaultDoctorModal } from "./modals";
+import {
+	AskModal,
+	ClaimCheckModal,
+	DigestModal,
+	MailModal,
+	PickModal,
+	PromptModal,
+	VaultDoctorModal,
+} from "./modals";
 import { RoadmapView, VIEW_TYPE_ROADMAP } from "./roadmap";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +83,7 @@ export default class InstituteOnePlugin extends Plugin {
 		// ---- dashboard view ------------------------------------------------
 		this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new InstituteDashboardView(leaf, this));
 		this.registerView(VIEW_TYPE_ROADMAP, (leaf) => new RoadmapView(leaf, this));
+		this.registerView(VIEW_TYPE_ASK_STREAM, (leaf) => new AskStreamView(leaf, this));
 		this.addRibbonIcon("gauge", "Institute 仪表盘", () => void this.activateDashboard());
 		this.addRibbonIcon("columns-3", "Institute 路线图", () => void this.activateRoadmap());
 
@@ -93,6 +104,36 @@ export default class InstituteOnePlugin extends Plugin {
 			id: "ask",
 			name: "Institute: 提问 (Ask)",
 			callback: () => this.openAskModal(),
+		});
+
+		this.addCommand({
+			id: "ask-stream",
+			name: "Institute: 流式问答（侧边栏）",
+			callback: () => void this.activateAskStream(),
+		});
+
+		this.addCommand({
+			id: "claim-check-selection",
+			name: "Institute: 查证选中文本",
+			editorCallback: (editor) => void this.claimCheckCommand(editor),
+		});
+
+		this.addCommand({
+			id: "digest-recent-reports",
+			name: "Institute: 打开今日简报摘要",
+			callback: () => void this.openDigestCommand("reports"),
+		});
+
+		this.addCommand({
+			id: "digest-analyst-memory",
+			name: "Institute: 我的分析师记忆",
+			callback: () => void this.openDigestCommand("memory"),
+		});
+
+		this.addCommand({
+			id: "digest-analyst-disputes",
+			name: "Institute: 争议清单",
+			callback: () => void this.openDigestCommand("disputes"),
 		});
 
 		this.addCommand({
@@ -199,6 +240,110 @@ export default class InstituteOnePlugin extends Plugin {
 		if (!leaf) return;
 		await leaf.setViewState({ type: VIEW_TYPE_ROADMAP, active: true });
 		await workspace.revealLeaf(leaf);
+	}
+
+	async activateAskStream(): Promise<void> {
+		const { workspace } = this.app;
+		const existing = workspace.getLeavesOfType(VIEW_TYPE_ASK_STREAM);
+		if (existing.length > 0) {
+			await workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: VIEW_TYPE_ASK_STREAM, active: true });
+		await workspace.revealLeaf(leaf);
+	}
+
+	// ---- 查证选中文本 (claim check, Phase 3) -------------------------------------
+
+	async claimCheckCommand(editor: Editor): Promise<void> {
+		const selection = editor.getSelection()?.trim() ?? "";
+		const text = selection || paragraphAround(editor);
+		if (!text.trim()) {
+			new Notice("Institute: 没有选中文本，光标也不在段落内。");
+			return;
+		}
+		const notice = new Notice("Institute: 查证中…", 0);
+		try {
+			const result = await this.api.claimCheck(text);
+			notice.hide();
+			new ClaimCheckModal(this.app, text, result).open();
+		} catch (e) {
+			notice.hide();
+			if (isMissingEndpoint(e)) {
+				new Notice(
+					"Institute: 后端未启用写作时查证（fact-check v2）— 请升级并重启后端。",
+					8000,
+				);
+			} else {
+				new Notice(`Institute: 查证失败 — ${errMsg(e)}`, 8000);
+			}
+		}
+	}
+
+	// ---- digest 快捷命令（/api/institute/*.md） ------------------------------------
+
+	async openDigestCommand(kind: "reports" | "memory" | "disputes"): Promise<void> {
+		if (kind === "reports") {
+			await this.showDigest("近期报告摘要 (recent reports)", () =>
+				this.api.digestRecentReports(),
+			);
+			return;
+		}
+		// memory / disputes are per-analyst: pick one (default analyst listed first)
+		let roster: Analyst[];
+		try {
+			roster = await this.getRoster();
+		} catch (e) {
+			new Notice(`Institute: 无法加载分析师名册 — ${errMsg(e)}`, 8000);
+			return;
+		}
+		if (!roster.length) {
+			new Notice("Institute: 名册为空。");
+			return;
+		}
+		const preferred = this.settings.defaultAnalyst;
+		const items = [...roster].sort((a, b) =>
+			a.id === preferred ? -1 : b.id === preferred ? 1 : 0,
+		);
+		new PickModal(
+			this.app,
+			items,
+			(a) => `${a.emoji} ${a.name}（${a.id}）— ${a.focus}`,
+			(a) => {
+				if (kind === "memory") {
+					void this.showDigest(`分析师记忆 — ${a.name}`, () =>
+						this.api.digestAnalystMemory(a.id),
+					);
+				} else {
+					void this.showDigest(`争议清单 — ${a.name}`, () =>
+						this.api.digestAnalystDisputes(a.id),
+					);
+				}
+			},
+			"选择分析师…",
+		).open();
+	}
+
+	private async showDigest(title: string, fetchMd: () => Promise<string>): Promise<void> {
+		const notice = new Notice("Institute: 获取摘要中…", 0);
+		try {
+			const md = await fetchMd();
+			notice.hide();
+			if (!md.trim()) {
+				new Notice("Institute: 摘要为空。", 5000);
+				return;
+			}
+			new DigestModal(this.app, title, md).open();
+		} catch (e) {
+			notice.hide();
+			if (isMissingEndpoint(e)) {
+				new Notice("Institute: 后端未启用该摘要端点 — 请升级并重启后端。", 8000);
+			} else {
+				new Notice(`Institute: 获取摘要失败 — ${errMsg(e)}`, 8000);
+			}
+		}
 	}
 
 	// ---- roster cache ----------------------------------------------------------
@@ -671,6 +816,22 @@ export default class InstituteOnePlugin extends Plugin {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/** The paragraph around the cursor: expand from the cursor line to the
+ * nearest blank lines in both directions ("" when the cursor sits on a
+ * blank line). Used by claim-check when there is no selection. */
+function paragraphAround(editor: Editor): string {
+	const cur = editor.getCursor().line;
+	if (!editor.getLine(cur).trim()) return "";
+	let start = cur;
+	while (start > 0 && editor.getLine(start - 1).trim()) start--;
+	let end = cur;
+	const last = editor.lineCount() - 1;
+	while (end < last && editor.getLine(end + 1).trim()) end++;
+	const lines: string[] = [];
+	for (let i = start; i <= end; i++) lines.push(editor.getLine(i));
+	return lines.join("\n").trim();
+}
 
 /** First non-empty content line of a note body (skips frontmatter, strips #). */
 function firstContentLine(body: string): string {

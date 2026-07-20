@@ -69,9 +69,17 @@ def build_analyst_prompt(
     *,
     context_blocks: list[str] | None = None,
     output_file: str | None = None,
+    memory_block: str | None = None,
 ) -> str:
-    """The standard prompt sandwich: anchor → persona → context → task → mandates."""
+    """The standard prompt sandwich: anchor → persona → memory → context → task → mandates.
+
+    ``memory_block`` is the analyst's standing memory (see
+    ``institute.memory.memory_block``); it slots right after the persona so it
+    reads as part of who the analyst is, before any per-task context.
+    """
     parts = [date_anchor(), persona_block(analyst)]
+    if memory_block and memory_block.strip():
+        parts.append(memory_block.strip())
     for block in context_blocks or []:
         if block and block.strip():
             parts.append(block.strip())

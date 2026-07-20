@@ -8,7 +8,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from ..config import get_settings
-from ..institute import sessions
+from ..institute import memory, sessions
 from ..institute.analysts import get_analyst
 from ..institute.prompts import build_analyst_prompt
 from ..router import executor
@@ -71,7 +71,10 @@ async def post_message(session_id: str, body: MessageBody):
     if session["analyst_id"]:
         analyst = get_analyst(session["analyst_id"])
         if analyst is not None:
-            prompt = build_analyst_prompt(analyst, body.content)
+            prompt = build_analyst_prompt(
+                analyst, body.content,
+                memory_block=await memory.memory_block(analyst.id),
+            )
             hand = body.hand or analyst.hand or settings.default_hand
             model = analyst.model
 

@@ -28,6 +28,9 @@ from ..hands.registry import get_registry
 log = logging.getLogger("institute.executor")
 
 TERMINAL = {"completed", "failed", "rate_limited", "cancelled", "expired"}
+# Non-terminal tasks statuses; TERMINAL | ACTIVE is the full 0001 CHECK enum.
+# Canonical import point for API surfaces (e.g. /api/contract) — do not restate.
+ACTIVE = ("queued", "running")
 
 _global_sem: asyncio.Semaphore | None = None
 _hand_locks: dict[str, asyncio.Lock] = {}
@@ -47,6 +50,19 @@ def _hand_lock(name: str) -> asyncio.Lock:
     return _hand_locks[name]
 
 
+def hand_busy(name: str) -> bool:
+    """True while the per-hand mutex is held (a task is running on that hand).
+
+    Locks are created lazily by ``_hand_lock()``: a hand that never ran has no
+    lock and is not busy. Waiters do not hold the lock, so "busy" means one
+    task is actually executing; it says nothing about queue depth behind it.
+    Read-only — callers (interactive ask routing, ROADMAP Phase 0) use it to
+    prefer an idle hand instead of queueing behind a long workflow step.
+    """
+    lock = _hand_locks.get(name)
+    return lock is not None and lock.locked()
+
+
 @dataclass
 class Task:
     id: str
@@ -64,6 +80,8 @@ class Task:
     error: str | None = None
     artifacts: list[str] | None = None
     tried: list[str] | None = None
+    fallback_chain: list[str] | None = None  # persisted policy (0024); None = registry default
+    lineage_root: str | None = None          # original task of a retry chain (0024)
 
     @classmethod
     def from_row(cls, r: dict[str, Any]) -> "Task":
@@ -73,29 +91,70 @@ class Task:
             parent_run_id=r["parent_run_id"], workspace_dir=r["workspace_dir"] or "",
             exit_code=r["exit_code"], output=r["output"] or "", error=r["error"],
             artifacts=json.loads(r["artifacts"] or "[]"), tried=json.loads(r["tried"] or "[]"),
+            fallback_chain=json.loads(r["fallback_chain"]) if r["fallback_chain"] else None,
+            lineage_root=r["lineage_root"],
         )
 
 
+TRUNCATION_MARKER = "\n…[truncated]"
+
+
+def truncate_output(text: str, cap_bytes: int) -> str:
+    """Byte-aware cap on tasks.output (settings.output_cap_bytes).
+
+    The old char-based slice under-capped multi-byte (CJK) output by up to 4x
+    and truncated silently. This cuts on UTF-8 code-point boundaries and ends
+    with an explicit marker so readers know the output is partial.
+    """
+    if not text:
+        return text
+    raw = text.encode("utf-8")
+    if len(raw) <= cap_bytes:
+        return text
+    marker_bytes = len(TRUNCATION_MARKER.encode("utf-8"))
+    if cap_bytes <= marker_bytes:
+        # cap smaller than the marker itself: the marker would blow the cap,
+        # so degrade to a bare head slice (content beats an all-marker output)
+        return raw[: max(cap_bytes, 0)].decode("utf-8", errors="ignore")
+    keep = cap_bytes - marker_bytes
+    # errors="ignore" drops the tail bytes of a code point split by the cut
+    return raw[:keep].decode("utf-8", errors="ignore") + TRUNCATION_MARKER
+
+
 def compact_error(text: str, cap: int = 1000) -> str:
-    """Keep the most informative line first, cap total size."""
+    """Keep the head and tail (first + last lines), cap total size.
+
+    The old form promoted the last line to the front and appended a head
+    slice — reading order was inverted, and an overlong last line made the
+    budget negative, silently dropping the first line entirely.
+    """
     text = (text or "").strip()
     if len(text) <= cap:
         return text
-    lines = [l for l in text.splitlines() if l.strip()]
-    head = lines[-1] if lines else text[:200]
-    return (head + "\n…\n" + text[:cap - len(head) - 5]).strip()[:cap]
+    head_budget = max(1, cap * 3 // 5)
+    tail_budget = max(1, cap - head_budget - 3)  # 3 = len("\n…\n")
+    return f"{text[:head_budget].rstrip()}\n…\n{text[-tail_budget:].lstrip()}"[:cap]
 
 
 async def _create_row(
     *, task_id: str, hand: str, prompt: str, source: str, model: str | None,
     session_id: str | None, parent_run_id: str | None, workspace: Path, timeout_s: int,
+    fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
 ) -> None:
+    # fallback_chain/lineage_root persist the caller's actual execution policy
+    # and retry ancestry (0024): the retry endpoint replays the STORED chain
+    # instead of re-deriving it from live settings, and the 0024 partial
+    # unique index on lineage_root arbitrates duplicate live retries — this
+    # INSERT raises IntegrityError when the lineage already has a live task.
     await db.execute(
         """INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source,
-                              parent_run_id, workspace_dir, timeout_s, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                              parent_run_id, workspace_dir, timeout_s, fallback_chain,
+                              lineage_root, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (task_id, session_id, hand, model, prompt, "queued", source,
-         parent_run_id, str(workspace), timeout_s, bus.now_iso()),
+         parent_run_id, str(workspace), timeout_s,
+         None if fallback_chain is None else json.dumps(list(fallback_chain)),
+         lineage_root, bus.now_iso()),
     )
     await bus.emit("task.queued", "task", task_id, {"hand": hand, "source": source})
 
@@ -174,7 +233,7 @@ async def _execute(
             await _finish(task_id, "failed", error=compact_error(str(exc)), exit_code=-1)
             return await get_task(task_id)  # type: ignore[return-value]
 
-    output = (result.output or "")[: settings.output_cap_bytes]
+    output = truncate_output(result.output or "", settings.output_cap_bytes)
 
     if result.rate_limit is not None:
         registry.mark_rate_limited(hand.name, result.rate_limit)
@@ -229,6 +288,7 @@ async def submit(
     timeout_s: int | None = None,
     fallback: bool = True,
     fallback_chain: Sequence[str] | None = None,
+    lineage_root: str | None = None,
     on_chunk: OnChunk | None = None,
 ) -> Task:
     """Run a hand and wait for the result. THE way to invoke a model."""
@@ -240,6 +300,7 @@ async def submit(
         task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
         session_id=session_id, parent_run_id=parent_run_id, workspace=ws,
         timeout_s=timeout_s or settings.default_timeout_s,
+        fallback_chain=fallback_chain, lineage_root=lineage_root,
     )
     atask = asyncio.ensure_future(
         _execute(task_id, on_chunk=on_chunk, allow_fallback=fallback, fallback_chain=fallback_chain)
@@ -260,12 +321,14 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     on_chunk = kwargs.pop("on_chunk", None)
     fallback = kwargs.pop("fallback", True)
     fallback_chain = kwargs.pop("fallback_chain", None)
+    lineage_root = kwargs.pop("lineage_root", None)
     timeout_s = kwargs.pop("timeout_s", None) or settings.default_timeout_s
     await _create_row(
         task_id=task_id, hand=hand, prompt=prompt,
         source=kwargs.pop("source", "api"), model=kwargs.pop("model", None),
         session_id=kwargs.pop("session_id", None), parent_run_id=kwargs.pop("parent_run_id", None),
         workspace=ws, timeout_s=timeout_s,
+        fallback_chain=fallback_chain, lineage_root=lineage_root,
     )
     atask = asyncio.create_task(
         _execute(task_id, on_chunk=on_chunk, allow_fallback=fallback, fallback_chain=fallback_chain)
@@ -299,15 +362,58 @@ async def list_tasks(
 
 
 async def cancel(task_id: str) -> bool:
-    atask = _running.get(task_id)
-    if atask is not None and not atask.done():
-        atask.cancel()
-        return True
+    """Cancel ONE task — the per-task version of the shutdown drain's path.
+
+    Order matters (ROADMAP Phase 0 cancel protocol):
+
+    1. queued → conditional-claim the row straight to 'cancelled' FIRST,
+       then wake any submit/spawn parked on the semaphore / per-hand mutex.
+       The row flip must come first: cancelling the asyncio task alone would
+       surface CancelledError at the lock await — outside the executor's
+       CancelledError→_finish handler — leaving the row 'queued' forever.
+       With the row already terminal, the woken task (or, without a wake,
+       its eventual queued→running claim) has nothing left to persist.
+    2. running → cancel the in-flight asyncio task from ``_running``: the
+       hand kills its CLI process group (hands/base.run_subprocess) and the
+       executor's CancelledError handler persists status='cancelled' — the
+       exact mechanism the shutdown drain relies on, applied to one task.
+    3. running row with no live asyncio task (shouldn't happen; restart
+       residue is swept by recover_orphans) → flip the row directly so an
+       operator is never stuck on a phantom.
+
+    Returns False for terminal/unknown tasks (the API maps that to 409/404).
+    """
     n = await db.execute(
         "UPDATE tasks SET status='cancelled', finished_at=?, error='cancelled while queued' "
-        "WHERE id=? AND status IN ('queued','running')",
+        "WHERE id=? AND status='queued'",
         (bus.now_iso(), task_id),
     )
+    if n:
+        await bus.emit("task.cancelled", "task", task_id, {"status": "cancelled"})
+        # a submit/spawn parked on the semaphore/mutex would otherwise sit
+        # there until the lock frees, only to fail its claim; wake it now.
+        # Safe: the row is already terminal, so the CancelledError surfacing
+        # at the lock await has nothing left to persist.
+        atask = _running.get(task_id)
+        if atask is not None and not atask.done():
+            atask.cancel()
+        return True
+    atask = _running.get(task_id)
+    if atask is not None and not atask.done():
+        row = await db.query_one(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'running'", (task_id,)
+        )
+        if row:  # a terminal row with a not-yet-reaped asyncio task is left alone
+            atask.cancel()
+            return True
+        return False
+    n = await db.execute(
+        "UPDATE tasks SET status='cancelled', finished_at=?, error='cancelled by operator' "
+        "WHERE id=? AND status='running'",
+        (bus.now_iso(), task_id),
+    )
+    if n:
+        await bus.emit("task.cancelled", "task", task_id, {"status": "cancelled"})
     return n > 0
 
 

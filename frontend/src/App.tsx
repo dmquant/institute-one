@@ -4,6 +4,7 @@ import { useSSE } from "./useSSE";
 import { useLoad } from "./ui";
 import Dashboard from "./pages/Dashboard";
 import Tasks from "./pages/Tasks";
+import Ask from "./pages/Ask";
 import Workflows from "./pages/Workflows";
 import RunDetail from "./pages/RunDetail";
 import Whiteboard from "./pages/Whiteboard";
@@ -11,19 +12,34 @@ import BoardDetail from "./pages/BoardDetail";
 import Mailbox from "./pages/Mailbox";
 import ThreadDetail from "./pages/ThreadDetail";
 import Research from "./pages/Research";
+import Trees from "./pages/Trees";
+import Projects from "./pages/Projects";
+import Forecasts from "./pages/Forecasts";
+import MultiAgent from "./pages/MultiAgent";
 import Sessions from "./pages/Sessions";
 import Analysts from "./pages/Analysts";
+import Hands from "./pages/Hands";
+import CronHealth from "./pages/CronHealth";
+import Operator from "./pages/Operator";
 import Settings from "./pages/Settings";
 
 const NAV: { to: string; zh: string; en: string }[] = [
   { to: "/", zh: "总览", en: "Dashboard" },
   { to: "/tasks", zh: "任务", en: "Tasks" },
+  { to: "/ask", zh: "即问", en: "Ask" },
   { to: "/workflows", zh: "工作流", en: "Workflows" },
   { to: "/whiteboard", zh: "白板", en: "Whiteboard" },
   { to: "/mailbox", zh: "信箱", en: "Mailbox" },
   { to: "/research", zh: "深度研究", en: "Research" },
+  { to: "/trees", zh: "研究树", en: "Trees" },
+  { to: "/projects", zh: "项目", en: "Projects" },
+  { to: "/forecasts", zh: "预测账本", en: "Forecasts" },
+  { to: "/multi-agent", zh: "多智能体", en: "Multi-agent" },
   { to: "/sessions", zh: "会话", en: "Sessions" },
   { to: "/analysts", zh: "分析师", en: "Analysts" },
+  { to: "/hands", zh: "执行手", en: "Hands" },
+  { to: "/cron", zh: "定时任务", en: "Cron" },
+  { to: "/operator", zh: "运维", en: "Operator" },
   { to: "/settings", zh: "设置", en: "Settings" },
 ];
 
@@ -82,6 +98,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/tasks" element={<Tasks />} />
+            <Route path="/ask" element={<Ask />} />
             <Route path="/workflows" element={<Workflows />} />
             <Route path="/workflows/runs/:runId" element={<RunDetail />} />
             <Route path="/whiteboard" element={<Whiteboard />} />
@@ -90,9 +107,18 @@ export default function App() {
             <Route path="/mailbox/:threadId" element={<ThreadDetail />} />
             <Route path="/research" element={<Research />} />
             <Route path="/research/:itemId" element={<Research />} />
+            <Route path="/trees" element={<Trees />} />
+            <Route path="/trees/:treeId" element={<Trees />} />
+            <Route path="/projects" element={<Projects />} />
+            <Route path="/projects/:projectId" element={<Projects />} />
+            <Route path="/forecasts" element={<Forecasts />} />
+            <Route path="/multi-agent" element={<MultiAgent />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/sessions/:sessionId" element={<Sessions />} />
             <Route path="/analysts" element={<Analysts />} />
+            <Route path="/hands" element={<Hands />} />
+            <Route path="/cron" element={<CronHealth />} />
+            <Route path="/operator" element={<Operator />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

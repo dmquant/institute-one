@@ -4,11 +4,15 @@ import {
 	EventRow,
 	HandStatus,
 	MetaResult,
+	NavRow,
+	PaperPositionRow,
 	TaskRow,
+	TriageResult,
 	errMsg,
 	fmtClock,
 	fmtCountdown,
 	fmtElapsed,
+	isMissingEndpoint,
 	sgtDate,
 } from "./api";
 import type InstituteOnePlugin from "./main";
@@ -78,6 +82,13 @@ export class InstituteDashboardView extends ItemView {
 	private dailyEl!: HTMLElement;
 	private runningEl!: HTMLElement;
 	private eventsEl!: HTMLElement;
+	// collapsible extras (hidden entirely when the backend lacks the endpoints)
+	private triageWrapEl!: HTMLDetailsElement;
+	private triageSummaryEl!: HTMLElement;
+	private triageBodyEl!: HTMLElement;
+	private bookWrapEl!: HTMLDetailsElement;
+	private bookSummaryEl!: HTMLElement;
+	private bookBodyEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: InstituteOnePlugin) {
 		super(leaf);
@@ -120,6 +131,12 @@ export class InstituteDashboardView extends ItemView {
 		this.handsEl = this.section(root, "执行手");
 		this.dailyEl = this.section(root, "今日日报");
 		this.runningEl = this.section(root, "进行中");
+
+		[this.triageWrapEl, this.triageSummaryEl, this.triageBodyEl] =
+			this.collapsible(root, "操作台 triage");
+		[this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] =
+			this.collapsible(root, "纸面账本");
+
 		this.eventsEl = this.section(root, "最近事件");
 
 		// quick actions
@@ -155,6 +172,34 @@ export class InstituteDashboardView extends ItemView {
 		h.style.color = "var(--text-muted)";
 		h.style.marginBottom = "4px";
 		return wrap.createDiv();
+	}
+
+	/**
+	 * Collapsible section built ONCE (a native <details> keeps its open state
+	 * across refreshes because we only rewrite summary/body contents).
+	 * Returns [wrap, summaryText, body]; hide `wrap` when the backend lacks
+	 * the endpoint.
+	 */
+	private collapsible(
+		root: HTMLElement,
+		title: string,
+	): [HTMLDetailsElement, HTMLElement, HTMLElement] {
+		const wrap = root.createEl("details");
+		wrap.style.marginBottom = "12px";
+		const summary = wrap.createEl("summary");
+		summary.style.cursor = "pointer";
+		summary.style.listStyle = "revert";
+		const label = summary.createSpan({ text: title });
+		label.style.fontWeight = "600";
+		label.style.fontSize = "11px";
+		label.style.letterSpacing = "0.05em";
+		label.style.color = "var(--text-muted)";
+		const summaryText = summary.createSpan({ text: "" });
+		summaryText.style.fontSize = "12px";
+		summaryText.style.marginLeft = "6px";
+		const body = wrap.createDiv();
+		body.style.padding = "4px 0 0 12px";
+		return [wrap, summaryText, body];
 	}
 
 	private actionButton(parent: HTMLElement, text: string, onClick: () => void): void {
@@ -210,6 +255,8 @@ export class InstituteDashboardView extends ItemView {
 			]);
 			this.renderDaily(daily);
 			this.renderRunning(running, queued);
+
+			await Promise.all([this.refreshTriage(), this.refreshBook()]);
 
 			try {
 				await this.pollEvents();
@@ -338,6 +385,140 @@ export class InstituteDashboardView extends ItemView {
 			new Notice("Institute: 已启动全员日报（后台运行，完成后自动导出）。", 6000);
 		} catch (e) {
 			new Notice(`Institute: 启动全员日报失败 — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	// ---- 操作台 triage（Phase 6；旧后端 404 时整块隐藏） -------------------------------
+
+	private async refreshTriage(): Promise<void> {
+		let t: TriageResult;
+		try {
+			t = await this.plugin.api.triage();
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.triageWrapEl.style.display = "none";
+			} else {
+				this.triageWrapEl.style.display = "";
+				this.triageSummaryEl.setText("（获取失败）");
+				this.triageBodyEl.empty();
+				this.muted(this.triageBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.triageWrapEl.style.display = "";
+		this.triageBodyEl.empty();
+
+		const open = t.actions?.open ?? 0;
+		const paused = t.maintenance?.paused === true;
+		this.triageSummaryEl.setText(
+			`${open} 待处理 · ${paused ? "维护中 ⏸" : "运行中"}`,
+		);
+		this.triageSummaryEl.style.color = paused
+			? "var(--color-orange)"
+			: open > 0
+				? "var(--color-orange)"
+				: "var(--text-muted)";
+
+		const line = (text: string, warn = false) => {
+			const el = this.triageBodyEl.createDiv({ text });
+			el.style.padding = "1px 0";
+			if (warn) el.style.color = "var(--color-orange)";
+			return el;
+		};
+
+		if (paused) {
+			line(`维护暂停中 — 排队深度 ${t.maintenance?.drain_depth ?? 0}`, true);
+		}
+		const byKind = t.actions?.open_by_kind ?? {};
+		const kinds = Object.entries(byKind).sort((a, b) => b[1] - a[1]);
+		if (kinds.length) {
+			line(`待处理 action：${kinds.map(([k, n]) => `${k} ${n}`).join(" · ")}`);
+		} else {
+			line("没有待处理 action。");
+		}
+		const failing = t.cron?.failing ?? [];
+		if (failing.length) {
+			line(`失败的定时任务：${failing.join("、")}`, true);
+		}
+		const conflicts = t.vault?.conflicts ?? 0;
+		if (conflicts > 0) {
+			line(`vault 冲突笔记：${conflicts}`, true);
+		}
+		const switches = Object.entries(t.feature_switches ?? {});
+		const off = switches.filter(([, v]) => !v).map(([k]) => k);
+		if (off.length) {
+			line(`已关闭的开关：${off.join("、")}`);
+		}
+	}
+
+	// ---- 纸面账本（paper book；旧后端 404 时整块隐藏） -----------------------------------
+
+	private async refreshBook(): Promise<void> {
+		let nav: NavRow[];
+		let positions: PaperPositionRow[];
+		try {
+			[nav, positions] = await Promise.all([
+				this.plugin.api.bookNav(30),
+				this.plugin.api.bookPositions("open"),
+			]);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.bookWrapEl.style.display = "none";
+			} else {
+				this.bookWrapEl.style.display = "";
+				this.bookSummaryEl.setText("（获取失败）");
+				this.bookBodyEl.empty();
+				this.muted(this.bookBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.bookWrapEl.style.display = "";
+		this.bookBodyEl.empty();
+
+		const latest = nav.length ? nav[nav.length - 1] : null;
+		const fmtNav = (v: number | null | undefined) =>
+			v == null || !Number.isFinite(v) ? "—" : v.toFixed(4);
+		this.bookSummaryEl.setText(
+			latest
+				? `NAV ${fmtNav(latest.nav)} · 持仓 ${positions.length}`
+				: `尚无 NAV · 持仓 ${positions.length}`,
+		);
+		this.bookSummaryEl.style.color =
+			latest && latest.nav < 1 ? "var(--color-red)" : "var(--text-muted)";
+
+		const line = (text: string, warn = false) => {
+			const el = this.bookBodyEl.createDiv({ text });
+			el.style.padding = "1px 0";
+			if (warn) el.style.color = "var(--color-orange)";
+			return el;
+		};
+
+		if (latest) {
+			line(
+				`${latest.work_date} · NAV ${fmtNav(latest.nav)}` +
+					(latest.benchmark_nav != null
+						? ` · 基准 ${fmtNav(latest.benchmark_nav)}`
+						: "") +
+					` · 累计已实现 ${fmtNav(latest.realized_pnl_cum)}`,
+			);
+			if (latest.n_unpriced > 0) {
+				line(`⚠️ ${latest.n_unpriced} 个仓位无法定价（NAV 为部分口径）`, true);
+			}
+		} else {
+			line("MTM 任务尚未写入 NAV 历史。");
+		}
+		if (positions.length) {
+			for (const p of positions.slice(0, 6)) {
+				const dir = p.direction === "short" ? "空" : "多";
+				line(
+					`${dir} ${p.security_id ?? "?"} @ ${p.entry_price} · ${p.entry_date}`,
+				);
+			}
+			if (positions.length > 6) {
+				this.muted(this.bookBodyEl, `… 还有 ${positions.length - 6} 个持仓`);
+			}
+		} else {
+			line("当前无未平仓位。");
 		}
 	}
 
