@@ -30,10 +30,10 @@ ROADMAP Phase 3 (proposal §6.2 row 3). The pipeline:
    lines count; quotes/code fences are context, conflicts collapse
    conservatively UNVERIFIABLE > DISPUTED > VERIFIED; REVIEW-C1 P1-2). The
    verdict row and the card's terminal status commit in one transaction.
-5. **Disputed surfacing**: DISPUTED verdicts and self_contradicted cards open
-   a mailbox feedback thread to the claiming analyst (mailbox's public
-   ``create_thread``) and emit ``factcheck.disputed`` for the vault exporter
-   (handler in PATCH-NOTES-C1.md).
+5. **Disputed surfacing**: DISPUTED verdicts and self_contradicted cards write
+   a durable outbox intent in the same transaction as the dispute. The drain
+   atomically materializes one mailbox thread/note/dispatch and marks the row
+   delivered; ``factcheck.disputed`` remains the vault exporter signal.
 
 Scheduling is NOT wired here (scheduler.py / main.py are other partitions);
 the 30-min gated job and the ``register()`` call live in PATCH-NOTES-C1.md
@@ -74,6 +74,8 @@ EXTRACT_PER_TICK = 2           # extraction tasks one tick may run
 VERIFY_PER_TICK = 3            # verification tasks one tick may run (within the daily cap)
 STALE_RUNNING_MINUTES = 60     # extraction rows / verifying cards stuck longer are re-opened
 DEFAULT_DAILY_CAP = 10         # INSTITUTE_FACTCHECK_DAILY_CAP fallback (config field: PATCH-NOTES-C1)
+OUTBOX_MAX_ATTEMPTS = 5        # terminal failed after this many delivery attempts
+OUTBOX_PER_DRAIN = 20          # bounded scheduler batch
 CLAIM_CHECK_MIN_SIM = 0.75     # claim_check vector recall floor (loose on purpose: writing-time hints)
 KEYWORD_MIN_OVERLAP = 0.4      # claim_check keyword fallback: claim-token coverage floor
 CLAIM_CHECK_MAX_HITS = 5
@@ -426,28 +428,41 @@ async def extract_claims(
         state, related_fact_id, sim = await _reuse_state(vec, category)
         status = {"fresh": "pending", "reused": "reused", "self_contradicted": "self_contradicted"}[state]
         card_id = uuid.uuid4().hex[:12]
-        # the INSERT is the arbiter: OR IGNORE on content_hash makes re-runs
-        # of the same source a per-claim no-op (rowcount decides, A2 spirit)
-        n = await db.execute(
-            "INSERT OR IGNORE INTO fact_cards "
-            "(id, source_kind, source_ref, analyst_id, claim, category, status, related_fact_id, content_hash, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (card_id, source_kind, str(source_ref), analyst_id or None, claim, category,
-             status, related_fact_id, _content_hash(source_kind, str(source_ref), claim), bus.now_iso()),
-        )
-        if not n:
-            continue  # already extracted from this source
-        await _store_claim_vector(card_id, vec)
         row = {
             "id": card_id, "source_kind": source_kind, "source_ref": str(source_ref),
             "analyst_id": analyst_id or None, "claim": claim, "category": category,
             "status": status, "related_fact_id": related_fact_id, "similarity": round(sim, 4),
         }
+        # the INSERT is the arbiter: OR IGNORE on content_hash makes re-runs
+        # of the same source a per-claim no-op. A self-contradiction's outbox
+        # intent lands in THIS transaction with the terminal card.
+        outbox_id: str | None = None
+        async with db.transaction() as conn:
+            cur = await conn.execute(
+                "INSERT OR IGNORE INTO fact_cards "
+                "(id, source_kind, source_ref, analyst_id, claim, category, status, related_fact_id, content_hash, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (card_id, source_kind, str(source_ref), analyst_id or None, claim, category,
+                 status, related_fact_id, _content_hash(source_kind, str(source_ref), claim), bus.now_iso()),
+            )
+            inserted = bool(cur.rowcount)
+            await cur.close()
+            if inserted and state == "self_contradicted":
+                outbox_id = await _enqueue_dispute_outbox(
+                    conn, row, kind="self_contradicted",
+                    verdict_label=SELF_CONTRADICTED_LABEL,
+                    evidence=f"与已被驳斥的事实相似度 {sim:.3f}（fact {related_fact_id}）",
+                    sources="",
+                )
+        if not inserted:
+            continue  # already extracted from this source
+        await _store_claim_vector(card_id, vec)
         created.append(row)
         if state == "self_contradicted":
             await _surface_dispute(
                 row, kind="self_contradicted", verdict_label=SELF_CONTRADICTED_LABEL,
                 evidence=f"与已被驳斥的事实相似度 {sim:.3f}（fact {related_fact_id}）", sources="",
+                outbox_id=outbox_id,
             )
     if created:
         await bus.emit("factcheck.extracted", "factcheck", str(source_ref), {
@@ -658,9 +673,10 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
     now = bus.now_iso()
     fact_id = uuid.uuid4().hex[:12]
     status = verdict.lower()  # VERIFIED→verified / DISPUTED→disputed / UNVERIFIABLE→unverifiable
+    outbox_id: str | None = None
 
-    # one transaction: the terminal status and its verdict row land together,
-    # conditional on the claim WE hold (status='verifying').
+    # one transaction: terminal status + verdict row + (for DISPUTED) delivery
+    # intent land together, conditional on the claim WE hold.
     # NB: transaction() holds the db write lock — use the yielded conn
     # directly (db.execute/bus.emit in here would deadlock); events after.
     async with db.transaction() as conn:
@@ -680,6 +696,11 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
             (fact_id, card["id"], verdict, evidence, json.dumps(urls, ensure_ascii=False),
              work_date(), now, _now_plus_days(ttl_days)),
         )
+        if verdict == "DISPUTED":
+            outbox_id = await _enqueue_dispute_outbox(
+                conn, {**card, "related_fact_id": fact_id}, kind="disputed",
+                verdict_label=DISPUTED_LABEL, evidence=evidence, sources=" ".join(urls),
+            )
 
     await bus.emit("factcheck.verified", "fact_card", card["id"], {
         "fact_id": fact_id, "verdict": verdict, "category": card["category"],
@@ -690,53 +711,228 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
         await _surface_dispute(
             {**card, "related_fact_id": fact_id}, kind="disputed",
             verdict_label=DISPUTED_LABEL, evidence=evidence, sources=" ".join(urls),
+            outbox_id=outbox_id,
         )
     log.info("card %s verified: %s (%s)", card["id"], verdict, card["category"])
     return {"card_id": card["id"], "status": "completed", "verdict": verdict,
             "fact_id": fact_id, "task_id": task.id}
 
 
-# ---- disputed surfacing -------------------------------------------------------
+# ---- disputed surfacing + durable outbox -------------------------------------
+
+def _dispute_payload(
+    card: dict[str, Any], *, kind: str, verdict_label: str, evidence: str, sources: str,
+) -> dict[str, Any]:
+    return {
+        "subject": DISPUTE_MAIL_SUBJECT.format(claim_head=card["claim"][:40]),
+        "body": DISPUTE_MAIL_BODY.format(
+            claim=card["claim"],
+            source_kind=card["source_kind"], source_ref=card["source_ref"],
+            verdict_label=verdict_label,
+            evidence=evidence or "（无）", sources=sources or "（无）",
+        ),
+        "event": {
+            "kind": kind,
+            "claim": card["claim"][:500],
+            "category": card.get("category"),
+            "analyst_id": card.get("analyst_id"),
+            "source_kind": card.get("source_kind"),
+            "source_ref": card.get("source_ref"),
+            "related_fact_id": card.get("related_fact_id"),
+            "evidence": (evidence or "")[:1000],
+            "source_urls": sources or "",
+        },
+    }
+
+
+async def _enqueue_dispute_outbox(
+    conn: Any, card: dict[str, Any], *, kind: str, verdict_label: str,
+    evidence: str, sources: str,
+) -> str | None:
+    """Write one analyst-delivery intent using the caller's dispute transaction."""
+    recipient_id = str(card.get("analyst_id") or "")
+    if not recipient_id:
+        return None
+    outbox_id = uuid.uuid4().hex[:12]
+    dispute_id = f"{kind}:{card['id']}"
+    payload = json.dumps(
+        _dispute_payload(
+            card, kind=kind, verdict_label=verdict_label,
+            evidence=evidence, sources=sources,
+        ),
+        ensure_ascii=False,
+    )
+    cur = await conn.execute(
+        "INSERT OR IGNORE INTO factcheck_dispute_outbox "
+        "(id, dispute_id, fact_card_id, recipient_id, payload, status, attempts, created_at) "
+        "VALUES (?,?,?,?,?,'pending',0,?)",
+        (outbox_id, dispute_id, card["id"], recipient_id, payload, bus.now_iso()),
+    )
+    inserted = bool(cur.rowcount)
+    await cur.close()
+    if inserted:
+        return outbox_id
+    cur = await conn.execute(
+        "SELECT id FROM factcheck_dispute_outbox WHERE dispute_id=? AND recipient_id=?",
+        (dispute_id, recipient_id),
+    )
+    existing = await cur.fetchone()
+    await cur.close()
+    return str(existing["id"]) if existing else None
+
+
+async def _record_outbox_failure(row: dict[str, Any], error: str) -> str | None:
+    """Count one failed attempt with attempts as the CAS version."""
+    attempts = int(row["attempts"])
+    next_status = "failed" if attempts + 1 >= OUTBOX_MAX_ATTEMPTS else "pending"
+    n = await db.execute(
+        "UPDATE factcheck_dispute_outbox "
+        "SET attempts=attempts+1, status=?, last_error=? "
+        "WHERE id=? AND status='pending' AND attempts=?",
+        (next_status, error[:500], row["id"], attempts),
+    )
+    return next_status if n else None
+
+
+async def _deliver_dispute_outbox_row(row: dict[str, Any]) -> str | None:
+    """Persist exactly one mailbox notification and mark the row delivered.
+
+    The deterministic thread id is the mailbox-side idempotency key. Thread,
+    operator note, pending dispatch, attempt increment, and delivered marker
+    commit together, so a crash can expose either all of them or none.
+    """
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid outbox payload JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("subject") or not payload.get("body"):
+        raise ValueError("outbox payload requires subject and body")
+
+    from .analysts import get_analyst
+
+    if get_analyst(row["recipient_id"]) is None:
+        raise ValueError(f"unknown analyst {row['recipient_id']}")
+
+    thread_id = f"factcheck-{row['id']}"
+    now = bus.now_iso()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "UPDATE factcheck_dispute_outbox SET attempts=attempts+1 "
+            "WHERE id=? AND status='pending' AND attempts=? AND attempts<?",
+            (row["id"], int(row["attempts"]), OUTBOX_MAX_ATTEMPTS),
+        )
+        claimed = bool(cur.rowcount)
+        await cur.close()
+        if not claimed:
+            return None
+
+        cur = await conn.execute(
+            "INSERT OR IGNORE INTO mailbox_threads "
+            "(id, subject, analyst_id, status, created_at, updated_at) "
+            "VALUES (?,?,?,'open',?,?)",
+            (thread_id, str(payload["subject"]), row["recipient_id"], now, now),
+        )
+        created = bool(cur.rowcount)
+        await cur.close()
+        if created:
+            await conn.execute(
+                "INSERT INTO mailbox_messages "
+                "(thread_id, author, kind, body, status, created_at) "
+                "VALUES (?,'operator','note',?,'done',?)",
+                (thread_id, str(payload["body"]), now),
+            )
+            await conn.execute(
+                "INSERT INTO mailbox_messages "
+                "(thread_id, author, kind, body, status, created_at) "
+                "VALUES (?,?,'dispatch','','pending',?)",
+                (thread_id, row["recipient_id"], now),
+            )
+        else:
+            cur = await conn.execute(
+                "SELECT analyst_id FROM mailbox_threads WHERE id=?", (thread_id,)
+            )
+            existing = await cur.fetchone()
+            await cur.close()
+            if existing is None or existing["analyst_id"] != row["recipient_id"]:
+                raise RuntimeError(f"mailbox idempotency collision for {thread_id}")
+
+        await conn.execute(
+            "UPDATE factcheck_dispute_outbox "
+            "SET status='delivered', delivered_at=?, last_error=NULL "
+            "WHERE id=? AND status='pending'",
+            (now, row["id"]),
+        )
+    return thread_id
+
+
+async def drain_dispute_outbox(
+    limit: int = OUTBOX_PER_DRAIN, *, outbox_id: str | None = None,
+) -> dict[str, Any]:
+    """Retry pending analyst notifications without invoking a model.
+
+    This job only writes mailbox's durable pending dispatch. The separately
+    gated mailbox sweep starts the analyst model call.
+    """
+    result: dict[str, Any] = {
+        "delivered": 0, "retried": 0, "failed": 0, "thread_ids": {},
+    }
+    try:
+        result["failed"] += await db.execute(
+            "UPDATE factcheck_dispute_outbox "
+            "SET status='failed', last_error=COALESCE(last_error, 'retry limit reached') "
+            "WHERE status='pending' AND attempts>=?",
+            (OUTBOX_MAX_ATTEMPTS,),
+        )
+        params: list[Any] = []
+        sql = (
+            "SELECT * FROM factcheck_dispute_outbox "
+            "WHERE status='pending' AND attempts<?"
+        )
+        params.append(OUTBOX_MAX_ATTEMPTS)
+        if outbox_id is not None:
+            sql += " AND id=?"
+            params.append(outbox_id)
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(min(max(int(limit), 1), 200))
+        for row in await db.query(sql, params):
+            try:
+                thread_id = await _deliver_dispute_outbox_row(row)
+            except Exception as exc:  # noqa: BLE001 - one poison row must not stop the drain
+                log.warning("dispute outbox delivery failed for %s: %s", row["id"], exc)
+                state = await _record_outbox_failure(row, str(exc))
+                if state == "failed":
+                    result["failed"] += 1
+                elif state == "pending":
+                    result["retried"] += 1
+                continue
+            if thread_id:
+                result["delivered"] += 1
+                result["thread_ids"][row["id"]] = thread_id
+    except Exception:  # noqa: BLE001 - scheduler-driven, must not raise
+        log.exception("dispute outbox drain failed")
+    return result
 
 async def _surface_dispute(
     card: dict[str, Any], *, kind: str, verdict_label: str, evidence: str, sources: str,
+    outbox_id: str | None = None,
 ) -> None:
-    """DISPUTED verdicts and self_contradicted cards → mailbox feedback thread
-    to the claiming analyst + factcheck.disputed event (vault export handler:
-    PATCH-NOTES-C1.md). Never raises."""
+    """Best-effort immediate drain, then the existing dispute event. Never raises."""
     thread_id: str | None = None
-    analyst_id = card.get("analyst_id")
-    if analyst_id:
+    if outbox_id:
         try:
-            from . import mailbox  # lazy: domain peer, public API only
-            from .analysts import get_analyst
-
-            if get_analyst(analyst_id) is not None:
-                thread = await mailbox.create_thread(
-                    DISPUTE_MAIL_SUBJECT.format(claim_head=card["claim"][:40]),
-                    analyst_id,
-                    DISPUTE_MAIL_BODY.format(
-                        claim=card["claim"],
-                        source_kind=card["source_kind"], source_ref=card["source_ref"],
-                        verdict_label=verdict_label,
-                        evidence=evidence or "（无）", sources=sources or "（无）",
-                    ),
-                )
-                thread_id = thread.get("id") if isinstance(thread, dict) else None
-            else:
-                log.warning("dispute thread skipped: unknown analyst %s", analyst_id)
+            drained = await drain_dispute_outbox(limit=1, outbox_id=outbox_id)
+            thread_id = drained["thread_ids"].get(outbox_id)
         except Exception:  # noqa: BLE001 - surfacing must never break verification
-            log.exception("dispute mailbox thread failed for card %s", card.get("id"))
+            log.exception("immediate dispute outbox drain failed for card %s", card.get("id"))
+    payload = _dispute_payload(
+        card, kind=kind, verdict_label=verdict_label,
+        evidence=evidence, sources=sources,
+    )["event"]
+    payload["thread_id"] = thread_id
     try:
-        await bus.emit("factcheck.disputed", "fact_card", str(card.get("id") or ""), {
-            "kind": kind,  # disputed | self_contradicted
-            "claim": card["claim"][:500], "category": card.get("category"),
-            "analyst_id": analyst_id,
-            "source_kind": card.get("source_kind"), "source_ref": card.get("source_ref"),
-            "related_fact_id": card.get("related_fact_id"),
-            "evidence": (evidence or "")[:1000], "source_urls": sources or "",
-            "thread_id": thread_id,
-        })
+        await bus.emit(
+            "factcheck.disputed", "fact_card", str(card.get("id") or ""), payload,
+        )
     except Exception:  # noqa: BLE001
         log.exception("factcheck.disputed emit failed for card %s", card.get("id"))
 
@@ -1095,3 +1291,30 @@ async def get_card(card_id: str) -> dict[str, Any] | None:
             pass
     card["fact"] = fact
     return card
+
+
+async def outbox_overview(limit: int = 50) -> dict[str, Any]:
+    """Pending/failed counts plus newest delivery rows for operators."""
+    counts = await db.query_one(
+        "SELECT "
+        "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending, "
+        "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed, "
+        "SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered "
+        "FROM factcheck_dispute_outbox"
+    ) or {}
+    rows = await db.query(
+        "SELECT * FROM factcheck_dispute_outbox "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
+        (min(max(int(limit), 1), 200),),
+    )
+    for row in rows:
+        try:
+            row["payload"] = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            pass
+    return {
+        "pending": int(counts.get("pending") or 0),
+        "failed": int(counts.get("failed") or 0),
+        "delivered": int(counts.get("delivered") or 0),
+        "recent": rows,
+    }

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import sqlite3
-from pathlib import Path
-from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -64,27 +61,6 @@ async def cancel_task(task_id: str):
     return {"cancelled": True}
 
 
-def _retry_policy(source: str, requested_hand: str) -> tuple[str, dict[str, Any]]:
-    """Source-derivation FALLBACK for rows whose stored chain is NULL.
-
-    Rows written since 0024 persist the actual fallback_chain and never come
-    here — retry_task replays the stored policy verbatim. NULL-chain rows are
-    either pre-0024 legacy rows or callers that used the registry default:
-    - source='research' (research workflow steps): confined to
-      settings.research_hand_names with the chain as fallback, mirroring
-      workflows._workflow_hand_policy (CLAUDE.md rule 10 — research stays on
-      codex+agy). If the stored hand fell out of the configured chain, use
-      the chain head instead of leaking onto a forbidden hand.
-    - every other source: registry-default fallback (fallback=True, no chain),
-      which is what a NULL chain means for every current production caller.
-    """
-    if source == "research":
-        hands = get_settings().research_hand_names
-        hand = requested_hand if requested_hand in hands else hands[0]
-        return hand, {"fallback_chain": hands}
-    return requested_hand, {}
-
-
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str):
     """Requeue a failed task (incl. 'orphaned by restart') as a NEW row.
@@ -92,7 +68,7 @@ async def retry_task(task_id: str):
     The new row references the original prompt/hand/session/workspace and
     replays the original row's PERSISTED fallback_chain (0024) — policy
     fidelity holds across process restarts and settings changes; rows with a
-    NULL stored chain fall back to the source derivation in _retry_policy.
+    NULL stored chain fall back to the executor's legacy source derivation.
 
     lineage_root points every generation of a retry chain at the original
     task (a retry of a retry keeps the same root — one-lookup audit), and the
@@ -116,25 +92,8 @@ async def retry_task(task_id: str):
         raise HTTPException(
             409, f"a retry for this lineage is already live (task {live['id']})",
         )
-    if row["fallback_chain"] is not None:
-        # replay the persisted policy — never re-derive from live settings
-        hand = row["requested_hand"]
-        policy: dict[str, Any] = {"fallback_chain": json.loads(row["fallback_chain"])}
-    else:
-        hand, policy = _retry_policy(row["source"], row["requested_hand"])
-    # an explicit model never crosses a hand family boundary (same rule as
-    # the executor's fallback path)
-    model = row["model"] if hand == row["requested_hand"] else None
     try:
-        new_id = await executor.spawn(
-            hand, row["prompt"],
-            source=row["source"], model=model,
-            session_id=row["session_id"], parent_run_id=row["parent_run_id"],
-            workspace=Path(row["workspace_dir"]) if row["workspace_dir"] else None,
-            timeout_s=row["timeout_s"],
-            lineage_root=lineage_root,
-            **policy,
-        )
+        new_id, lineage_root = await executor.respawn_from_row(row)
     except sqlite3.IntegrityError:
         # lost the pre-check race (same instant, other process): the 0024
         # unique index arbitrated — exactly one live retry per lineage

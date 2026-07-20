@@ -558,7 +558,7 @@ export interface TreeNode {
   status: TreeNodeStatus;
   task_id: string | null;
   summary: string | null;
-  score: number | null; // reserved column, unwritten for now
+  score: number | null; // canonical SCORE line, 0-100; malformed/missing -> null
   created_at: string;
   finished_at: string | null;
 }
@@ -850,6 +850,8 @@ export const getTree = (id: string) => req<ResearchTreeDetail>(`/api/research/tr
 export const createTree = (root_topic: string, max_depth = 2, max_nodes = 12) =>
   post<CreateTreeResult>("/api/research/tree", { root_topic, max_depth, max_nodes });
 export const stopTree = (id: string) => post<ResearchTreeDetail>(`/api/research/tree/${id}/stop`);
+export const retryTreeNode = (treeId: string, nodeId: string) =>
+  post<ResearchTreeDetail>(`/api/research/tree/${treeId}/node/${nodeId}/retry`);
 
 // projects (Phase 7 containers)
 export const listProjects = (status?: string, limit = 100) =>

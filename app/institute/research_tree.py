@@ -30,8 +30,9 @@ The loop (house rules throughout):
    stays on the research hands (hard rule 10): round-robin over
    ``settings.research_hand_names`` with the fallback chain confined to it.
 4. **parse_explore()** is canonical-line extraction (the C1 VERDICT / C4
-   precedent): only line-anchored ``CONCLUSION:`` / ``CHILD: <topic> |
-   <question>`` lines count; code fences and blockquotes are quoted material;
+   precedent): only line-anchored ``CONCLUSION:``, ``SCORE:`` and
+   ``CHILD: <topic> | <question>`` lines count; code fences and blockquotes
+   are quoted material;
    placeholder mimics (``<子主题>``, and the ``<一段结论>`` conclusion form —
    REVIEW-D4 N1) are dropped; children are deduped and capped. Echo immunity
    is structural: the prompt never places a protocol token at line start
@@ -57,14 +58,16 @@ The loop (house rules throughout):
    FINAL SNAPSHOT: emitted only when the tree is terminal
    (completed/failed/stopped) AND drained (no pending/running nodes), via a
    conditional claim on the ``announced_at`` column — exactly one event per
-   tree, payload read from the database rows after the terminal state is
-   durable. Crash recovery: ``recover_orphans()`` at boot prunes running
+   drain generation (a manual failed-node retry starts a new generation),
+   payload read from the database rows after the terminal state is durable.
+   Crash recovery: ``recover_orphans()`` at boot prunes running
    nodes under terminal trees and requeues the rest (mount in
    PATCH-NOTES-D4.md); the tick sweep settles/announces whatever a crash
    left unflipped or unannounced.
 
 Bus events (SSE-visible via /api/events/stream?types=tree.):
-``tree.node_completed`` (every node reaching completed/failed) and
+``tree.node_completed`` (every node reaching completed/failed),
+``tree.node_retried`` (an operator requeues one failed node), and
 ``tree.completed`` (the drained terminal snapshot described above).
 """
 from __future__ import annotations
@@ -73,6 +76,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import re
 import uuid
 from typing import Any
@@ -96,6 +100,7 @@ TREE_TERMINAL = ("completed", "stopped", "failed")
 NODE_LIVE = ("pending", "running")
 
 NODE_COMPLETED_EVENT = "tree.node_completed"
+NODE_RETRIED_EVENT = "tree.node_retried"
 TREE_COMPLETED_EVENT = "tree.completed"
 
 MAX_CHILDREN_PER_NODE = 3      # line-protocol children accepted per node
@@ -120,7 +125,7 @@ TREES_BOOKED_KEY_PREFIX = "research_tree_booked:"
 
 # ---- prompt constant (verbatim-stable once written; CLAUDE.md rule 4) --------
 # Echo immunity by construction: no line of this template starts with a
-# protocol token (CONCLUSION:/CHILD: appear only mid-line, inside 「」), and
+# protocol token (CONCLUSION:/SCORE:/CHILD: appear only mid-line, inside 「」), and
 # every {placeholder} is filled with _quote_material-neutralized text — so a
 # hand that mirrors the prompt back can never produce a canonical line.
 
@@ -134,10 +139,12 @@ EXPLORE_PROMPT = """\
 
 【任务】
 1. 结合父节点结论链的已有认识，针对当前主题与核心问题给出一段简要研究结论（200 字以内，讲清关键事实、你的判断与依据）；
-2. 提出最多 {max_children} 个最值得下钻的子问题——只提能实质推进整体研究、且与父节点已覆盖内容不重复的方向；没有值得下钻的方向就一个都不提。
+2. 对本节点结论相对根主题的研究价值打 0–100 分（越高越值得优先阅读）；
+3. 提出最多 {max_children} 个最值得下钻的子问题——只提能实质推进整体研究、且与父节点已覆盖内容不重复的方向；没有值得下钻的方向就一个都不提。
 
 【输出格式】只输出以下行协议，不要任何其他文字：
 第一行输出结论行，格式是「CONCLUSION: <一段结论>」（独占一行）；
+第二行输出评分行，格式是「SCORE: <0-100>」（独占一行，只写数字）；
 随后每个子问题独占一行，格式是「CHILD: <子主题> | <子问题>」——子主题不超过 30 字，子问题是一句可直接研究的问题。\
 """
 
@@ -148,8 +155,12 @@ NO_QUESTION_LABEL = "（未指定，围绕主题自由探索）"
 
 _FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
 _CONCLUSION_LINE = re.compile(r"^\s*\**\s*CONCLUSION\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
+_SCORE_LINE = re.compile(r"^\s*\**\s*SCORE\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
+_SCORE_VALUE = re.compile(
+    r"^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:(?:/|／)\s*100|[%％]|分)?$"
+)
 _CHILD_LINE = re.compile(r"^\s*\**\s*CHILD\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
-_PROTOCOL_GUARD = re.compile(r"(CONCLUSION|CHILD)(\s*[:：])", re.IGNORECASE)
+_PROTOCOL_GUARD = re.compile(r"(CONCLUSION|SCORE|CHILD)(\s*[:：])", re.IGNORECASE)
 
 
 def _quote_material(text: str) -> str:
@@ -157,7 +168,8 @@ def _quote_material(text: str) -> str:
     (the C1 ``_quote_material`` / C4 ``_quote_detail`` precedent). Collapsing
     whitespace keeps the material inline after its 【标签】/list label so
     nothing from it can sit at line start; breaking the ``CONCLUSION:`` /
-    ``CHILD:`` patterns is belt and braces for hands that re-wrap lines."""
+    ``SCORE:`` / ``CHILD:`` patterns is belt and braces for hands that
+    re-wrap lines."""
     flat = " ".join((text or "").split())
     return _PROTOCOL_GUARD.sub(r"\1 -\2", flat)
 
@@ -168,20 +180,40 @@ def _is_placeholder(text: str) -> bool:
     return text.startswith("<") and text.endswith(">")
 
 
+def _parse_score_payload(payload: str) -> float | None:
+    """Parse the canonical score payload, or return None without raising.
+
+    Score contract: ``SCORE: N`` is the model's 0–100 self-assessment of this
+    node conclusion's research value relative to the root topic. ``N%``,
+    ``N/100`` and ``N分`` are tolerated, but prose, non-finite values and
+    out-of-range numbers are rejected. The database therefore stores either
+    a comparable 0–100 REAL or NULL — malformed model output never fails the
+    node.
+    """
+    m = _SCORE_VALUE.fullmatch(payload.strip())
+    if m is None:
+        return None
+    try:
+        score = float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) and 0 <= score <= 100 else None
+
+
 def parse_explore(text: str) -> dict[str, Any]:
-    """Model output -> {"conclusion": str, "children": [{"topic","question"}]}.
+    """Model output -> conclusion + optional score + child questions.
 
     Canonical-line extraction only: line-anchored ``CONCLUSION:`` /
-    ``CHILD:`` (markdown bold and full-width colons tolerated), lines inside
-    code fences or blockquotes are quoted material and are skipped. The
-    conclusion is the FIRST canonical line whose payload is not a
-    ``<placeholder>`` mimic (REVIEW-D4 N1); children split on the first
-    ``|``/``｜`` (a missing separator degrades to a topic-only child),
+    ``SCORE:`` / ``CHILD:`` (markdown bold and full-width colons tolerated),
+    lines inside code fences or blockquotes are quoted material and are
+    skipped. The conclusion and score are the FIRST valid canonical lines;
+    malformed/missing scores stay ``None``. Children split on the first
+    ``|``/``｜`` (a missing separator degrades to a topic-only child);
     placeholder mimics are dropped, topics are deduped case-insensitively
     and capped at MAX_CHILDREN_PER_NODE. Any failure mode returns what was
     salvageable — never raises.
     """
-    out: dict[str, Any] = {"conclusion": "", "children": []}
+    out: dict[str, Any] = {"conclusion": "", "score": None, "children": []}
     if not (text or "").strip():
         return out
     seen: set[str] = set()
@@ -197,6 +229,11 @@ def parse_explore(text: str) -> dict[str, Any]:
             candidate = m.group(1).strip("* ").strip()
             if not out["conclusion"] and candidate and not _is_placeholder(candidate):
                 out["conclusion"] = candidate[:SUMMARY_CAP]
+            continue
+        m = _SCORE_LINE.match(line)
+        if m:
+            if out["score"] is None:
+                out["score"] = _parse_score_payload(m.group(1).strip("* ").strip())
             continue
         m = _CHILD_LINE.match(line)
         if m is None:
@@ -526,9 +563,11 @@ async def _maybe_finish_tree(tree_id: str) -> bool:
 
 
 async def _announce_if_drained(tree_id: str) -> bool:
-    """Emit the ONE ``tree.completed`` final snapshot (REVIEW-D4 M2/H2).
+    """Emit one ``tree.completed`` final snapshot per drain generation.
 
-    The conditional claim on ``announced_at`` is the single-shot arbiter:
+    The conditional claim on ``announced_at`` is the generation's single-shot
+    arbiter (``retry_node`` deliberately clears it when reopening a terminal
+    tree):
     it only fires when the tree is terminal AND drained (no pending/running
     nodes left — a stopped tree with naturally-finishing running nodes waits
     for its last finisher). The payload is read from the database AFTER the
@@ -609,6 +648,7 @@ async def _run_node(node: dict[str, Any]) -> str:
 
     parsed = parse_explore(task.output or "")
     summary = parsed["conclusion"] or " ".join((task.output or "").split())[:SUMMARY_CAP]
+    score = parsed["score"]
     added = pruned = 0
     completed = False
     # one transaction: parent terminal write FIRST, then its children — the
@@ -616,9 +656,9 @@ async def _run_node(node: dict[str, Any]) -> str:
     # commit (bus.emit inside the transaction would deadlock on the write lock).
     async with db.transaction() as conn:
         cur = await conn.execute(
-            "UPDATE research_tree_nodes SET status='completed', task_id=?, summary=?, finished_at=? "
+            "UPDATE research_tree_nodes SET status='completed', task_id=?, summary=?, score=?, finished_at=? "
             "WHERE id = ? AND status = 'running'",
-            (task.id, summary, bus.now_iso(), node_id),
+            (task.id, summary, score, bus.now_iso(), node_id),
         )
         claimed_completion = cur.rowcount
         await cur.close()
@@ -630,7 +670,7 @@ async def _run_node(node: dict[str, Any]) -> str:
             "tree_id": tree_id, "node_id": node_id, "depth": node["depth"],
             "topic": node["topic"], "status": "completed", "task_id": task.id,
             "children_added": added, "children_pruned": pruned,
-            "summary": summary[:300],
+            "summary": summary[:300], "score": score,
         })
     else:
         log.info("node %s no longer running; discarding result batch (no children inserted)",
@@ -721,6 +761,94 @@ async def recover_orphans() -> int:
     if n:
         log.warning("requeued %d research tree nodes orphaned by restart", n)
     return stranded + n
+
+
+# ---- failed-node retry -------------------------------------------------------
+
+class TransitionConflict(RuntimeError):
+    """A research-tree state transition is not currently allowed (API: 409)."""
+
+
+async def retry_node(tree_id: str, node_id: str) -> dict[str, Any]:
+    """Requeue exactly one failed node for the normal BFS drain.
+
+    This is deliberately a bounded manual retry, not an automatic retry loop:
+    only ``failed -> pending`` is accepted, so a duplicate/concurrent request
+    sees the already-pending node and conflicts. A stopped tree remains final.
+    Retrying a node from a completed/failed tree atomically reopens the tree as
+    ``exploring`` and clears its final-snapshot markers; after the new attempt
+    drains, the normal arbiter emits a fresh ``tree.completed`` snapshot.
+    """
+    previous_tree_status = ""
+    depth = 0
+    topic = ""
+    async with db.transaction() as conn:
+        # This conditional UPDATE is the arbiter and the first mutable
+        # statement, so concurrent callers cannot both win.
+        cur = await conn.execute(
+            "UPDATE research_tree_nodes "
+            "SET status='pending', task_id=NULL, summary=NULL, score=NULL, finished_at=NULL "
+            "WHERE id = ? AND tree_id = ? AND status = 'failed' "
+            "AND EXISTS (SELECT 1 FROM research_trees t "
+            "            WHERE t.id = ? AND t.status != 'stopped')",
+            (node_id, tree_id, tree_id),
+        )
+        claimed = cur.rowcount
+        await cur.close()
+        if not claimed:
+            cur = await conn.execute(
+                "SELECT status FROM research_trees WHERE id = ?", (tree_id,)
+            )
+            tree = await cur.fetchone()
+            await cur.close()
+            if tree is None:
+                raise LookupError(f"research tree {tree_id} not found")
+            cur = await conn.execute(
+                "SELECT status FROM research_tree_nodes WHERE id = ? AND tree_id = ?",
+                (node_id, tree_id),
+            )
+            node = await cur.fetchone()
+            await cur.close()
+            if node is None:
+                raise LookupError(f"research tree node {node_id} not found in tree {tree_id}")
+            if node["status"] != "failed":
+                raise TransitionConflict(
+                    f"only failed research tree nodes can be retried (status: {node['status']})"
+                )
+            raise TransitionConflict(f"research tree {tree_id} is stopped and cannot be retried")
+
+        cur = await conn.execute(
+            "SELECT depth, topic FROM research_tree_nodes WHERE id = ?", (node_id,)
+        )
+        node = await cur.fetchone()
+        await cur.close()
+        cur = await conn.execute(
+            "SELECT status FROM research_trees WHERE id = ?", (tree_id,)
+        )
+        tree = await cur.fetchone()
+        await cur.close()
+        depth = int(node["depth"])
+        topic = str(node["topic"])
+        previous_tree_status = str(tree["status"])
+        cur = await conn.execute(
+            "UPDATE research_trees "
+            "SET status='exploring', finished_at=NULL, announced_at=NULL "
+            "WHERE id = ? AND status IN ('completed','failed')",
+            (tree_id,),
+        )
+        await cur.close()
+
+    await bus.emit(NODE_RETRIED_EVENT, "research_tree", tree_id, {
+        "tree_id": tree_id,
+        "node_id": node_id,
+        "depth": depth,
+        "topic": topic,
+        "status": "pending",
+        "previous_tree_status": previous_tree_status,
+    })
+    tree = await get_tree(tree_id)
+    assert tree is not None  # protected by the node FK and transaction above
+    return tree
 
 
 # ---- stop ---------------------------------------------------------------------

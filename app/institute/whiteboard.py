@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import math
+import shutil
 import struct
 import uuid
 from datetime import datetime, timedelta
@@ -44,6 +45,9 @@ BOARD_STATUSES = ("active", "completed", "stopped", "failed")
 MAX_ACTIVE_BOARDS = 2
 DEFAULT_MAX_CARDS = 5
 HANDOFF_TIMEOUT_S = 300
+TOPIC_CLAIM_LEASE_S = 45 * 60
+ORPHAN_SESSION_GRACE_S = 60 * 60
+TOPIC_CLAIM_PREFIX = "whiteboard_topic_claim:"
 
 # ---- similarity gate + diversity pick (Phase 1a) --------------------------
 # Thresholds/knobs live in admin_state (key below) as one JSON row seeded by
@@ -126,6 +130,146 @@ async def expire_topic(topic_id: int) -> bool:
         "UPDATE topic_pool SET status='expired' WHERE id=? AND status='pending'", (topic_id,)
     )
     return n > 0
+
+
+# ---- topic claim lease + orphan reaper ------------------------------------
+
+def _topic_claim_key(topic_id: int) -> str:
+    return f"{TOPIC_CLAIM_PREFIX}{topic_id}"
+
+
+def _topic_claim_token(owner: str) -> str:
+    return json.dumps({"owner": owner, "claimed_at": bus.now_iso()})
+
+
+def _topic_claim_live(value: str, key: str) -> bool:
+    try:
+        claimed_at = datetime.fromisoformat(json.loads(value)["claimed_at"])
+        age_s = (datetime.fromisoformat(bus.now_iso()) - claimed_at).total_seconds()
+        if age_s < 0:
+            log.warning("topic claim %s has a future claimed_at (%s); treating as stale", key, claimed_at)
+        return 0 <= age_s < TOPIC_CLAIM_LEASE_S
+    except (ValueError, KeyError, TypeError):
+        return False  # corrupt claims must not wedge a topic forever
+
+
+async def _claim_topic(topic_id: int) -> tuple[str, str] | None:
+    """Claim a pool topic, taking over an expired claim with an exact-value CAS."""
+    key = _topic_claim_key(topic_id)
+    token = _topic_claim_token(uuid.uuid4().hex[:12])
+    n = await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+        (key, token),
+    )
+    if n:
+        return key, token
+
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
+    if row is None:  # released between INSERT and SELECT; retry on the next kickoff
+        return None
+    if _topic_claim_live(row["value"], key):
+        return None
+    n = await db.execute(
+        "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
+        (token, key, row["value"]),
+    )
+    return (key, token) if n else None
+
+
+async def _release_topic_claim(key: str, token: str) -> None:
+    # A timed-out zombie must not erase the newer owner's takeover claim.
+    await db.execute("DELETE FROM admin_state WHERE key = ? AND value = ?", (key, token))
+
+
+async def reap_orphans() -> dict[str, int]:
+    """Reap stale topic claims and old whiteboard sessions with no board.
+
+    The session has no status column, so a board row is its durable lifecycle
+    marker. A board-less session is reaped only after one hour, when it has
+    also seen no recent touch and owns no live task. Never raises.
+    """
+    stats = {
+        "claims_reaped": 0,
+        "topics_requeued": 0,
+        "sessions_reaped": 0,
+        "workspaces_reaped": 0,
+    }
+    try:
+        claims = await db.query(
+            "SELECT key, value FROM admin_state WHERE substr(key, 1, ?) = ?",
+            (len(TOPIC_CLAIM_PREFIX), TOPIC_CLAIM_PREFIX),
+        )
+        for row in claims:
+            if _topic_claim_live(row["value"], row["key"]):
+                continue
+            deleted = await db.execute(
+                "DELETE FROM admin_state WHERE key = ? AND value = ?",
+                (row["key"], row["value"]),
+            )
+            if not deleted:
+                continue
+            stats["claims_reaped"] += 1
+            try:
+                topic_id = int(row["key"][len(TOPIC_CLAIM_PREFIX):])
+            except ValueError:
+                log.warning("reaped malformed whiteboard topic claim key %r", row["key"])
+                continue
+            try:
+                claimed_board_id = str(json.loads(row["value"])["owner"])
+            except (ValueError, KeyError, TypeError):
+                claimed_board_id = ""
+            # Compatibility repair for crashes under the old status='used'
+            # claim. For new claims, owner is the reserved board id, giving the
+            # reaper an exact no-migration link from claim to landed board.
+            stats["topics_requeued"] += await db.execute(
+                "UPDATE topic_pool SET status='pending' "
+                "WHERE id=? AND status='used' "
+                "AND NOT EXISTS (SELECT 1 FROM whiteboard_boards WHERE id=?)",
+                (topic_id, claimed_board_id),
+            )
+    except Exception:  # noqa: BLE001 - cleanup must never block kickoff
+        log.exception("whiteboard topic-claim reaper failed")
+
+    try:
+        cutoff = _iso_ago(hours=ORPHAN_SESSION_GRACE_S / 3600)
+        sessions = await db.query(
+            "SELECT id, workspace_dir FROM sessions s "
+            "WHERE kind='whiteboard' AND created_at < ? AND updated_at < ? "
+            "AND NOT EXISTS (SELECT 1 FROM whiteboard_boards b WHERE b.session_id=s.id) "
+            "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.session_id=s.id "
+            "                AND t.status IN ('queued','running'))",
+            (cutoff, cutoff),
+        )
+        root = get_settings().workspaces_dir.resolve()
+        for session in sessions:
+            deleted = await db.execute(
+                "DELETE FROM sessions WHERE id=? AND kind='whiteboard' "
+                "AND created_at < ? AND updated_at < ? "
+                "AND NOT EXISTS (SELECT 1 FROM whiteboard_boards b "
+                "                WHERE b.session_id=sessions.id) "
+                "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.session_id=sessions.id "
+                "                AND t.status IN ('queued','running'))",
+                (session["id"], cutoff, cutoff),
+            )
+            if not deleted:
+                continue
+            stats["sessions_reaped"] += 1
+            workspace = Path(session["workspace_dir"])
+            try:
+                resolved = workspace.resolve()
+                if resolved == root or not resolved.is_relative_to(root):
+                    log.error("refusing to remove unsafe orphan workspace %s", workspace)
+                elif workspace.exists():
+                    await asyncio.to_thread(shutil.rmtree, workspace)
+                    stats["workspaces_reaped"] += 1
+            except (OSError, RuntimeError):
+                log.exception("could not remove orphan whiteboard workspace %s", workspace)
+    except Exception:  # noqa: BLE001 - cleanup must never block kickoff
+        log.exception("whiteboard session reaper failed")
+
+    if any(stats.values()):
+        log.info("whiteboard reaper: %s", stats)
+    return stats
 
 
 # ---- similarity config + category weights ---------------------------------
@@ -450,24 +594,17 @@ def _match_root_analyst(text: str) -> str:
     return rid
 
 
-async def _create_board_session(board_id: str, topic: str) -> str:
-    title = f"WB {topic}"
-    try:
-        from . import sessions  # lazy: parallel module, soft coupling
-
-        sess = await sessions.create_session(kind="whiteboard", title=title)
-        return sess["id"] if isinstance(sess, dict) else sess.id
-    except Exception:  # noqa: BLE001 - fall back to a direct row so boards still work
-        log.warning("sessions.create_session unavailable; inserting session row directly", exc_info=True)
-        session_id = uuid.uuid4().hex[:12]
-        ws = get_settings().workspaces_dir / "whiteboard" / board_id
-        ws.mkdir(parents=True, exist_ok=True)
-        now = bus.now_iso()
-        await db.execute(
-            "INSERT INTO sessions (id, title, kind, workspace_dir, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (session_id, title, "whiteboard", str(ws), now, now),
-        )
-        return session_id
+def _new_board_session(topic: str, now: str) -> dict[str, str]:
+    """Allocate session metadata; its row lands atomically with the board."""
+    session_id = uuid.uuid4().hex[:12]
+    workspace = get_settings().workspaces_dir / "sessions" / session_id
+    return {
+        "id": session_id,
+        "title": f"WB {topic}",
+        "workspace_dir": str(workspace),
+        "created_at": now,
+        "updated_at": now,
+    }
 
 
 async def _board_workspace(board: dict[str, Any]) -> Path:
@@ -486,16 +623,49 @@ async def _open_board(
     category: str | None = None,
     prior_board_id: str | None = None,
     topic_vec: list[float] | None = None,
+    topic_claim: tuple[int, str, str] | None = None,
 ) -> dict[str, Any]:
-    board_id = uuid.uuid4().hex[:12]
-    session_id = await _create_board_session(board_id, topic)
+    if topic_claim is None:
+        board_id = uuid.uuid4().hex[:12]
+    else:
+        try:
+            # The claim owner doubles as the reserved board id. This lets the
+            # reaper distinguish "board committed, release crashed" from
+            # "kickoff died before board" without adding a schema column.
+            board_id = str(json.loads(topic_claim[2])["owner"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("invalid whiteboard topic claim token") from exc
     root = _match_root_analyst(f"{topic} {question}")
     now = bus.now_iso()
     wd = work_date()
-    # one transaction so a board never lands without its first card.
+    session = _new_board_session(topic, now)
+    session_id = session["id"]
+    # One short transaction: a claimed topic, session row, board and first
+    # card land together. The workspace directory is created lazily on first
+    # use, so a rolled-back transaction leaves no filesystem orphan either.
     # NB: transaction() holds the db write lock — use the yielded conn directly
     # (db.execute/bus.emit in here would deadlock); events after commit.
     async with db.transaction() as conn:
+        if topic_claim is not None:
+            topic_id, claim_key, claim_token = topic_claim
+            cur = await conn.execute(
+                "UPDATE topic_pool SET status='used' "
+                "WHERE id=? AND status='pending' "
+                "AND EXISTS (SELECT 1 FROM admin_state WHERE key=? AND value=?)",
+                (topic_id, claim_key, claim_token),
+            )
+            claimed = cur.rowcount
+            await cur.close()
+            if claimed != 1:
+                raise RuntimeError(f"lost topic claim for pool row {topic_id}")
+        await conn.execute(
+            "INSERT INTO sessions (id, title, kind, workspace_dir, created_at, updated_at) "
+            "VALUES (?,?, 'whiteboard', ?,?,?)",
+            (
+                session_id, session["title"], session["workspace_dir"],
+                session["created_at"], session["updated_at"],
+            ),
+        )
         await conn.execute(
             "INSERT INTO whiteboard_boards (id, topic, question, status, max_cards, session_id, work_date, category, prior_board_id, created_at, updated_at) "
             "VALUES (?,?,?,'active',?,?,?,?,?,?,?)",
@@ -509,6 +679,11 @@ async def _open_board(
     # COMMIT done: the board exists. From here on no ordinary exception may
     # escape — callers (kickoff) treat a raise as "nothing landed" and release
     # the topic claim, which would let the same topic open a second board.
+    try:
+        Path(session["workspace_dir"]).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # _board_workspace retries lazily before the first card writes.
+        log.exception("could not create workspace for board %s", board_id)
     try:
         await bus.emit("whiteboard.board_opened", "board", board_id, {"topic": topic})
     except Exception:  # noqa: BLE001
@@ -533,39 +708,51 @@ async def kickoff() -> str | None:
     """Open one board from the topic pool if capacity allows. Never raises.
 
     Candidates come diversity-ordered from ``_pick_candidates``; each passes
-    the similarity gate BEFORE being claimed (a skipped topic stays pending
-    and is never consumed). The claim itself keeps the conditional-update
-    idiom, and a failed board open still releases the claim.
+    a leased admin_state claim BEFORE the similarity gate, so an overlapping
+    kickoff burns no model work on a live-claimed topic. The pool row becomes
+    ``used`` only in the session+board+first-card transaction. Every normal
+    exit CAS-releases its exact claim token; stale claims can be taken over.
     """
     try:
+        # Existing periodic entrypoint doubles as the janitor hook; no extra
+        # scheduler job is needed.
+        await reap_orphans()
         row = await db.query_one("SELECT COUNT(*) AS n FROM whiteboard_boards WHERE status='active'")
         if row and row["n"] >= MAX_ACTIVE_BOARDS:
             return None
         for top in await _pick_candidates():
-            verdict, prior_board_id, topic_vec = await _similarity_gate(top)
-            if verdict == "skip":
-                continue  # stays pending; excluded from candidates while the verdict is fresh
-            claimed = await db.execute(
-                "UPDATE topic_pool SET status='used' WHERE id=? AND status='pending'", (top["id"],)
-            )
-            if not claimed:
-                continue  # lost the claim race — try the next candidate
+            claim = await _claim_topic(top["id"])
+            if claim is None:
+                continue
+            claim_key, claim_token = claim
             try:
+                # A concurrent expire may have changed the candidate after it
+                # was selected. Check before any embedding/model call; the
+                # transaction repeats the authoritative status+token check.
+                fresh = await db.query_one("SELECT * FROM topic_pool WHERE id=?", (top["id"],))
+                if fresh is None or fresh["status"] != "pending":
+                    continue
+                top = fresh
+                verdict, prior_board_id, topic_vec = await _similarity_gate(top)
+                if verdict == "skip":
+                    continue  # pending + claim released in finally
                 board = await _open_board(
                     top["topic"], top["question"], max_cards=DEFAULT_MAX_CARDS,
                     category=top.get("category"),
                     prior_board_id=prior_board_id if verdict == "augment" else None,
                     topic_vec=topic_vec,
+                    topic_claim=(top["id"], claim_key, claim_token),
                 )
             except Exception:  # noqa: BLE001 - board insert failed: release the claim so the topic isn't lost
-                released = await db.execute(
-                    "UPDATE topic_pool SET status='pending' WHERE id=? AND status='used'", (top["id"],)
-                )
                 log.exception(
-                    "board open failed for topic %s; %s", top["id"],
-                    "topic released back to pool" if released else "could not release topic claim",
+                    "board open failed for topic %s; transaction rolled back", top["id"],
                 )
                 return None
+            finally:
+                try:
+                    await _release_topic_claim(claim_key, claim_token)
+                except Exception:  # noqa: BLE001 - committed board remains authoritative
+                    log.exception("could not release topic claim %s", claim_key)
             log.info("kicked off board %s: %s", board["id"], top["topic"])
             return board["id"]
         return None

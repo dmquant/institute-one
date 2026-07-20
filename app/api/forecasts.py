@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -41,6 +41,13 @@ class SettleBody(BaseModel):
     note: str = ""
 
 
+class ExportVaultBody(BaseModel):
+    """Explicitly select the one rolling export supported by this endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["history"]
+
+
 @router.get("")
 async def list_forecasts(status: str | None = None, thesis_id: str | None = None, limit: int = 100):
     return await _call(forecasts.list_forecasts, status=status, thesis_id=thesis_id, limit=limit)
@@ -49,6 +56,12 @@ async def list_forecasts(status: str | None = None, thesis_id: str | None = None
 @router.post("")
 async def create_forecast(body: ForecastCreate):
     return await _call(forecasts.create_forecast, body.model_dump(exclude_unset=True))
+
+
+@router.post("/export-vault")
+async def export_vault_history(body: ExportVaultBody):
+    """Manually refresh the managed rolling forecast-history note."""
+    return await _call(forecasts.export_vault_history)
 
 
 @router.get("/{forecast_id}")

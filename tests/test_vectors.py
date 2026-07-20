@@ -52,6 +52,12 @@ def _reset_vector_state(monkeypatch) -> None:
     monkeypatch.setattr(vectors, "_vec_unavailable", False)
     monkeypatch.setattr(vectors, "_ollama_down_until", 0.0)
     monkeypatch.setattr(vectors, "_ollama_warned", False)
+    monkeypatch.setattr(vectors, "_ollama_failure_reason", None)
+    monkeypatch.setattr(vectors, "_ollama_down_key", None)
+    monkeypatch.setattr(vectors, "_embed_cache", type(vectors._embed_cache)())
+    monkeypatch.setattr(vectors, "_health_probe_until", 0.0)
+    monkeypatch.setattr(vectors, "_health_probe_key", None)
+    monkeypatch.setattr(vectors, "_health_probe_result", None)
 
 
 @pytest.fixture
@@ -259,13 +265,29 @@ async def test_api_search_endpoints_vector_mode(fake_embedder):
         assert r.status_code == 200
         body = r.json()
         assert body["mode"] == "vector+fts"
+        assert body["reason"] == "healthy"
         assert body["results"][0]["path"] == "research/r10/pure.md"
 
         r = await client.post("/api/search", json={"query": "gpu", "k": 2})
         assert r.status_code == 200
         body = r.json()
         assert body["mode"] == "vector+fts"
+        assert body["reason"] == "healthy"
         assert len(body["results"]) <= 2
+
+
+@needs_vec
+async def test_api_distinguishes_healthy_zero_hits(fake_embedder):
+    from app.main import create_app
+
+    status = await vectors.search_with_status("nothing indexed")
+    assert status == {"reason": "healthy", "results": []}
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/archive/search", params={"q": "nothing indexed"})
+    assert response.status_code == 200
+    assert response.json() == {"mode": "fts", "results": [], "reason": "healthy"}
 
 
 # ---- shutdown drain --------------------------------------------------------
@@ -322,14 +344,36 @@ async def test_ollama_unreachable_degrades_to_fts(vectors_enabled, monkeypatch):
     assert hybrid["mode"] == "fts"
     assert any(r["path"] == "research/r12/doc.md" for r in hybrid["results"])
 
+    from app.main import create_app
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/archive/search", params={"q": "zebrafish77"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reason"] == "ollama_unreachable"
+    assert body["mode"] == "fts"
+    assert isinstance(body["results"], list)  # existing client contract is unchanged
+
 
 async def test_real_embed_returns_none_when_ollama_down(vectors_enabled, monkeypatch):
-    """The actual HTTP wrapper: connection refused → None, no raise."""
-    monkeypatch.setattr(
-        vectors, "get_settings",
-        lambda: type("S", (), {"ollama_host": "http://127.0.0.1:9", "enable_vectors": True})(),
-    )
+    """The actual HTTP wrapper: mocked connection failure → None, no raise."""
+    class FailingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            raise vectors.httpx.ConnectError("refused")
+
+    monkeypatch.setattr(vectors.httpx, "AsyncClient", FailingClient)
     assert await vectors.embed("hello") is None
+    assert vectors._ollama_failure_reason == "ollama_unreachable"
 
 
 async def test_embed_failure_negative_cache_and_single_warning(
@@ -362,6 +406,115 @@ async def test_embed_failure_negative_cache_and_single_warning(
     warnings = [r for r in caplog.records
                 if r.levelno == logging.WARNING and "embed failed" in r.message]
     assert len(warnings) == 1
+
+
+async def test_embed_reuses_same_model_content_hash(vectors_enabled, monkeypatch):
+    calls: list[dict] = []
+
+    class OkResponse:
+        status_code = 200
+
+        def json(self):
+            return {"embedding": fake_embed_vector("gpu")}
+
+    class OkClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            calls.append(kwargs["json"])
+            return OkResponse()
+
+    monkeypatch.setattr(vectors.httpx, "AsyncClient", OkClient)
+    first = await vectors.embed("identical content")
+    second = await vectors.embed("identical content")
+    assert first == second
+    assert len(calls) == 1
+
+    monkeypatch.setattr(vectors, "_model", lambda: "next-model")
+    assert await vectors.embed("identical content") == first
+    assert len(calls) == 2, "model is part of the content-addressed cache key"
+
+
+async def test_missing_model_reason_is_preserved(vectors_enabled, monkeypatch):
+    class MissingResponse:
+        status_code = 404
+
+        def json(self):
+            return {"error": "model 'bge-m3' not found"}
+
+    class MissingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return MissingResponse()
+
+    async def _ready():
+        return True
+
+    monkeypatch.setattr(vectors.httpx, "AsyncClient", MissingClient)
+    monkeypatch.setattr(vectors, "ensure_ready", _ready)
+    assert await vectors.embed("hello") is None
+    status = await vectors.search_with_status("hello")
+    assert status == {"reason": "model_missing", "results": []}
+
+
+async def test_health_probe_is_cached_and_reports_model_counts(vectors_enabled, monkeypatch):
+    await db.execute(
+        "INSERT INTO vector_chunks "
+        "(path, ref_kind, ref_id, chunk_index, text, model, created_at) "
+        "VALUES ('old.md','','',0,'old','old-model','now')"
+    )
+    await db.execute(
+        "INSERT INTO vector_chunks "
+        "(path, ref_kind, ref_id, chunk_index, text, model, created_at) "
+        "VALUES ('new.md','','',0,'new','bge-m3','now')"
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def _ready():
+        return True
+
+    async def _probe(host: str, model: str):
+        calls.append((host, model))
+        return {
+            "reachable": True,
+            "model_available": True,
+            "reason": vectors.REASON_HEALTHY,
+        }
+
+    monkeypatch.setattr(vectors, "ensure_ready", _ready)
+    monkeypatch.setattr(vectors, "_probe_ollama_uncached", _probe)
+    first = await vectors.get_health()
+    second = await vectors.get_health()
+
+    assert first["reason"] == "healthy"
+    assert first["probe_cached"] is False
+    assert second["probe_cached"] is True
+    assert len(calls) == 1
+    assert first["chunk_counts"] == {"bge-m3": 1, "old-model": 1}
+
+    from app.main import create_app
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/vectors/health")
+    assert response.status_code == 200
+    assert response.json()["chunk_counts"] == {"bge-m3": 1, "old-model": 1}
+    assert len(calls) == 1
 
 
 async def test_sqlite_vec_missing_degrades(vectors_enabled, monkeypatch):
@@ -407,6 +560,45 @@ async def test_search_never_raises_on_internal_failure(fake_embedder, monkeypatc
 
     monkeypatch.setattr(vectors.db, "query", _boom)
     assert await vectors.search("gpu") == []
+
+
+@needs_vec
+async def test_gc_stale_models_keeps_current_rows(vectors_enabled):
+    assert await vectors.ensure_ready()
+    ids: dict[str, int] = {}
+    async with db.transaction() as conn:
+        for model in ("old-model", "bge-m3"):
+            cur = await conn.execute(
+                "INSERT INTO vector_chunks "
+                "(path, ref_kind, ref_id, chunk_index, text, model, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (f"{model}.md", "", "", 0, model, model, "now"),
+            )
+            ids[model] = int(cur.lastrowid)
+            await conn.execute(
+                "INSERT INTO vec_search (rowid, embedding) VALUES (?,?)",
+                (cur.lastrowid, vectors._pack(fake_embed_vector("gpu"))),
+            )
+
+    from app.main import create_app
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/vectors/gc", json={"keep_model": "bge-m3"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reason"] == "healthy"
+    assert body["deleted_chunks"] == 1
+    assert body["deleted_projections"] == 1
+
+    rows = await db.query("SELECT id, model FROM vector_chunks ORDER BY id")
+    assert rows == [{"id": ids["bge-m3"], "model": "bge-m3"}]
+    assert await db.query(
+        "SELECT rowid FROM vec_search WHERE rowid = ?", (ids["old-model"],)
+    ) == []
+    assert await db.query(
+        "SELECT rowid FROM vec_search WHERE rowid = ?", (ids["bge-m3"],)
+    ) == [{"rowid": ids["bge-m3"]}]
 
 
 # ---- chunking -------------------------------------------------------------

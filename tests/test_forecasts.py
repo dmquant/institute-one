@@ -547,6 +547,55 @@ async def test_list_and_filters():
         await forecasts.list_forecasts(status="closed")
 
 
+async def test_forecast_history_exports_managed_vault_note():
+    from app.vault.writer import get_writer
+
+    await _mk_thesis(name="出口增长论点")
+    await _mk_security("VAULT.US", name="Vault Corp")
+    await _bar("VAULT.US", "2026-06-01", 10.0)
+    await _bar("VAULT.US", "2026-06-11", 11.0)
+    fc = await _forecast("VAULT.US", claim="十日内显著上行并进入历史导出")
+    await forecasts.settle_forecast(fc["id"])
+
+    writer = get_writer()
+    assert writer.root is not None
+    book = writer.root / "Book"
+    if book.exists():
+        for old in book.glob("forecasts*.md"):
+            old.unlink()
+
+    exported = await forecasts.export_vault_history()
+    assert exported == {"enabled": True, "path": "Book/forecasts.md", "count": 1}
+    target = writer.root / exported["path"]
+    text = target.read_text(encoding="utf-8")
+    assert "managed: institute" in text
+    assert "type: forecast-history" in text
+    assert "%% institute:begin %%" in text and "%% institute:end %%" in text
+    assert "# 预测历史" in text and fc["id"] in text
+    assert "十日内显著上行并进入历史导出" in text
+    assert "VAULT.US（Vault Corp）" in text
+    assert "结算：**hit**" in text and "标的收益 +10.00%" in text
+    ledger = await db.query_one(
+        "SELECT artifact_kind, artifact_id, mode FROM vault_index WHERE path = ?",
+        ("Book/forecasts.md",),
+    )
+    assert ledger == {
+        "artifact_kind": "forecast-history",
+        "artifact_id": "forecast-history",
+        "mode": "region",
+    }
+
+    # The manual API refresh uses the same managed region and preserves notes
+    # a human adds outside it.
+    target.write_text(text + "\n人工复盘批注。\n", encoding="utf-8")
+    async with AsyncClient(transport=ASGITransport(app=_make_app()), base_url="http://test") as client:
+        response = await client.post(
+            "/api/forecasts/export-vault", json={"scope": "history"})
+    assert response.status_code == 200
+    assert response.json() == exported
+    assert "人工复盘批注。" in target.read_text(encoding="utf-8")
+
+
 # ==== API surface ==============================================================
 
 def _make_app() -> FastAPI:

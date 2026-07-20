@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { createTree, getTree, listTrees, stopTree } from "../api";
+import { createTree, getTree, listTrees, retryTreeNode, stopTree } from "../api";
 import type { TreeNode } from "../api";
 import { useSSE } from "../useSSE";
 import {
@@ -152,9 +152,16 @@ function TreeList() {
 }
 
 function TreeDetail({ treeId }: { treeId: string }) {
-  const { lastEvent } = useSSE({ types: ["tree."], max: 1 });
-  const tree = useLoad(() => getTree(treeId), [treeId, lastEvent?.id ?? 0], 15000);
+  const { events: treeEvents } = useSSE({ types: ["tree."], max: 50 });
+  const latestTreeEventId = useMemo(
+    () => treeEvents.find((e) => e.ref_id === treeId)?.id ?? 0,
+    [treeEvents, treeId],
+  );
+  // Completion/retry events refresh immediately; the engine emits no
+  // pending->running event, so 5s polling covers that one missing transition.
+  const tree = useLoad(() => getTree(treeId), [treeId, latestTreeEventId], 5000);
   const [err, setErr] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState<string | null>(null);
 
   const t = tree.data;
 
@@ -188,6 +195,19 @@ function TreeDetail({ treeId }: { treeId: string }) {
       tree.reload();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const retry = async (nodeId: string) => {
+    setErr(null);
+    setRetrying(nodeId);
+    try {
+      await retryTreeNode(treeId, nodeId);
+      tree.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(null);
     }
   };
 
@@ -252,10 +272,24 @@ function TreeDetail({ treeId }: { treeId: string }) {
                     <div className="head">
                       <strong>{n.topic}</strong>
                       <StatusBadge status={n.status} />
+                      <span className="faint mono" style={{ fontSize: 12 }}>
+                        depth {n.depth} · score {n.score ?? "—"}
+                      </span>
                       {n.task_id && (
                         <Link className="mono" style={{ fontSize: 12 }} to={`/tasks?id=${n.task_id}`}>
                           task {n.task_id}
                         </Link>
+                      )}
+                      {n.status === "failed" && (
+                        <button
+                          className="ghost"
+                          style={{ padding: "3px 8px", fontSize: 12 }}
+                          disabled={retrying !== null || t.status === "stopped"}
+                          title={t.status === "stopped" ? "已停止的树不可重试" : "重新放回 BFS 待处理队列"}
+                          onClick={() => retry(n.id)}
+                        >
+                          {retrying === n.id ? "重试中…" : "重试节点"}
+                        </button>
                       )}
                       <span className="faint" style={{ marginLeft: "auto" }}>
                         {ago(n.finished_at ?? n.created_at)}

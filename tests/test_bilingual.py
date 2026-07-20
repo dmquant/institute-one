@@ -19,9 +19,12 @@ import asyncio
 import json
 import uuid
 
+import httpx
 import pytest
+from fastapi import FastAPI
 
 from app import bus, db
+from app.api import bilingual as bilingual_api
 from app.config import get_settings
 from app.institute import bilingual, scheduler
 from app.institute.prompts import work_date
@@ -31,12 +34,14 @@ from app.institute.prompts import work_date
 async def clean_bilingual_tasks():
     """Cancel stray twin tasks before conftest closes the DB."""
     bilingual._bg_tasks.clear()
+    bilingual._active_runs.clear()
     yield
     for t in list(bilingual._bg_tasks):
         t.cancel()
     if bilingual._bg_tasks:
         await asyncio.gather(*list(bilingual._bg_tasks), return_exceptions=True)
     bilingual._bg_tasks.clear()
+    bilingual._active_runs.clear()
 
 
 async def _drain() -> None:
@@ -97,6 +102,15 @@ async def _twin_events() -> list[dict]:
 
 async def _bilingual_tasks() -> list[dict]:
     return await db.query("SELECT * FROM tasks WHERE source = 'bilingual'")
+
+
+def _api_client() -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(bilingual_api.router)
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    )
 
 
 async def _set_maintenance_raw(value: str) -> None:
@@ -308,3 +322,283 @@ async def test_register_subscribes_and_emit_path_stays_quiet_when_off(monkeypatc
     await _drain()
     assert await _bilingual_tasks() == []
     assert await _twin_events() == []
+
+
+# ---- M8-011 durable index / read API -------------------------------------------
+
+async def test_twin_replay_is_idempotent_without_scanning_events():
+    run_id = await _mk_run("briefing", file_text="# 晨会简报\n\n唯一正文。")
+    first = await bilingual.twin_for_workflow(run_id)
+    second = await bilingual.twin_for_workflow(run_id)
+
+    assert second == first
+    assert len(await _bilingual_tasks()) == 1
+    assert len(await _twin_events()) == 1
+    state = await bilingual.get_twin_state(run_id)
+    assert state["status"] == "ready"
+    assert state["attempts"] == 1
+    assert state["event_emitted"] is True
+
+    # Simulate a crash after bus.emit committed but before the state marker:
+    # replay recognizes the same task_id event and only repairs the marker.
+    state["event_emitted"] = False
+    await db.execute(
+        "UPDATE admin_state SET value = ? WHERE key = ?",
+        (bilingual._state_json(state), bilingual._state_key(run_id)),
+    )
+    assert await bilingual.twin_for_workflow(run_id) == first
+    assert len(await _bilingual_tasks()) == 1
+    assert len(await _twin_events()) == 1
+    assert (await bilingual.get_twin_state(run_id))["event_emitted"] is True
+
+
+async def test_read_api_by_id_and_both_managed_paths():
+    run_id = await _mk_run("daily", file_text="# 每日日报\n\n双向读取正文。")
+    await bilingual.twin_for_workflow(run_id)
+    state = await bilingual.get_twin_state(run_id)
+
+    async with _api_client() as client:
+        en = await client.get(
+            f"/api/bilingual/twins/{run_id}", params={"locale": "en"},
+        )
+        assert en.status_code == 200
+        assert en.json()["exists"] is True
+        assert en.json()["input_locale"] == "zh"
+        assert en.json()["direction"] == "zh->en"
+        assert en.json()["counterpart"]["locale"] == "en"
+        assert en.json()["counterpart"]["exists"] is True
+        assert "双向读取正文" in en.json()["content"]
+
+        zh = await client.get(
+            "/api/bilingual/twins/by-path",
+            params={"path": state["twin_path"], "locale": "zh"},
+        )
+        assert zh.status_code == 200
+        assert zh.json()["input_locale"] == "en"
+        assert zh.json()["direction"] == "en->zh"
+        assert zh.json()["counterpart"]["locale"] == "zh"
+        assert zh.json()["counterpart"]["exists"] is True
+        assert zh.json()["content"] == "# 每日日报\n\n双向读取正文。"
+
+        source_path = await client.get(
+            "/api/bilingual/twins/by-path",
+            params={"path": state["source_path"], "locale": "en"},
+        )
+        assert source_path.status_code == 200
+        assert source_path.json()["document_id"] == run_id
+        assert (await client.get("/api/bilingual/twins/unknown")).status_code == 404
+        assert (
+            await client.get(
+                f"/api/bilingual/twins/{run_id}", params={"locale": "fr"},
+            )
+        ).status_code == 422
+
+
+async def test_locale_preference_roundtrip_and_query_override():
+    run_id = await _mk_run("briefing", file_text="# 晨会简报\n\n偏好正文。")
+    await bilingual.twin_for_workflow(run_id)
+
+    async with _api_client() as client:
+        assert (await client.get("/api/bilingual/preference")).json() == {"locale": "zh"}
+        put = await client.put("/api/bilingual/preference", json={"locale": "en"})
+        assert put.status_code == 200 and put.json() == {"locale": "en"}
+
+        preferred = await client.get(f"/api/bilingual/twins/{run_id}")
+        assert preferred.json()["locale"] == "en"
+        overridden = await client.get(
+            f"/api/bilingual/twins/{run_id}", params={"locale": "zh"},
+        )
+        assert overridden.json()["locale"] == "zh"
+        assert (
+            await client.put("/api/bilingual/preference", json={"locale": "fr"})
+        ).status_code == 422
+
+
+async def test_corrupt_locale_preference_falls_back_to_zh():
+    for bad in ("not-json", "[]", '"fr"', "null"):
+        await db.execute(
+            "INSERT INTO admin_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (bilingual.LOCALE_KEY, bad),
+        )
+        assert await bilingual.get_locale_preference() == "zh"
+
+
+async def test_read_api_reports_known_source_without_twin():
+    run_id = await _mk_run("daily", file_text="# 每日日报\n\n尚未翻译。")
+    async with _api_client() as client:
+        response = await client.get(
+            f"/api/bilingual/twins/{run_id}", params={"locale": "en"},
+        )
+    assert response.status_code == 200
+    assert response.json()["exists"] is False
+    assert response.json()["twin_exists"] is False
+    assert response.json()["status"] == "missing"
+
+
+async def test_coverage_counts_twins_and_detects_stale_source():
+    translated = await _mk_run("briefing", file_text="# 晨会简报\n\n原始版本。")
+    await bilingual.twin_for_workflow(translated)
+    await _mk_run("daily", file_text="# 每日日报\n\n没有孪生。")
+
+    run = await db.query_one("SELECT session_id FROM workflow_runs WHERE id = ?", (translated,))
+    session = await db.query_one("SELECT workspace_dir FROM sessions WHERE id = ?", (run["session_id"],))
+    (get_settings().workspaces_dir / "twin-tests" / translated / "晨会简报.md").write_text(
+        "# 晨会简报\n\n源文档已更新。", encoding="utf-8",
+    )
+
+    stats = await bilingual.coverage_stats()
+    assert stats["total_documents"] == 2
+    assert stats["with_twin"] == 1
+    assert stats["without_twin"] == 1
+    assert stats["stale"] == 1
+    assert stats["current_twins"] == 0
+    assert stats["coverage_percent"] == 50.0
+    assert session["workspace_dir"].endswith(translated)
+
+    async with _api_client() as client:
+        assert (await client.get("/api/bilingual/coverage")).json() == stats
+
+
+# ---- M8-011 bounded retry state machine ----------------------------------------
+
+async def test_failed_translation_is_retried_on_next_cycle(monkeypatch):
+    run_id = await _mk_run("briefing", file_text="# 晨会简报\n\n重试正文。")
+    original = bilingual._translate_task
+    calls = 0
+
+    async def fail_once(text, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary translator outage")
+        return await original(text, **kwargs)
+
+    monkeypatch.setattr(bilingual, "_translate_task", fail_once)
+    await bilingual._twin_safe(run_id)
+    failed = await bilingual.get_twin_state(run_id)
+    assert failed["status"] == "failed"
+    assert failed["attempts"] == 1
+
+    assert await bilingual.retry_failed_twins() == [run_id]
+    ready = await bilingual.get_twin_state(run_id)
+    assert ready["status"] == "ready"
+    assert ready["attempts"] == 2
+    assert len(await _bilingual_tasks()) == 1
+
+
+async def test_next_workflow_completion_cycle_reclaims_old_failure(monkeypatch):
+    await bilingual.set_enabled(True)
+    first_run = await _mk_run("briefing", file_text="# 晨会简报\n\n第一次失败。")
+    second_run = await _mk_run("daily", file_text="# 每日日报\n\n下一轮作业。")
+    original = bilingual._translate_task
+    calls = 0
+
+    async def fail_first(text, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("one transient failure")
+        return await original(text, **kwargs)
+
+    monkeypatch.setattr(bilingual, "_translate_task", fail_first)
+    await bilingual._on_workflow_completed(_completed_event(first_run, "briefing"))
+    await _drain()
+    assert (await bilingual.get_twin_state(first_run))["status"] == "failed"
+
+    # The next supported workflow completion sweeps old failures before its run.
+    await bilingual._on_workflow_completed(_completed_event(second_run, "daily"))
+    await _drain()
+    first = await bilingual.get_twin_state(first_run)
+    second = await bilingual.get_twin_state(second_run)
+    assert (first["status"], first["attempts"]) == ("ready", 2)
+    assert (second["status"], second["attempts"]) == ("ready", 1)
+
+
+async def test_retry_budget_stops_at_three_and_is_queryable(monkeypatch):
+    run_id = await _mk_run("daily", file_text="# 每日日报\n\n永久失败正文。")
+    calls = 0
+
+    async def always_fail(text, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("translator unavailable")
+
+    monkeypatch.setattr(bilingual, "_translate_task", always_fail)
+    for expected_attempt in (1, 2, 3):
+        await bilingual._twin_safe(run_id)
+        state = await bilingual.get_twin_state(run_id)
+        assert state["attempts"] == expected_attempt
+    assert state["status"] == "permanent_failed"
+
+    # Further replay/sweep is inert: the quota ceiling is durable.
+    await bilingual._twin_safe(run_id)
+    assert await bilingual.retry_failed_twins() == []
+    assert calls == bilingual.MAX_TRANSLATION_ATTEMPTS
+
+    async with _api_client() as client:
+        response = await client.get(
+            "/api/bilingual/failures", params={"permanent_only": True},
+        )
+    assert response.status_code == 200
+    assert response.json()["items"][0]["run_id"] == run_id
+    assert response.json()["items"][0]["status"] == "permanent_failed"
+
+
+async def test_restart_orphan_at_attempt_limit_becomes_permanent_without_model_call(
+    monkeypatch,
+):
+    run_id = await _mk_run("briefing", file_text="# 晨会简报\n\n重启遗留。")
+    run = await db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,))
+    source = (await bilingual._source_text(run)).strip()
+    source_path, twin_path = bilingual._document_paths(run)
+    state = {
+        "version": 1,
+        "run_id": run_id,
+        "workflow_id": "briefing",
+        "source_locale": "zh",
+        "locale": "en",
+        "source_path": source_path,
+        "twin_path": twin_path,
+        "source_sha256": bilingual._source_sha(source),
+        "status": "translating",
+        "attempts": bilingual.MAX_TRANSLATION_ATTEMPTS,
+        "max_attempts": bilingual.MAX_TRANSLATION_ATTEMPTS,
+        "claim_id": "dead-process",
+        "task_id": None,
+        "error": None,
+        "event_emitted": False,
+        "work_date": work_date(),
+        "started_at": bus.now_iso(),
+        "updated_at": bus.now_iso(),
+    }
+    await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES (?, ?)",
+        (bilingual._state_key(run_id), bilingual._state_json(state)),
+    )
+
+    async def must_not_run(*args, **kwargs):
+        raise AssertionError("retry budget was exceeded")
+
+    monkeypatch.setattr(bilingual, "_translate_task", must_not_run)
+    assert await bilingual.retry_failed_twins() == [run_id]
+    assert (await bilingual.get_twin_state(run_id))["status"] == "permanent_failed"
+
+
+async def test_new_source_version_gets_fresh_retry_budget(monkeypatch):
+    run_id = await _mk_run("briefing", file_text="# 晨会简报\n\n旧版本。")
+
+    async def always_fail(text, **kwargs):
+        raise RuntimeError("translator unavailable")
+
+    monkeypatch.setattr(bilingual, "_translate_task", always_fail)
+    for _ in range(bilingual.MAX_TRANSLATION_ATTEMPTS):
+        await bilingual._twin_safe(run_id)
+    assert (await bilingual.get_twin_state(run_id))["status"] == "permanent_failed"
+
+    path = get_settings().workspaces_dir / "twin-tests" / run_id / "晨会简报.md"
+    path.write_text("# 晨会简报\n\n全新版本。", encoding="utf-8")
+    await bilingual._twin_safe(run_id)
+    state = await bilingual.get_twin_state(run_id)
+    assert state["status"] == "failed"
+    assert state["attempts"] == 1

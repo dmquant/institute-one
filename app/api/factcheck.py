@@ -54,3 +54,11 @@ async def get_card(card_id: str):
     if card is None:
         raise HTTPException(404, f"unknown fact card {card_id!r}")
     return card
+
+
+@router.get("/api/factcheck/outbox")
+async def get_outbox(
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Dispute-delivery backlog counts and newest rows."""
+    return await factcheck.outbox_overview(limit=limit)

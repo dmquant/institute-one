@@ -159,6 +159,30 @@ async def insert_pending_card(
     return card_id
 
 
+async def insert_dispute_outbox(
+    *, recipient_id: str = "tech-analyst", status: str = "pending", attempts: int = 0,
+) -> tuple[str, str]:
+    """Seed one outbox row without invoking a model (drain/API test helper)."""
+    card_id = await insert_pending_card(
+        f"outbox claim {uuid.uuid4().hex}", analyst_id=recipient_id,
+    )
+    outbox_id = uuid.uuid4().hex[:12]
+    payload = {
+        "subject": "【事实核查】测试通知",
+        "body": "请复核测试论断。",
+        "event": {"kind": "disputed", "analyst_id": recipient_id},
+    }
+    await db.execute(
+        "INSERT INTO factcheck_dispute_outbox "
+        "(id, dispute_id, fact_card_id, recipient_id, payload, status, attempts, "
+        "created_at, delivered_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (outbox_id, f"test:{card_id}", card_id, recipient_id,
+         json.dumps(payload, ensure_ascii=False), status, attempts, bus.now_iso(),
+         bus.now_iso() if status == "delivered" else None),
+    )
+    return outbox_id, card_id
+
+
 async def events_of(type_: str) -> list[bus.Event]:
     return await bus.replay(0, types=[type_])
 
@@ -562,6 +586,73 @@ async def test_verify_disputed_opens_mailbox_thread_and_emits(verifier_output):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def test_disputed_verdict_commits_pending_outbox_before_delivery_crash(
+        monkeypatch, verifier_output):
+    """Verdict/fact/outbox survive a crash at the post-commit delivery edge."""
+    verifier_output.text = (
+        "VERDICT: DISPUTED\nEVIDENCE: 与年报不符。\nSOURCES: https://example.com/ar"
+    )
+
+    async def crash_before_delivery(*args, **kwargs):
+        raise RuntimeError("synthetic process crash before delivery")
+
+    monkeypatch.setattr(factcheck, "drain_dispute_outbox", crash_before_delivery)
+    card_id = await insert_pending_card(
+        "投递前崩溃论断", category="financial", analyst_id="tech-analyst",
+    )
+
+    result = await factcheck.verify_pending()
+    assert result[0]["verdict"] == "DISPUTED"
+    assert (await db.query_one(
+        "SELECT status FROM fact_cards WHERE id=?", (card_id,)))["status"] == "disputed"
+    assert (await db.query_one(
+        "SELECT verdict FROM verified_facts WHERE fact_card_id=?", (card_id,))
+    )["verdict"] == "DISPUTED"
+    outbox = await db.query_one(
+        "SELECT * FROM factcheck_dispute_outbox WHERE fact_card_id=?", (card_id,))
+    assert outbox["status"] == "pending"
+    assert outbox["attempts"] == 0
+    assert outbox["recipient_id"] == "tech-analyst"
+    assert await db.query("SELECT * FROM mailbox_threads") == []
+
+
+async def test_dispute_outbox_drain_delivers_once_and_is_idempotent():
+    outbox_id, _ = await insert_dispute_outbox()
+
+    first = await factcheck.drain_dispute_outbox()
+    assert first["delivered"] == 1
+    assert first["thread_ids"][outbox_id] == f"factcheck-{outbox_id}"
+    row = await db.query_one(
+        "SELECT * FROM factcheck_dispute_outbox WHERE id=?", (outbox_id,))
+    assert row["status"] == "delivered"
+    assert row["attempts"] == 1
+    assert row["delivered_at"]
+
+    second = await factcheck.drain_dispute_outbox()
+    assert second["delivered"] == 0
+    assert len(await db.query("SELECT * FROM mailbox_threads")) == 1
+    messages = await db.query(
+        "SELECT kind, status FROM mailbox_messages ORDER BY id")
+    assert messages == [
+        {"kind": "note", "status": "done"},
+        {"kind": "dispatch", "status": "pending"},
+    ]
+
+
+async def test_dispute_outbox_attempt_limit_marks_failed():
+    outbox_id, _ = await insert_dispute_outbox(recipient_id="missing-analyst")
+
+    for _ in range(factcheck.OUTBOX_MAX_ATTEMPTS):
+        await factcheck.drain_dispute_outbox()
+
+    row = await db.query_one(
+        "SELECT * FROM factcheck_dispute_outbox WHERE id=?", (outbox_id,))
+    assert row["status"] == "failed"
+    assert row["attempts"] == factcheck.OUTBOX_MAX_ATTEMPTS
+    assert "unknown analyst" in row["last_error"]
+    assert await db.query("SELECT * FROM mailbox_threads") == []
+
+
 async def test_verify_unverifiable_is_terminal_without_dispute(verifier_output):
     verifier_output.text = "VERDICT: UNVERIFIABLE\nEVIDENCE: 无公开来源。\nSOURCES: none"
     card_id = await insert_pending_card("I公司未披露数据", category="other")
@@ -783,6 +874,26 @@ async def test_factcheck_cards_api_filters_and_404():
         assert r.json()["fact"]["verdict"] == "DISPUTED"
 
         assert (await client.get("/api/factcheck/cards/nope")).status_code == 404
+
+
+async def test_factcheck_outbox_api_counts_and_recent_rows():
+    pending_id, _ = await insert_dispute_outbox()
+    await insert_dispute_outbox(status="failed", attempts=factcheck.OUTBOX_MAX_ATTEMPTS)
+    await insert_dispute_outbox(status="delivered", attempts=1)
+
+    app = _app_with_factcheck_router()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/factcheck/outbox", params={"limit": 2})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pending"] == 1
+    assert body["failed"] == 1
+    assert body["delivered"] == 1
+    assert len(body["recent"]) == 2
+    assert all(isinstance(row["payload"], dict) for row in body["recent"])
+    overview = await factcheck.outbox_overview(limit=3)
+    assert any(row["id"] == pending_id for row in overview["recent"])
 
 
 # ---- MCP read tools (round-trip, test_mcp.py style) ------------------------------

@@ -52,6 +52,18 @@ async def get_tree(tree_id: str):
     return tree
 
 
+@router.post("/tree/{tree_id}/node/{node_id}/retry")
+async def retry_node(tree_id: str, node_id: str):
+    """Requeue one failed node. Duplicate/non-failed retries and retries on a
+    stopped tree are conflicts; a node id from another tree is not found."""
+    try:
+        return await research_tree.retry_node(tree_id, node_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except research_tree.TransitionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @router.post("/tree/{tree_id}/stop")
 async def stop_tree(tree_id: str):
     """Prune pending nodes and terminal the tree to 'stopped'; running nodes

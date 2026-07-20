@@ -194,6 +194,7 @@ def test_job_gating_registry_matches_semantics():
         "mailbox-sweep": True,
         "research-tick": True,
         "research-tree-tick": True,
+        "rate-limit-revival": True,
         "factcheck-tick": True,
         "chain-tick": True,
         "committee": True,
@@ -213,4 +214,4 @@ def test_job_gating_registry_matches_semantics():
         if hasattr(fn, "job_name")
     }
     assert found == expected  # full set: nothing missing, nothing extra, gates exact
-    assert len(found) == 20   # 7 cron + 13 interval (research-tree-tick joined in D4)
+    assert len(found) == 21   # 7 cron + 14 interval (rate-limit-revival joined in H1)

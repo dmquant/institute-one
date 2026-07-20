@@ -25,6 +25,7 @@ EXPECTED_GATES = {
     "mailbox-sweep": True,
     "research-tick": True,
     "research-tree-tick": True,
+    "rate-limit-revival": True,
     "factcheck-tick": True,
     "chain-tick": True,
     "committee": True,
@@ -145,12 +146,12 @@ async def test_metric_write_failure_never_breaks_the_job(monkeypatch, caplog):
 
 async def test_job_registry_definition_surface_without_scheduler():
     """With the scheduler stopped (every test runs this way) the registry
-    still exposes the full definition surface: 20 jobs, exact gate table,
+    still exposes the full definition surface: 21 jobs, exact gate table,
     sorted by name, live fields all None/False."""
     reg = scheduler.job_registry()
     assert [r["name"] for r in reg] == sorted(EXPECTED_GATES)
     assert {r["name"]: r["gated"] for r in reg} == EXPECTED_GATES
-    assert len(reg) == 20  # 7 cron + 13 interval
+    assert len(reg) == 21  # 7 cron + 14 interval
     for r in reg:
         assert set(r) == {"name", "gated", "registered", "trigger", "next_run_time"}
         assert r["registered"] is False
@@ -158,7 +159,7 @@ async def test_job_registry_definition_surface_without_scheduler():
 
 
 async def test_job_registry_live_scheduler_marks_all_jobs_registered():
-    """S4-P0-03 proof: with the scheduler actually started, all 20 jobs are
+    """S4-P0-03 proof: with the scheduler actually started, all 21 jobs are
     registered with a real trigger and a computed next run time."""
     scheduler.start()
     try:

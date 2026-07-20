@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app import bus, db
+from app.config import get_settings
 from app.institute import forecasts, market_data, paper_book
 
 MADE = "2026-06-01T23:00:00+00:00"
@@ -168,6 +169,21 @@ async def test_opener_cap_and_per_security_dedup():
     dups = [p for p in await _positions("open") if p["security_id"] == "DUPS.US"]
     assert len(dups) == 1
     assert dups[0]["forecast_id"] in {f1["id"], f2["id"]}
+
+
+async def test_opener_cap_switch_restores_advisory_mode(monkeypatch):
+    await _mk_thesis()
+    for sid in ("ADVA.US", "ADVB.US"):
+        await _mk_security(sid)
+        await _bar(sid, "2026-06-01", 10.0)
+        await _forecast(sid, claim=f"advisory {sid}")
+    await _set_cap(1)
+    monkeypatch.setattr(get_settings(), "paper_book_enforce_caps", False)
+
+    out = await paper_book.opener_tick()
+    assert out["cap"] == 1 and out["cap_enforced"] is False
+    assert out["opened"] == 2
+    assert len(await _positions("open")) == 2
 
 
 # ==== MTM: stop / target / horizon =============================================
@@ -339,6 +355,118 @@ async def test_mtm_unpriceable_is_unknown_not_zero():
     assert "未知" in journal and "unpriced" in journal
 
 
+async def test_reconcile_dry_run_then_repairs_idempotently():
+    await _mk_thesis()
+    await _mk_security("RECON.US")
+    await _bar("RECON.US", "2026-06-01", 10.0)
+    await _bar("RECON.US", "2026-06-11", 10.3)
+    fc = await _forecast("RECON.US", claim="待补结算")
+    assert (await paper_book.opener_tick())["opened"] == 1
+    await _expire(fc["id"])
+
+    dry = await paper_book.reconcile(dry_run=True)
+    assert dry["operations"] == 0
+    assert (dry["would_close"], dry["would_settle"], dry["planned_operations"]) == (1, 1, 2)
+    assert (await _positions("open"))[0]["forecast_id"] == fc["id"]
+    assert (await forecasts.get_forecast(fc["id"]))["settlement"] is None
+    assert await db.query(
+        "SELECT * FROM events WHERE type = ?", (paper_book.RECONCILE_DIFFERENCE_EVENT,)
+    ) == []
+
+    first = await paper_book.reconcile()
+    assert (first["closed"], first["settled"], first["operations"]) == (1, 1, 2)
+    pos = (await _positions("closed"))[0]
+    assert (pos["close_reason"], pos["close_price"]) == ("horizon", pytest.approx(10.3))
+    assert (await forecasts.get_forecast(fc["id"]))["status"] == "settled"
+
+    second = await paper_book.reconcile()
+    assert second["operations"] == 0
+    assert (second["closed"], second["settled"], second["differences_recorded"]) == (0, 0, 0)
+
+
+async def test_reconcile_settles_forecast_closed_before_expiry():
+    await _mk_thesis()
+    await _mk_security("EARLY.US")
+    await _bar("EARLY.US", "2026-06-01", 10.0)
+    await _bar("EARLY.US", "2026-06-11", 11.5)
+    fc = await _forecast("EARLY.US", claim="先止盈后到期")
+    assert (await paper_book.opener_tick())["opened"] == 1
+    assert (await paper_book.mark_to_market())["closed"] == 1
+    assert (await forecasts.get_forecast(fc["id"]))["status"] == "open"
+    await _expire(fc["id"])
+
+    out = await paper_book.reconcile()
+    assert (out["closed"], out["settled"], out["operations"]) == (0, 1, 1)
+    assert (await forecasts.get_forecast(fc["id"]))["status"] == "settled"
+    assert (await paper_book.reconcile())["operations"] == 0
+
+
+async def test_reconcile_replays_first_historical_trigger_not_only_latest_mark():
+    await _mk_thesis()
+    await _mk_security("SWING.US")
+    await _bar("SWING.US", "2026-06-01", 10.0)
+    await _bar("SWING.US", "2026-06-05", 11.5)  # target was crossed
+    await _bar("SWING.US", "2026-06-10", 10.1)  # then recovered below target
+    fc = await _forecast("SWING.US", claim="中途止盈触发后回落")
+    assert (await paper_book.opener_tick())["opened"] == 1
+
+    first = await paper_book.reconcile()
+    assert (first["closed"], first["settled"], first["operations"]) == (1, 0, 1)
+    assert first["actions"][0]["reason"] == "target"
+    assert first["actions"][0]["source_mark_date"] == "2026-06-05"
+    pos = (await _positions("closed"))[0]
+    assert pos["close_price"] == pytest.approx(11.5)
+
+    # Difference reconciliation reconstructs the same first trigger, so the
+    # second sweep is truly zero-operation despite closed_at being today.
+    second = await paper_book.reconcile()
+    assert second["differences_found"] == 0
+    assert second["operations"] == 0
+    assert (await forecasts.get_forecast(fc["id"]))["status"] == "open"
+
+
+async def test_reconcile_records_pit_difference_without_rewriting_history():
+    await _mk_thesis()
+    await _mk_security("CORR.US")
+    await _bar("CORR.US", "2026-06-01", 10.0)
+    await _bar("CORR.US", "2026-06-11", 10.3)
+    fc = await _forecast("CORR.US", claim="结算后数据修正")
+    assert (await paper_book.opener_tick())["opened"] == 1
+    await _expire(fc["id"])
+    assert (await paper_book.mark_to_market())["closed"] == 1
+    before = (await _positions("closed"))[0]
+    assert before["close_price"] == pytest.approx(10.3)
+
+    # Same valid-time bar, later knowledge-time: PIT correction is a new row.
+    await _bar("CORR.US", "2026-06-11", 11.0, known="2026-06-20T00:00:00+00:00")
+    versions = await db.query(
+        "SELECT close, as_known_at FROM price_bars "
+        "WHERE security_id = ? AND bar_date = ? ORDER BY as_known_at",
+        ("CORR.US", "2026-06-11"),
+    )
+    assert [v["close"] for v in versions] == [10.3, 11.0]
+
+    first = await paper_book.reconcile()
+    assert (first["differences_found"], first["differences_recorded"], first["operations"]) == (
+        1, 1, 1)
+    diff = first["differences"][0]
+    assert diff["recorded_close_price"] == pytest.approx(10.3)
+    assert diff["current_known_price"] == pytest.approx(11.0)
+    after = await paper_book.get_position(before["id"])
+    assert after["close_price"] == pytest.approx(10.3)  # historical fact never UPDATEd
+    assert len(await db.query(
+        "SELECT * FROM events WHERE type = ?", (paper_book.RECONCILE_DIFFERENCE_EVENT,)
+    )) == 1
+
+    second = await paper_book.reconcile()
+    assert second["differences_found"] == 1
+    assert second["differences"][0]["already_recorded"] is True
+    assert second["differences_recorded"] == 0 and second["operations"] == 0
+    assert len(await db.query(
+        "SELECT * FROM events WHERE type = ?", (paper_book.RECONCILE_DIFFERENCE_EVENT,)
+    )) == 1
+
+
 async def test_opener_concurrency_database_is_the_arbiter():
     """REVIEW-C3 M3: per-security uniqueness and the cap are enforced by the
     INSERT itself (partial unique index + conditional insert), not by the
@@ -365,7 +493,8 @@ async def test_opener_concurrency_database_is_the_arbiter():
     await _mk_security("CAPX.US")
     await _bar("CAPX.US", "2026-06-01", 10.0)
     f3 = await _forecast("CAPX.US", claim="超出上限")
-    assert await paper_book._insert_position(f3, "2026-06-01", 10.0, 1, now) == "cap"
+    with pytest.raises(paper_book.RiskLimitConflict, match="max_positions"):
+        await paper_book._insert_position(f3, "2026-06-01", 10.0, 1, now)
 
     # whole-tick integration: concurrent sweeps agree on one total winner
     await _set_cap(2)
@@ -498,6 +627,48 @@ def _make_app() -> FastAPI:
     app = FastAPI()
     app.include_router(api_paper_book.router)
     return app
+
+
+async def test_open_api_hard_rejects_cap_then_switch_allows_advisory(monkeypatch):
+    await _mk_thesis()
+    forecasts_by_sid = {}
+    for sid in ("HARD1.US", "HARD2.US"):
+        await _mk_security(sid)
+        await _bar(sid, "2026-06-01", 10.0)
+        forecasts_by_sid[sid] = await _forecast(sid, claim=f"hard cap {sid}")
+    await _set_cap(1)
+
+    async with AsyncClient(transport=ASGITransport(app=_make_app()), base_url="http://test") as client:
+        first = await client.post(
+            f"/api/book/forecasts/{forecasts_by_sid['HARD1.US']['id']}/open")
+        assert first.status_code == 200
+        refused = await client.post(
+            f"/api/book/forecasts/{forecasts_by_sid['HARD2.US']['id']}/open")
+        assert refused.status_code == 409
+        assert "max_positions" in refused.json()["detail"]
+
+        monkeypatch.setattr(get_settings(), "paper_book_enforce_caps", False)
+        allowed = await client.post(
+            f"/api/book/forecasts/{forecasts_by_sid['HARD2.US']['id']}/open")
+        assert allowed.status_code == 200
+        assert allowed.json()["forecast_id"] == forecasts_by_sid["HARD2.US"]["id"]
+    assert len(await _positions("open")) == 2
+
+
+def test_cli_registers_reconcile_dry_run(monkeypatch, capsys):
+    from app import cli
+
+    seen = {}
+
+    def fake(settings, *, dry_run=False):
+        seen["settings"] = settings
+        seen["dry_run"] = dry_run
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_reconcile_paper_book", fake)
+    assert cli.main(["reconcile-paper-book", "--dry-run"]) == 0
+    assert seen == {"settings": get_settings(), "dry_run": True}
+    assert capsys.readouterr().err == ""
 
 
 async def test_manual_close_api_roundtrip():

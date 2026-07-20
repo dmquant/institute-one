@@ -107,6 +107,7 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
     // Cursor state is effect-local: a types/max change or StrictMode's dev
     // double-mount rebuilds the feed (stale filtered rows must not linger).
     setEvents([]);
+    setLastEvent(null);
     let cursor = 0; // highest event id already applied to this instance
     let bootstrapped = false;
     let closed = false;

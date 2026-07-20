@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     research_hands: str = "codex,agy"
     default_timeout_s: int = 1800
     output_cap_bytes: int = 200_000  # tasks.output column cap
+    paper_book_enforce_caps: bool = True
 
     # Hand enable flags (CLI hands are additionally gated on the binary existing)
     enable_claude: bool = True
@@ -96,6 +97,7 @@ class Settings(BaseSettings):
     research_daily_cap: int = 4
     research_cooldown_days: int = 30
     janitor_minutes: int = 60
+    events_retention_days: int = 90       # durable SSE/audit replay window
     # Phase 3 fact-check (factcheck.py reads both defensively)
     factcheck_tick_minutes: int = 30    # 0/negative disables the job
     # Verification ATTEMPTS per SGT work date. None -> factcheck's built-in

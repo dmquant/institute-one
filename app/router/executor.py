@@ -338,6 +338,42 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     return task_id
 
 
+def _legacy_retry_policy(source: str, requested_hand: str) -> tuple[str, dict[str, Any]]:
+    """Rebuild policy only for rows whose persisted fallback_chain is NULL."""
+    if source == "research":
+        hands = get_settings().research_hand_names
+        hand = requested_hand if requested_hand in hands else hands[0]
+        return hand, {"fallback_chain": hands}
+    return requested_hand, {}
+
+
+async def respawn_from_row(row: dict[str, Any]) -> tuple[str, str]:
+    """Spawn a new generation while preserving one task row's stored policy.
+
+    Status eligibility and live-lineage checks belong to the caller. Keeping
+    only the reconstruction here lets the manual retry endpoint and automatic
+    rate-limit revival replay the exact same hand/model/chain semantics.
+    """
+    lineage_root = row["lineage_root"] or row["id"]
+    if row["fallback_chain"] is not None:
+        hand = row["requested_hand"]
+        policy: dict[str, Any] = {"fallback_chain": json.loads(row["fallback_chain"])}
+    else:
+        hand, policy = _legacy_retry_policy(row["source"], row["requested_hand"])
+    # An explicit model never crosses a hand family boundary.
+    model = row["model"] if hand == row["requested_hand"] else None
+    new_id = await spawn(
+        hand, row["prompt"],
+        source=row["source"], model=model,
+        session_id=row["session_id"], parent_run_id=row["parent_run_id"],
+        workspace=Path(row["workspace_dir"]) if row["workspace_dir"] else None,
+        timeout_s=row["timeout_s"],
+        lineage_root=lineage_root,
+        **policy,
+    )
+    return new_id, lineage_root
+
+
 async def get_task(task_id: str) -> Task | None:
     row = await db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
     return Task.from_row(row) if row else None

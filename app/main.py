@@ -175,6 +175,7 @@ def create_app() -> FastAPI:
         analysts as api_analysts,
         archive as api_archive,
         ask_stream as api_ask_stream,
+        bilingual as api_bilingual,
         chain as api_chain,
         contract as api_contract,
         digests as api_digests,
@@ -210,7 +211,7 @@ def create_app() -> FastAPI:
         api_roadmap.router, api_theses.router, api_market_data.router,
         api_forecasts.router, api_chain.router, api_paper_book.router,
         api_factcheck.router, api_operator.router, api_multi_agent.router,
-        api_archive.router, api_vault.router,
+        api_archive.router, api_vault.router, api_bilingual.router,
         api_contract.router, api_mcp.router,
     ):
         app.include_router(r)

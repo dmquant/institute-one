@@ -276,6 +276,88 @@ async def list_forecasts(
     return [_forecast_out(r) for r in await db.query(sql, params)]
 
 
+# ---- vault projection --------------------------------------------------------
+
+def _vault_inline(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _vault_return(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:+.2%}" if math.isfinite(number) else "—"
+
+
+async def render_vault_history() -> tuple[str, int]:
+    """Render the complete forecast ledger as deterministic markdown."""
+    rows = await db.query(
+        "SELECT f.*, t.name_zh AS thesis_name, "
+        "s.name_zh AS security_name_zh, s.name_en AS security_name_en, "
+        "fs.verdict AS settlement_verdict, fs.settled_at, "
+        "fs.actual_return, fs.benchmark_return, fs.note AS settlement_note "
+        "FROM forecasts f "
+        "LEFT JOIN theses t ON t.id = f.thesis_id "
+        "LEFT JOIN securities s ON s.id = f.security_id "
+        "LEFT JOIN forecast_settlements fs ON fs.forecast_id = f.id "
+        "ORDER BY f.made_at DESC, f.id"
+    )
+    lines = ["# 预测历史", "", f"> 共 {len(rows)} 条预测；按 made_at 倒序。", ""]
+    for row in rows:
+        try:
+            rule = json.loads(row["settlement_rule"])
+            rule_text = json.dumps(rule, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            rule_text = _vault_inline(row["settlement_rule"])
+        security_name = row["security_name_zh"] or row["security_name_en"] or ""
+        security = row["security_id"] or "—"
+        if security_name:
+            security += f"（{_vault_inline(security_name)}）"
+        thesis_name = row["thesis_name"] or row["thesis_id"]
+        conviction = "—" if row["conviction"] is None else f"{float(row['conviction']):.0%}"
+        lines += [
+            f"## {row['made_at'][:10]} · `{row['id']}`",
+            "",
+            _vault_inline(row["claim"]),
+            "",
+            f"- 状态：**{row['status']}**　方向：`{row['direction']}`　信念：{conviction}",
+            f"- 标的：{security}",
+            f"- 论点：{_vault_inline(thesis_name)}（`{row['thesis_id']}`）",
+            f"- 时间：made_at `{row['made_at']}` → expires_at `{row['expires_at']}`"
+            f"（{row['horizon_days']} 天）",
+            f"- 结算规则：`{rule_text}`",
+        ]
+        if row["settlement_verdict"] is not None:
+            lines += [
+                f"- 结算：**{row['settlement_verdict']}** 于 `{row['settled_at']}`；"
+                f"标的收益 {_vault_return(row['actual_return'])}；"
+                f"基准收益 {_vault_return(row['benchmark_return'])}",
+                f"- 结算说明：{_vault_inline(row['settlement_note']) or '—'}",
+            ]
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n", len(rows)
+
+
+async def export_vault_history() -> dict[str, Any]:
+    """Write ``Book/forecasts.md`` through VaultWriter managed regions."""
+    from ..vault.writer import get_writer  # lazy: keep the ledger domain lightweight
+
+    body, count = await render_vault_history()
+    writer = get_writer()
+    written = await writer.write_note(
+        "Book/forecasts.md",
+        {"type": "forecast-history"},
+        body,
+        artifact_kind="forecast-history",
+        artifact_id="forecast-history",
+        region=True,
+    )
+    return {"enabled": writer.enabled, "path": written, "count": count}
+
+
 # ---- settlement ------------------------------------------------------------
 
 def _adj_close(bar: dict[str, Any]) -> float:

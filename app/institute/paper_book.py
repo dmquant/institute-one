@@ -81,6 +81,7 @@ events so a closed call flows back into its author's standing memory.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -90,6 +91,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
+from ..config import get_settings
 from . import forecasts, market_data
 from .prompts import work_date
 
@@ -102,6 +104,7 @@ DEFAULT_TARGET_PCT = 0.10
 BENCHMARK_ID = "CSI300"
 ADMIN_KEY = "paper_book"
 BENCH_BASE_KEY = "paper_book:benchmark_base"
+RECONCILE_DIFFERENCE_EVENT = "paper_book.reconcile_difference"
 STATUSES = ("open", "closed")
 CLOSE_REASONS = ("stop", "target", "horizon", "manual", "unpriced")
 
@@ -112,6 +115,10 @@ class PaperBookError(ValueError):
 
 class TransitionConflict(PaperBookError):
     """Conditional claim lost — the row changed under us (API maps to 409)."""
+
+
+class RiskLimitConflict(TransitionConflict):
+    """An opening risk invariant rejected the position (API maps to 409)."""
 
 
 def _new_id() -> str:
@@ -199,20 +206,45 @@ async def _insert_position(fc: dict[str, Any], entry_date: str, entry_price: flo
     the statement's own WHERE (atomic under SQLite's single writer — no
     check-then-insert window), UNIQUE(forecast_id) rejects a concurrent open
     of the same forecast, and the 0017 partial unique index rejects a second
-    OPEN position on the same security. Returns 'opened' | 'cap' | 'lost_race'.
+    OPEN position on the same security.
+
+    With ``paper_book_enforce_caps`` disabled only the configurable aggregate
+    cap becomes advisory; the schema invariants (one position per forecast,
+    one open position per security) remain hard. A hard aggregate-cap refusal
+    raises ``RiskLimitConflict`` rather than returning an advisory outcome.
     """
+    enforce_cap = get_settings().paper_book_enforce_caps
+    sql = (
+        "INSERT INTO paper_positions (id, forecast_id, security_id, direction, "
+        "entry_date, entry_price, size, stop_pct, target_pct, status, opened_at, updated_at) "
+        "SELECT ?,?,?,?,?,?,?,?,?,'open',?,?"
+    )
+    params: tuple[Any, ...] = (
+        _new_id(), fc["id"], fc["security_id"], fc["direction"], entry_date,
+        entry_price, SIZE, DEFAULT_STOP_PCT, DEFAULT_TARGET_PCT, now, now,
+    )
+    if enforce_cap:
+        sql += " WHERE (SELECT COUNT(*) FROM paper_positions WHERE status = 'open') < ?"
+        params += (cap,)
     try:
-        inserted = await db.execute(
-            "INSERT INTO paper_positions (id, forecast_id, security_id, direction, "
-            "entry_date, entry_price, size, stop_pct, target_pct, status, opened_at, updated_at) "
-            "SELECT ?,?,?,?,?,?,?,?,?,'open',?,? "
-            "WHERE (SELECT COUNT(*) FROM paper_positions WHERE status = 'open') < ?",
-            (_new_id(), fc["id"], fc["security_id"], fc["direction"], entry_date,
-             entry_price, SIZE, DEFAULT_STOP_PCT, DEFAULT_TARGET_PCT, now, now, cap),
-        )
+        inserted = await db.execute(sql, params)
     except sqlite3.IntegrityError:
         return "lost_race"  # a concurrent opener won this forecast or security
-    return "opened" if inserted else "cap"
+    if not inserted:
+        raise RiskLimitConflict(
+            f"paper-book max_positions cap {cap} reached; opening forecast {fc['id']} refused"
+        )
+    return "opened"
+
+
+async def _emit_opened(
+    fc: dict[str, Any], entry_date: str, entry_price: float,
+) -> None:
+    await bus.emit("paper_book.opened", "paper_position", fc["id"], {
+        "forecast_id": fc["id"], "security_id": fc["security_id"],
+        "direction": fc["direction"], "entry_date": entry_date,
+        "entry_price": entry_price,
+    })
 
 
 async def opener_tick() -> dict[str, Any]:
@@ -228,11 +260,13 @@ async def opener_tick() -> dict[str, Any]:
     """
     now = bus.now_iso()
     cap = await max_positions()
+    enforce_cap = get_settings().paper_book_enforce_caps
     row = await db.query_one("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'open'")
     summary = {"cap": cap, "open_before": row["n"] if row else 0, "opened": 0,
                "skipped_no_price": 0, "skipped_security_dup": 0, "lost_race": 0,
-               "considered": 0}
-    if summary["open_before"] >= cap:
+               "rejected_cap": 0, "cap_enforced": enforce_cap, "considered": 0}
+    if enforce_cap and summary["open_before"] >= cap:
+        summary["rejected_cap"] = 1
         return summary
 
     candidates = await db.query(
@@ -257,22 +291,66 @@ async def opener_tick() -> dict[str, Any]:
                 summary["skipped_no_price"] += 1
                 continue  # no usable knowledge at made_at — retry next tick
             entry_date, entry_price = entry
-            outcome = await _insert_position(fc, entry_date, entry_price, cap, now)
-            if outcome == "cap":
-                break  # the database says the book is full — stop the sweep
+            try:
+                outcome = await _insert_position(fc, entry_date, entry_price, cap, now)
+            except RiskLimitConflict:
+                summary["rejected_cap"] += 1
+                break  # the database says the enforced book is full
             if outcome == "lost_race":
                 summary["lost_race"] += 1
                 continue
             seen_securities.add(fc["security_id"])
             summary["opened"] += 1
-            await bus.emit("paper_book.opened", "paper_position", fc["id"], {
-                "forecast_id": fc["id"], "security_id": fc["security_id"],
-                "direction": fc["direction"], "entry_date": entry_date,
-                "entry_price": entry_price,
-            })
+            await _emit_opened(fc, entry_date, entry_price)
         except Exception:  # noqa: BLE001 - one bad forecast must not stop the sweep
             log.exception("opener failed for forecast %s", fc["id"])
     return summary
+
+
+async def open_forecast_position(forecast_id: str) -> dict[str, Any] | None:
+    """Open one forecast through the same database-enforced path as the tick.
+
+    This is the operator/API path: validation failures are 400s, while an
+    aggregate cap, per-security open-position limit, duplicate forecast, or
+    concurrent state change is a 409. The setting switch can make only
+    ``max_positions`` advisory; schema uniqueness remains non-bypassable.
+    """
+    fc = await db.query_one("SELECT * FROM forecasts WHERE id = ?", (forecast_id,))
+    if fc is None:
+        return None
+    now = bus.now_iso()
+    if fc["status"] != "open":
+        raise TransitionConflict(f"forecast {forecast_id} is {fc['status']!r}, not open")
+    if fc["direction"] not in ("long", "short"):
+        raise PaperBookError(f"forecast {forecast_id} direction {fc['direction']!r} is not tradable")
+    if not fc["security_id"]:
+        raise PaperBookError(f"forecast {forecast_id} has no security to open")
+    if fc["expires_at"] <= now:
+        raise PaperBookError(f"forecast {forecast_id} expired at {fc['expires_at']}")
+    entry = await _entry_bar(fc["security_id"], fc["made_at"])
+    if entry is None:
+        raise PaperBookError(
+            f"no usable entry price known for {fc['security_id']} at {fc['made_at']}"
+        )
+    entry_date, entry_price = entry
+    outcome = await _insert_position(fc, entry_date, entry_price, await max_positions(), now)
+    if outcome == "lost_race":
+        prior = await db.query_one(
+            "SELECT id FROM paper_positions WHERE forecast_id = ?", (forecast_id,))
+        if prior:
+            raise TransitionConflict(f"forecast {forecast_id} already has a paper position")
+        other = await db.query_one(
+            "SELECT id FROM paper_positions WHERE security_id = ? AND status = 'open'",
+            (fc["security_id"],),
+        )
+        if other:
+            raise RiskLimitConflict(
+                f"security {fc['security_id']} already has open position {other['id']}"
+            )
+        raise TransitionConflict(f"opening forecast {forecast_id} lost a concurrent claim")
+    await _emit_opened(fc, entry_date, entry_price)
+    return await db.query_one(
+        "SELECT * FROM paper_positions WHERE forecast_id = ?", (forecast_id,))
 
 
 # ---- closes ----------------------------------------------------------------------
@@ -527,6 +605,286 @@ async def close_position(position_id: str) -> dict[str, Any] | None:
         raise TransitionConflict(f"position {position_id} changed concurrently; reload and retry")
     await _maybe_settle(pos["forecast_id"])
     return await get_position(position_id)
+
+
+# ---- historical reconciliation -----------------------------------------------------
+
+def _reconcile_close_decision(
+    pos: dict[str, Any],
+    mark: tuple[str, float] | None,
+    expired: bool,
+) -> tuple[str, float | None, float | None] | None:
+    """Apply the live MTM close state machine without writing anything."""
+    ret = _signed_return(pos["direction"], pos["entry_price"], mark[1]) \
+        if mark is not None else None
+    if ret is None:
+        return ("unpriced", None, None) if expired else None
+    if ret <= -pos["stop_pct"]:
+        reason = "stop"
+    elif ret >= pos["target_pct"]:
+        reason = "target"
+    elif expired:
+        reason = "horizon"
+    else:
+        return None
+    return reason, mark[1], ret * pos["size"]
+
+
+async def _reconcile_open_decision(
+    pos: dict[str, Any],
+    wd: str,
+    expired: bool,
+) -> tuple[str, float | None, float | None, str | None] | None:
+    """Replay daily PIT marks and return the first missed close transition."""
+    if not pos["security_id"]:
+        return ("unpriced", None, None, None) if expired else None
+    end = _mark_window(wd, pos["fc_expires_at"])
+    bars = await market_data.get_bars_pit(
+        pos["security_id"], start=pos["entry_date"], end=end
+    )
+    for bar in bars:
+        price = _bar_price(bar)
+        ret = _signed_return(pos["direction"], pos["entry_price"], price)
+        if ret is None:
+            continue
+        if ret <= -pos["stop_pct"]:
+            return "stop", price, ret * pos["size"], bar["bar_date"]
+        if ret >= pos["target_pct"]:
+            return "target", price, ret * pos["size"], bar["bar_date"]
+    if not expired:
+        return None
+    # Horizon uses the newest row's latest-known version exactly like live
+    # MTM. If that endpoint is unusable, do not fall back to an older price.
+    mark = None
+    if bars:
+        price = _bar_price(bars[-1])
+        if price is not None:
+            mark = (bars[-1]["bar_date"], price)
+    decision = _reconcile_close_decision(pos, mark, True)
+    if decision is None:  # expired always yields horizon or unpriced
+        return None
+    return (*decision, mark[0] if mark is not None else None)
+
+
+async def _historical_trigger_mark(
+    pos: dict[str, Any],
+    end: str,
+) -> tuple[str, float] | None:
+    """First current-known bar satisfying a stored stop/target close reason."""
+    bars = await market_data.get_bars_pit(
+        pos["security_id"], start=pos["entry_date"], end=end
+    )
+    for bar in bars:
+        price = _bar_price(bar)
+        ret = _signed_return(pos["direction"], pos["entry_price"], price)
+        if ret is None:
+            continue
+        if pos["close_reason"] == "stop" and ret <= -pos["stop_pct"]:
+            return bar["bar_date"], price
+        if pos["close_reason"] == "target" and ret >= pos["target_pct"]:
+            return bar["bar_date"], price
+    return None
+
+
+def _difference_ref(
+    position_id: str,
+    mark_date: str,
+    recorded_price: float | None,
+    current_price: float,
+) -> str:
+    """Stable identity for one observed PIT correction.
+
+    A later version for the same valid-time bar has a different current price
+    and therefore a different id; replaying the same knowledge state gets the
+    same id and is an idempotent no-op.
+    """
+    recorded = "none" if recorded_price is None else float(recorded_price).hex()
+    raw = f"{position_id}|{mark_date}|{recorded}|{float(current_price).hex()}"
+    return f"{position_id}:{hashlib.sha256(raw.encode()).hexdigest()[:20]}"
+
+
+async def _record_reconcile_difference(
+    ref_id: str,
+    payload: dict[str, Any],
+    now: str,
+) -> int:
+    """Append one durable audit event, atomically deduplicated by stable ref."""
+    event_type, ref_kind = RECONCILE_DIFFERENCE_EVENT, "paper_position"
+    return await db.execute(
+        "INSERT INTO events (type, ref_kind, ref_id, payload, created_at) "
+        "SELECT ?,?,?,?,? WHERE NOT EXISTS ("
+        "SELECT 1 FROM events WHERE type = ? AND ref_kind = ? AND ref_id = ?)",
+        (
+            event_type, ref_kind, ref_id,
+            json.dumps(payload, ensure_ascii=False, allow_nan=False), now,
+            event_type, ref_kind, ref_id,
+        ),
+    )
+
+
+async def reconcile(*, dry_run: bool = False, wd: str | None = None) -> dict[str, Any]:
+    """Repair missed closes/settlements and audit PIT price corrections.
+
+    Every historical position is inspected under the same window and close
+    precedence as live MTM. Open positions that now satisfy stop/target or
+    expiry are closed conditionally; every expired linked forecast still open
+    is settled. Closed-position prices are compared with the latest currently
+    known PIT version at their historical close window. A mismatch NEVER
+    rewrites ``paper_positions`` or ``forecast_settlements``: it appends a
+    deduplicated ``paper_book.reconcile_difference`` event instead.
+
+    ``dry_run`` performs the identical reads/decisions but makes no writes.
+    Sequential replays are idempotent: conditional status claims remove
+    completed close/settle work, and discrepancy event refs are deterministic.
+    """
+    wd = wd or work_date()
+    now = bus.now_iso()
+    positions = await db.query(
+        "SELECT p.*, f.expires_at AS fc_expires_at, f.status AS fc_status "
+        "FROM paper_positions p JOIN forecasts f ON f.id = p.forecast_id "
+        "ORDER BY p.opened_at, p.id"
+    )
+    summary: dict[str, Any] = {
+        "dry_run": dry_run,
+        "work_date": wd,
+        "considered": len(positions),
+        "closed": 0,
+        "settled": 0,
+        "differences_found": 0,
+        "differences_recorded": 0,
+        "would_close": 0,
+        "would_settle": 0,
+        "would_record_differences": 0,
+        "operations": 0,
+        "planned_operations": 0,
+        "actions": [],
+        "differences": [],
+        "errors": [],
+    }
+
+    # First repair state transitions. The snapshot may race another worker;
+    # _close and settle_forecast are conditional claims, so only one wins.
+    for pos in positions:
+        expired = pos["fc_expires_at"] <= now
+        try:
+            if pos["status"] == "open":
+                decision = await _reconcile_open_decision(pos, wd, expired)
+                if decision is not None:
+                    reason, close_price, realized, mark_date = decision
+                    action = {
+                        "position_id": pos["id"],
+                        "forecast_id": pos["forecast_id"],
+                        "action": "close",
+                        "reason": reason,
+                        "source_mark_date": mark_date,
+                        "close_price": close_price,
+                        "realized_pnl": realized,
+                    }
+                    summary["actions"].append(action)
+                    if dry_run:
+                        summary["would_close"] += 1
+                    elif await _close(pos, reason, close_price, realized, now):
+                        summary["closed"] += 1
+
+            # A stop/target/manual close before expiry deliberately did not
+            # settle then; reconciliation picks it up once expiry has arrived.
+            if expired and pos["fc_status"] == "open":
+                if dry_run:
+                    summary["would_settle"] += 1
+                    summary["actions"].append({
+                        "position_id": pos["id"],
+                        "forecast_id": pos["forecast_id"],
+                        "action": "settle",
+                    })
+                else:
+                    try:
+                        settled = await forecasts.settle_forecast(
+                            pos["forecast_id"], note="paper-book reconciliation"
+                        )
+                        if settled is not None:
+                            summary["settled"] += 1
+                    except forecasts.TransitionConflict:
+                        pass  # another reconciler/settler won the same claim
+                    except forecasts.ForecastError as exc:
+                        summary["errors"].append({
+                            "position_id": pos["id"],
+                            "stage": "settle",
+                            "error": str(exc),
+                        })
+        except Exception as exc:  # noqa: BLE001 - one corrupt historical row must not stop the sweep
+            log.exception("reconcile transition failed for position %s", pos["id"])
+            summary["errors"].append({
+                "position_id": pos["id"],
+                "stage": "transition",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    # Then compare rows that were already historical at sweep start. Positions
+    # closed above used this exact current mark and cannot differ on this run.
+    for pos in positions:
+        if pos["status"] != "closed" or not pos["security_id"]:
+            continue
+        try:
+            if pos["close_reason"] in ("horizon", "unpriced"):
+                comparison_end = pos["fc_expires_at"][:10]
+            else:
+                close_day = str(pos["closed_at"] or pos["fc_expires_at"])[:10]
+                comparison_end = _mark_window(close_day, pos["fc_expires_at"])
+            mark = None
+            if pos["close_reason"] in ("stop", "target"):
+                mark = await _historical_trigger_mark(pos, comparison_end)
+            if mark is None:
+                mark = await _latest_mark(pos["security_id"], comparison_end)
+            if mark is None:
+                continue  # current source is still unknown: no discrepancy can be asserted
+            recorded = pos["close_price"] if forecasts._usable_price(pos["close_price"]) else None
+            if recorded is not None and math.isclose(
+                float(recorded), mark[1], rel_tol=1e-12, abs_tol=0.0
+            ):
+                continue
+            ref_id = _difference_ref(pos["id"], mark[0], recorded, mark[1])
+            prior = await db.query_one(
+                "SELECT 1 AS x FROM events "
+                "WHERE type = ? AND ref_kind = 'paper_position' AND ref_id = ?",
+                (RECONCILE_DIFFERENCE_EVENT, ref_id),
+            )
+            difference = {
+                "position_id": pos["id"],
+                "forecast_id": pos["forecast_id"],
+                "security_id": pos["security_id"],
+                "close_reason": pos["close_reason"],
+                "comparison_end": comparison_end,
+                "source_mark_date": mark[0],
+                "recorded_close_price": recorded,
+                "current_known_price": mark[1],
+                "event_ref": ref_id,
+                "already_recorded": prior is not None,
+            }
+            summary["differences"].append(difference)
+            if prior is None:
+                if dry_run:
+                    summary["would_record_differences"] += 1
+                else:
+                    summary["differences_recorded"] += await _record_reconcile_difference(
+                        ref_id, difference, now
+                    )
+        except Exception as exc:  # noqa: BLE001 - one bad comparison must not stop repairs
+            log.exception("reconcile price comparison failed for position %s", pos["id"])
+            summary["errors"].append({
+                "position_id": pos["id"],
+                "stage": "price_comparison",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    summary["differences_found"] = len(summary["differences"])
+    summary["operations"] = (
+        summary["closed"] + summary["settled"] + summary["differences_recorded"]
+    )
+    summary["planned_operations"] = (
+        summary["would_close"] + summary["would_settle"]
+        + summary["would_record_differences"]
+    )
+    return summary
 
 
 # ---- reads ----------------------------------------------------------------------------

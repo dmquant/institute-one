@@ -32,6 +32,15 @@ async def get_position(position_id: str):
     return pos
 
 
+@router.post("/forecasts/{forecast_id}/open")
+async def open_forecast_position(forecast_id: str):
+    """Operator open path; hard risk/cap refusals are HTTP 409."""
+    pos = await _call(paper_book.open_forecast_position, forecast_id)
+    if pos is None:
+        raise HTTPException(404, "forecast not found")
+    return pos
+
+
 @router.post("/positions/{position_id}/close")
 async def close_position(position_id: str):
     """Manual close at the latest usable mark (fails closed on no price)."""

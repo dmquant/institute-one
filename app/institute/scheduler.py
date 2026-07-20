@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import shutil
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -26,6 +27,11 @@ from .prompts import now_sgt, work_date
 log = logging.getLogger("institute.scheduler")
 
 _scheduler: AsyncIOScheduler | None = None
+
+RATE_LIMIT_REVIVAL_LIMIT = 3
+RATE_LIMIT_REVIVAL_MARKER = "[rate-limit-revival:claimed]"
+JANITOR_DELETE_LIMIT = 5000
+RESEARCH_TREE_BOOKED_PREFIX = "research_tree_booked:"
 
 
 # ---- maintenance switch ----------------------------------------------------
@@ -157,9 +163,10 @@ def metered(name: str, *, gated: bool = False) -> Callable[[Callable[..., Awaita
 # research-tree-tick claims BFS explore nodes (executor.submit),
 # factcheck-tick runs extraction/verification tasks, chain-tick runs entity
 # extraction, operator-fast-route/operator-deep-route classify actions through
-# executor.submit, committee opens the weekly debate run. In-flight work still
-# drains under maintenance: card/dispatch/workflow drivers are plain asyncio
-# tasks outside the scheduler. Ungated jobs — janitor, hand-scorecard,
+# executor.submit, committee opens the weekly debate run, rate-limit-revival
+# respawns terminal calls. In-flight work still drains under maintenance:
+# card/dispatch/workflow drivers are plain asyncio tasks outside the scheduler.
+# Ungated jobs — janitor, hand-scorecard,
 # market-refresh, operator-vault-sweep, paper-opener, paper-mtm — never spend
 # model quota (cleanup, task QA over terminal rows, market data fetching,
 # vault conflict sweeps, paper-book ledger DB reads/writes) and keep running
@@ -280,6 +287,78 @@ async def _market_refresh_job() -> None:
     await market_fetchers.refresh_all(limit=get_settings().market_refresh_limit)
 
 
+def _revival_error(error: str | None) -> str:
+    base = (error or "").rstrip()
+    return f"{base}\n{RATE_LIMIT_REVIVAL_MARKER}" if base else RATE_LIMIT_REVIVAL_MARKER
+
+
+@metered("rate-limit-revival", gated=True)
+async def _rate_limit_revival_job() -> None:
+    """Respawn cooled-down terminal tasks, at most three per firing.
+
+    The error marker is an atomic per-source-row claim. It is written only
+    when that lineage has no live retry; a concurrent INSERT still resolves
+    through uq_tasks_lineage_active and is treated as an idempotent skip.
+    """
+    from ..hands.registry import get_registry
+    from ..router import executor
+
+    registry = get_registry()
+    revived = 0
+    rows = await db.query(
+        "SELECT * FROM tasks WHERE status = 'rate_limited' "
+        "AND instr(COALESCE(error, ''), ?) = 0 "
+        "ORDER BY COALESCE(finished_at, created_at) ASC, id ASC",
+        (RATE_LIMIT_REVIVAL_MARKER,),
+    )
+    for row in rows:
+        if revived >= RATE_LIMIT_REVIVAL_LIMIT:
+            break
+        hand = row["hand"]
+        if not hand or registry.cooling_until(hand) is not None:
+            continue
+        lineage_root = row["lineage_root"] or row["id"]
+        live = await db.query_one(
+            "SELECT id FROM tasks WHERE lineage_root = ? "
+            "AND status IN ('queued','running') LIMIT 1",
+            (lineage_root,),
+        )
+        if live is not None:
+            continue
+
+        original_error = row["error"]
+        claimed_error = _revival_error(original_error)
+        claimed = await db.execute(
+            "UPDATE tasks SET error = ? WHERE id = ? AND status = 'rate_limited' "
+            "AND instr(COALESCE(error, ''), ?) = 0 "
+            "AND NOT EXISTS (SELECT 1 FROM tasks live "
+            "                WHERE live.lineage_root = ? "
+            "                AND live.status IN ('queued','running'))",
+            (claimed_error, row["id"], RATE_LIMIT_REVIVAL_MARKER, lineage_root),
+        )
+        if not claimed:
+            continue
+        try:
+            await executor.respawn_from_row(row)
+        except sqlite3.IntegrityError:
+            # The unique index won the race for another retry. Keep the claim
+            # marker: this source row's lineage was revived by that winner.
+            log.debug("rate-limit revival lost live-lineage race for %s", row["id"])
+        except Exception:  # noqa: BLE001 - one corrupt row must not block the batch
+            # A non-idempotency failure did not create a usable retry; release
+            # only our exact marker so a later tick can try again.
+            await db.execute(
+                "UPDATE tasks SET error = ? WHERE id = ? AND status = 'rate_limited' "
+                "AND error = ?",
+                (original_error, row["id"], claimed_error),
+            )
+            log.exception("rate-limit revival failed for task %s", row["id"])
+        else:
+            revived += 1
+    if revived:
+        log.info("rate-limit revival spawned %d task(s)", revived)
+
+
 @metered("janitor")
 async def _janitor() -> None:
     settings = get_settings()
@@ -335,11 +414,48 @@ async def _janitor() -> None:
 
     # 4) cron metrics older than 30 days (the table IS the health window)
     metrics_cutoff = (now_utc - timedelta(days=30)).isoformat(timespec="seconds")
-    n = await db.execute("DELETE FROM cron_metrics WHERE fired_at < ?", (metrics_cutoff,))
+    n = await db.execute(
+        "DELETE FROM cron_metrics WHERE id IN "
+        "(SELECT id FROM cron_metrics WHERE fired_at < ? ORDER BY id ASC LIMIT ?)",
+        (metrics_cutoff, JANITOR_DELETE_LIMIT),
+    )
     if n:
         log.info("janitor removed %d old cron metrics", n)
 
-    # 5) nightly DB backup during the 03:00-05:00 SGT window (once per date)
+    # 5) events retention. events.id is AUTOINCREMENT and every replay path
+    # asks for id > cursor, so deleting an old prefix only creates harmless
+    # gaps: ids are never reused and cursors remain monotonic. Vault exporter
+    # handlers run synchronously during bus.emit and project authoritative
+    # domain rows; they do not rely on historical event replay.
+    events_cutoff = (
+        now_utc - timedelta(days=max(1, int(settings.events_retention_days)))
+    ).isoformat(timespec="seconds")
+    n = await db.execute(
+        "DELETE FROM events WHERE id IN "
+        "(SELECT id FROM events WHERE created_at < ? ORDER BY id ASC LIMIT ?)",
+        (events_cutoff, JANITOR_DELETE_LIMIT),
+    )
+    if n:
+        log.info("janitor removed %d expired events", n)
+
+    # 6) SGT-dated research-tree booked counters older than 30 days. Exactly
+    # 30 days remains in-window; malformed/admin keys are left untouched.
+    counter_cutoff = (now_sgt().date() - timedelta(days=30)).isoformat()
+    suffix_pos = len(RESEARCH_TREE_BOOKED_PREFIX) + 1
+    n = await db.execute(
+        "DELETE FROM admin_state WHERE key IN "
+        "(SELECT key FROM admin_state "
+        " WHERE substr(key, 1, ?) = ? AND length(key) = ? "
+        " AND substr(key, ?, 10) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+        " AND substr(key, ?, 10) < ? ORDER BY key ASC LIMIT ?)",
+        (len(RESEARCH_TREE_BOOKED_PREFIX), RESEARCH_TREE_BOOKED_PREFIX,
+         len(RESEARCH_TREE_BOOKED_PREFIX) + 10, suffix_pos, suffix_pos,
+         counter_cutoff, JANITOR_DELETE_LIMIT),
+    )
+    if n:
+        log.info("janitor removed %d expired research-tree counters", n)
+
+    # 7) nightly DB backup during the 03:00-05:00 SGT window (once per date)
     if 3 <= now_sgt().hour < 5:
         target = settings.backups_dir / f"institute-{work_date()}.db"
         if not target.exists():
@@ -394,12 +510,14 @@ def start() -> None:
     every(_research_tick_job, "research-tick", minutes=settings.research_tick_minutes)
     every(_research_tree_tick_job, "research-tree-tick", minutes=5)
     every(_factcheck_tick_job, "factcheck-tick", minutes=settings.factcheck_tick_minutes)
+    every("app.institute.factcheck:drain_dispute_outbox", "factcheck-outbox", minutes=1)
     every(_chain_tick_job, "chain-tick", minutes=60)
     every(_operator_fast_route_job, "operator-fast-route", minutes=15)
     every(_operator_deep_route_job, "operator-deep-route", minutes=60)
     every(_operator_vault_sweep_job, "operator-vault-sweep", minutes=60)
     every(_paper_opener_job, "paper-opener", minutes=5)
     every(_market_refresh_job, "market-refresh", minutes=settings.market_refresh_minutes)
+    every(_rate_limit_revival_job, "rate-limit-revival", minutes=5)
     every(_janitor, "janitor", minutes=settings.janitor_minutes)
 
     sched.start()

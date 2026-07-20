@@ -221,8 +221,8 @@ async def test_empty_db_shapes_of_key_aggregates():
         cron = json.loads(_result_text(await _call_tool_raw(client, "cron_health", {})))
         assert cron["window_days"] == 30
         # S4-P0-03: empty cron_metrics still answers the full scheduler
-        # registry (20 jobs), all with zeroed metric fields
-        assert len(cron["jobs"]) == 20
+        # registry (21 jobs), all with zeroed metric fields
+        assert len(cron["jobs"]) == 21
         assert all(j["fires"] == 0 and j["last_fired_at"] is None for j in cron["jobs"].values())
 
         actions = json.loads(_result_text(await _call_tool_raw(client, "operator_actions_list", {})))

@@ -1,4 +1,4 @@
-"""``institute`` CLI — start/stop/status + unified doctor (ROADMAP Phase 8).
+"""``institute`` CLI — lifecycle, doctor, and paper-book reconciliation.
 
 Entry points: the ``institute`` console script (pyproject ``[project.scripts]``)
 or ``python -m app.cli``. Everything is synchronous and works without the
@@ -669,21 +669,50 @@ def cmd_doctor(settings: Settings) -> int:
     return 1 if tally[FAIL] else 0
 
 
+def cmd_reconcile_paper_book(settings: Settings, *, dry_run: bool = False) -> int:
+    """Run the repeatable paper-book repair sweep against the configured DB."""
+    async def _run() -> dict[str, Any]:
+        from . import db
+        from .institute import paper_book
+
+        already_open = db._conn is not None
+        if not already_open:
+            await db.init()
+        try:
+            return await paper_book.reconcile(dry_run=dry_run)
+        finally:
+            if not already_open:
+                await db.close()
+
+    result = _run_async(_run())
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if result["errors"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # pydantic-settings reads .env relative to CWD; the server starts from the
     # repo root, so the CLI must too or doctor would see a different config.
     os.chdir(_repo_root())
     parser = argparse.ArgumentParser(
         prog="institute",
-        description="institute-one operator CLI: start/stop/status/doctor",
+        description="institute-one operator CLI: lifecycle/doctor/reconciliation",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start", help="start the server in the background (scripts/start.sh)")
     sub.add_parser("stop", help="stop the pidfile-started server (scripts/stop.sh)")
     sub.add_parser("status", help="process + port + /health probe (exit 0 when healthy)")
     sub.add_parser("doctor", help="offline health report: hands/db/vault/cron/orphans/limits/disk")
+    reconcile_parser = sub.add_parser(
+        "reconcile-paper-book",
+        help="repair missed paper-book closes/settlements and audit PIT price differences",
+    )
+    reconcile_parser.add_argument(
+        "--dry-run", action="store_true", help="report planned operations without writing"
+    )
     args = parser.parse_args(argv)
     settings = get_settings()
+    if args.command == "reconcile-paper-book":
+        return cmd_reconcile_paper_book(settings, dry_run=args.dry_run)
     handlers = {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "doctor": cmd_doctor}
     return handlers[args.command](settings)
 

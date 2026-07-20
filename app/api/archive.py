@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from ..institute import archive
+from ..institute import archive, vectors
 
 # No prefix: this router carries both /api/archive/* and the Phase 1a
 # semantic entry point POST /api/search (proposal §9) — main.py mounts one
@@ -14,12 +14,13 @@ router = APIRouter(tags=["archive"])
 
 @router.get("/api/archive/search")
 async def search(q: str, limit: int = 20):
-    """Hybrid search: {"mode": "vector+fts"|"fts", "results": [...]}.
+    """Hybrid search with a backward-compatible top-level health reason.
 
     Degrades to pure FTS5 rows (mode="fts") whenever the vector layer is
     unavailable (no Ollama, no sqlite-vec, vectors disabled).
     """
-    return await archive.search_hybrid(q, limit=limit)
+    result = await archive.search_hybrid(q, limit=limit)
+    return {**result, "reason": vectors.last_search_reason()}
 
 
 class SearchBody(BaseModel):
@@ -30,7 +31,25 @@ class SearchBody(BaseModel):
 @router.post("/api/search")
 async def semantic_search(body: SearchBody):
     """Semantic search entry point (proposal §9). Same degradation contract."""
-    return await archive.search_hybrid(body.query, limit=body.k)
+    result = await archive.search_hybrid(body.query, limit=body.k)
+    return {**result, "reason": vectors.last_search_reason()}
+
+
+@router.get("/api/vectors/health")
+async def vector_health():
+    return await vectors.get_health()
+
+
+class VectorGCBody(BaseModel):
+    keep_model: str
+
+
+@router.post("/api/vectors/gc")
+async def vector_gc(body: VectorGCBody):
+    keep_model = body.keep_model.strip()
+    if not keep_model:
+        raise HTTPException(400, "keep_model must not be empty")
+    return await vectors.gc_stale_models(keep_model)
 
 
 @router.get("/api/archive/files")
