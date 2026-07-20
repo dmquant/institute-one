@@ -9,7 +9,7 @@ stores the result as a new ``analyst_memory`` version row. ``memory_block``
 renders the latest version as a context block; ``prompt_with_memory`` is THE
 prompt-assembly entrypoint (M8-005) — it injects that block into
 ``prompts.build_analyst_prompt`` in exactly one place, so every analyst prompt
-carries the memory between persona and task.
+that opts into standing memory carries it between persona and task.
 
 Exactly-once consumption (REVIEW-B3 B3-H1/B3-M3): material is NOT selected by
 timestamp — second-precision timestamps plus a strict ``>`` lose whatever
@@ -36,8 +36,8 @@ even a taken-over zombie that wakes up cannot double-write a version (its
 model output AND cursors are discarded, and its material is re-consumed
 relative to the winner's cursors).
 
-Scheduling is NOT wired here (scheduler.py is another agent's partition); the
-23:30 SGT gated job lives in PATCH-NOTES-B3.md until integrated.
+``scheduler.py`` mounts ``compact_all`` as the gated 23:30 SGT
+``memory-compact`` job.
 """
 from __future__ import annotations
 

@@ -6,9 +6,9 @@ line — REVIEW-D5 M3), the archive conditional claim AND its atomic freeze
 interleave an archive right before the write — REVIEW-D5 H1), idempotent
 linking (INSERT OR IGNORE + UNIQUE is the arbiter), per-kind referential
 validation including research_trees with cherry-pick degradation (REVIEW-D5
-M1), the two-rail research merge in get()/digest_md()/n_links (REVIEW-D5 L2),
+M1), the two-rail research merge in get()/digest()/digest_md()/n_links (REVIEW-D5 L2),
 the 8KB digest clamp and heading escape (REVIEW-D5 M3) — plus the
-enqueue(project_id=) backward-compatible extension and the four API routes
+enqueue(project_id=) backward-compatible extension and the project API routes
 (router mounted on a bare FastAPI app, test_operator idiom).
 """
 from __future__ import annotations
@@ -117,6 +117,10 @@ async def test_archive_conditional_and_idempotent():
     again = await projects.archive(p["id"])
     assert again["status"] == "archived"
     assert await projects.archive("nope") is None
+    active = await projects.unarchive(p["id"])
+    assert active["status"] == "active"
+    assert (await projects.unarchive(p["id"]))["status"] == "active"
+    assert await projects.unarchive("nope") is None
 
 
 # ---- link / unlink ---------------------------------------------------------------
@@ -223,6 +227,15 @@ async def test_unlink():
     await projects.link(p["id"], "research", item["id"])
     assert await projects.unlink(p["id"], "research", item["id"]) is True
     assert await projects.unlink(p["id"], "research", item["id"]) is False
+    direct = await research.enqueue("解绑直挂话题", project_id=p["id"])
+    await projects.link(p["id"], "research", direct["id"])
+    assert await projects.unlink(p["id"], "research", direct["id"]) is True
+    assert (await db.query_one(
+        "SELECT project_id FROM research_queue WHERE id = ?", (direct["id"],)
+    ))["project_id"] is None
+    assert all(r["ref_id"] != direct["id"] for r in (await projects.get(p["id"]))["links"]["research"])
+    with pytest.raises(ValueError, match="unknown link kind"):
+        await projects.unlink(p["id"], "bogus", item["id"])
 
 
 # ---- get (expanded) ----------------------------------------------------------------
@@ -288,6 +301,21 @@ async def test_digest_md_renders_and_clamps():
     clamped = await projects.digest_md(big["id"])
     assert len(clamped.encode("utf-8")) <= DIGEST_CAP_BYTES
     assert "[digest truncated at 8KB]" in clamped
+
+
+async def test_digest_groups_counts_and_limits_recent_timeline():
+    p = await projects.create("结构化摘要")
+    item = await research.enqueue("摘要研究", project_id=p["id"])
+    board_id = await _mk_board("摘要白板")
+    await projects.link(p["id"], "board", board_id)
+
+    summary = await projects.digest(p["id"], limit=1)
+    assert summary["name"] == "结构化摘要"
+    assert summary["counts"] == {"research": 1, "board": 1, "thread": 0, "tree": 0}
+    assert len(summary["timeline"]) == 1
+    assert summary["timeline"][0]["title"] in {"摘要研究", "摘要白板"}
+    assert {item["id"], board_id} >= {summary["timeline"][0]["ref_id"]}
+    assert await projects.digest("nope") is None
 
 
 async def test_digest_escapes_markdown_in_project_name():
@@ -388,8 +416,43 @@ async def test_api_links_and_digest():
         assert (await client.post("/api/projects/ghost/links",
                                   json={"kind": "research", "ref_id": item["id"]})).status_code == 400
 
+        r = await client.get(f"/api/projects/{pid}/digest", params={"limit": 1})
+        assert r.status_code == 200
+        assert r.json()["counts"]["research"] == 1
+        assert r.json()["timeline"][0]["title"] == "API 链接话题"
+        assert (await client.get("/api/projects/nope/digest")).status_code == 404
+
         r = await client.get(f"/api/projects/{pid}/digest.md")
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/markdown")
         assert "API 链接话题" in r.text
         assert (await client.get("/api/projects/nope/digest.md")).status_code == 404
+
+        assert (await client.post(f"/api/projects/{pid}/archive")).json()["status"] == "archived"
+        refused = await client.post(
+            f"/api/projects/{pid}/links", json={"kind": "research", "ref_id": item["id"] + "x"}
+        )
+        assert refused.status_code == 400  # reference validation runs before lifecycle validation
+        refused = await client.post(
+            f"/api/projects/{pid}/links", json={"kind": "research", "ref_id": item["id"]}
+        )
+        assert refused.status_code == 200  # idempotent replay remains allowed while archived
+        other = await research.enqueue("API 归档拒绝新链接")
+        refused = await client.post(
+            f"/api/projects/{pid}/links", json={"kind": "research", "ref_id": other["id"]}
+        )
+        assert refused.status_code == 409
+
+        assert (await client.post(f"/api/projects/{pid}/unarchive")).json()["status"] == "active"
+        assert (await client.post(f"/api/projects/{pid}/unarchive")).status_code == 200
+        assert (await client.post("/api/projects/nope/archive")).status_code == 404
+        assert (await client.post("/api/projects/nope/unarchive")).status_code == 404
+
+        removed = await client.delete(
+            f"/api/projects/{pid}/links/research/{item['id']}"
+        )
+        assert removed.status_code == 204 and removed.content == b""
+        again = await client.delete(
+            f"/api/projects/{pid}/links/research/{item['id']}"
+        )
+        assert again.status_code == 204

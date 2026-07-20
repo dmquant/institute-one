@@ -71,9 +71,8 @@ so extraction never blocks on curation.
 
 Hooks: ``register()`` subscribes ``research.completed`` and
 ``workflow.completed`` (filtered to workflow_id='daily' — the compiled 每日日报;
-there is no dedicated daily.completed event). Handlers never raise. Mounting
-``register()`` into the app lifespan is the main agent's patch — see
-PATCH-NOTES-C3.md.
+there is no dedicated daily.completed event). Handlers never raise, and the
+app lifespan calls ``register()``.
 """
 from __future__ import annotations
 
@@ -696,8 +695,7 @@ async def _on_workflow_completed(event: bus.Event) -> None:
 
 
 def register() -> None:
-    """Hook the extractor into the bus. Called once from the app lifespan
-    (mounting is the main agent's patch — PATCH-NOTES-C3.md)."""
+    """Hook the extractor into the bus. Called once from the app lifespan."""
     bus.on("research.completed", _on_research_completed)
     bus.on("workflow.completed", _on_workflow_completed)
     log.info("forecast extractor registered (research.completed + daily workflow.completed)")

@@ -16,12 +16,9 @@ the verified Phase 0 finding. The posture:
   (``install_auth``) — the misconfiguration the roadmap item exists for.
 
 The token is re-read per request (cheap: one settings attribute / env probe),
-so tests and a future hot-reload never fight a cached copy. It is sourced
-from ``settings.token`` when the config field exists, falling back to the
-raw ``INSTITUTE_TOKEN`` environment variable until the ``config.py`` field
-lands (config.py is outside this card's partition — see PATCH-NOTES-E6.md;
-note the fallback reads the real environment only, not ``.env``, which
-pydantic alone parses).
+so tests and runtime environment changes never fight a cached copy.
+``settings.token`` is the normal source (including ``.env``); the raw process
+``INSTITUTE_TOKEN`` variable remains a compatibility fallback.
 
 Implementation is a pure ASGI middleware, not ``BaseHTTPMiddleware``: the
 response is passed through verbatim with no wrapping, so the SSE event
@@ -48,8 +45,8 @@ _EXEMPT_PATHS = ("/health",)  # exact-match exemptions (probes)
 def configured_token() -> str | None:
     """The bearer token in force, or None (auth disabled).
 
-    ``settings.token`` once the config field lands; raw ``INSTITUTE_TOKEN``
-    env var as the interim source. Empty strings mean "unset".
+    ``settings.token`` is authoritative when set; raw ``INSTITUTE_TOKEN`` is
+    the compatibility fallback. Empty strings mean "unset".
     """
     token = getattr(get_settings(), "token", None) or os.environ.get("INSTITUTE_TOKEN")
     return token or None
@@ -95,9 +92,8 @@ class BearerAuthMiddleware:
 def install_auth(app: FastAPI) -> None:
     """Mount the middleware + warn on a non-loopback bind without a token.
 
-    Called once from ``create_app()`` (the one-line mount in app/main.py —
-    PATCH-NOTES-E6.md). The warning fires at app construction, not per
-    request: it flags the configuration, not the traffic.
+    Called once from ``create_app()``. The warning fires at app construction,
+    not per request: it flags the configuration, not the traffic.
     """
     settings = get_settings()
     if settings.host not in ("127.0.0.1", "localhost", "::1") and configured_token() is None:

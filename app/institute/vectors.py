@@ -82,7 +82,7 @@ _ollama_down_key: tuple[str, str] | None = None
 
 # Successful embeddings are content-addressed by (model, sha256(text)). This
 # deliberately stays process-local because migration 0007 has no content_hash
-# column and this card may not add a migration.
+# column; persistent chunk rows remain keyed by their source projection.
 _embed_cache: OrderedDict[tuple[str, str], tuple[float, ...]] = OrderedDict()
 
 # Lightweight /api/tags health probe cache. The key includes host + model so a

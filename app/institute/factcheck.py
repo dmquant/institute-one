@@ -35,11 +35,11 @@ ROADMAP Phase 3 (proposal §6.2 row 3). The pipeline:
    atomically materializes one mailbox thread/note/dispatch and marks the row
    delivered; ``factcheck.disputed`` remains the vault exporter signal.
 
-Scheduling is NOT wired here (scheduler.py / main.py are other partitions);
-the 30-min gated job and the ``register()`` call live in PATCH-NOTES-C1.md
-until integrated. Everything in this module follows the house rules: model
-calls only via executor.submit, conditional claims by rowcount, bus.now_iso()
-/ work_date() for time, handlers/tick never raise.
+The app lifespan calls ``register()``, and ``scheduler.py`` mounts ``tick()``
+as the gated 30-minute ``factcheck-tick`` job. Everything in this module
+follows the house rules: model calls only via executor.submit, conditional
+claims by rowcount, bus.now_iso() / work_date() for time, handlers/tick never
+raise.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ EXTRACT_TEXT_CAP = 6000        # source text slice fed to the extraction prompt
 EXTRACT_PER_TICK = 2           # extraction tasks one tick may run
 VERIFY_PER_TICK = 3            # verification tasks one tick may run (within the daily cap)
 STALE_RUNNING_MINUTES = 60     # extraction rows / verifying cards stuck longer are re-opened
-DEFAULT_DAILY_CAP = 10         # INSTITUTE_FACTCHECK_DAILY_CAP fallback (config field: PATCH-NOTES-C1)
+DEFAULT_DAILY_CAP = 10         # INSTITUTE_FACTCHECK_DAILY_CAP fallback
 OUTBOX_MAX_ATTEMPTS = 5        # terminal failed after this many delivery attempts
 OUTBOX_PER_DRAIN = 20          # bounded scheduler batch
 CLAIM_CHECK_MIN_SIM = 0.75     # claim_check vector recall floor (loose on purpose: writing-time hints)
@@ -197,8 +197,7 @@ def _now_plus_days(days: float) -> str:
 
 
 def _daily_cap() -> int:
-    # Defensive read: the setting lands via PATCH-NOTES-C1 (config.py is
-    # another partition). Missing == the documented default.
+    # A missing/None/invalid setting falls back to the documented default.
     try:
         return max(0, int(getattr(get_settings(), "factcheck_daily_cap", DEFAULT_DAILY_CAP)))
     except (TypeError, ValueError):
@@ -207,8 +206,8 @@ def _daily_cap() -> int:
 
 def _extract_hand() -> str:
     """Cheap-hand routing for extraction (ROADMAP: opencode/cheap hand).
-    Defensive read — the config field ships via PATCH-NOTES-C1; missing or
-    empty falls back to the default hand (tests: echo)."""
+    An optional settings extension can override it; missing or empty falls
+    back to the default hand (tests: echo)."""
     s = get_settings()
     return str(getattr(s, "factcheck_extract_hand", "") or "") or s.default_hand
 
@@ -937,7 +936,7 @@ async def _surface_dispute(
         log.exception("factcheck.disputed emit failed for card %s", card.get("id"))
 
 
-# ---- hooks (bus.on subscriptions; wiring line in PATCH-NOTES-C1.md) -----------
+# ---- hooks (bus.on subscriptions; registered by the app lifespan) ------------
 
 async def enqueue_extraction(
     source_kind: str, source_ref: str, analyst_id: str | None = None,
@@ -981,8 +980,7 @@ async def _on_research_completed(event: bus.Event) -> None:
 
 def register() -> None:
     """Hook the fact-check queue into the bus. Called once from the app
-    lifespan (the one-line mount is in PATCH-NOTES-C1.md — zero edits to the
-    whiteboard/research partitions)."""
+    lifespan."""
     bus.on("whiteboard.card_completed", _on_card_completed)
     bus.on("research.completed", _on_research_completed)
     log.info("factcheck hooks registered (card_completed, research.completed)")
@@ -1054,7 +1052,7 @@ async def _source_text(row: dict[str, Any]) -> str | None:
     return None
 
 
-# ---- the tick (scheduler entrypoint; mount in PATCH-NOTES-C1.md) ---------------
+# ---- the tick (scheduler entrypoint) ------------------------------------------
 
 async def _recover_stale_running() -> None:
     cutoff = (
@@ -1136,7 +1134,7 @@ async def _drain_extractions(cap: int) -> int:
 
 async def tick() -> dict[str, Any]:
     """Scheduler job body (30-min interval, gated=True — it starts model
-    work; mount in PATCH-NOTES-C1.md). Never raises."""
+    work). Never raises."""
     out: dict[str, Any] = {"extracted": 0, "verified": 0}
     try:
         await _recover_stale_running()

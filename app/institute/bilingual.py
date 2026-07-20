@@ -8,8 +8,8 @@ summary / text_bytes — the full translation lives exactly once, in the
 ``tasks`` row the translation ran as (``tasks.output``, executor 200KB cap);
 consumers dereference ``task_id``. The vault WRITE side — an exporter
 handler deriving the ``..._en.md`` sibling from the existing export filename
-convention — belongs to the exporter's owner and is specified in
-PATCH-NOTES-D5.md; this module never touches the vault.
+convention — lives in ``vault/exporter.py``; this module never touches the
+vault.
 
 Trigger chain (all opt-in, quota-safe by default):
 
@@ -30,8 +30,7 @@ Trigger chain (all opt-in, quota-safe by default):
 default hand; ``TRANSLATE_PROMPT`` is a NEW constant (rule 4 untouched) and
 is byte-stable so the echo hand makes the whole chain testable offline.
 
-``register()`` subscribes the handler; mounting it into the app lifespan is
-the main agent's one-line patch — PATCH-NOTES-D5.md (forecast_extract idiom).
+``register()`` subscribes the handler and is called by the app lifespan.
 """
 from __future__ import annotations
 
@@ -88,7 +87,7 @@ END_DOCUMENT\
 TWIN_SUMMARY_CAP = 500
 
 # Twin tasks being driven by THIS process (whiteboard _bg_tasks idiom).
-# Draining at shutdown is the main agent's patch — PATCH-NOTES-D5.md.
+# The app shutdown drain includes this registry.
 _bg_tasks: set[asyncio.Task] = set()
 # A process-local companion to the durable ``status='translating'`` claim.
 # This app is deliberately single-process; an empty set after restart means a
@@ -839,7 +838,6 @@ async def _on_workflow_completed(event: bus.Event) -> None:
 
 
 def register() -> None:
-    """Hook the twin trigger into the bus. Called once from the app lifespan
-    (mounting is the main agent's patch — PATCH-NOTES-D5.md)."""
+    """Hook the twin trigger into the bus. Called once from the app lifespan."""
     bus.on("workflow.completed", _on_workflow_completed)
     log.info("bilingual twins registered (workflow.completed, default off)")

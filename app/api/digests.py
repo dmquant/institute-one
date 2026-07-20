@@ -8,9 +8,9 @@ what the model saw. Bodies are clamped to 8KB with an explicit truncation
 marker (institute/digests.py owns the rendering rules).
 
 Robustness stance: these endpoints always answer 200 with markdown — unknown
-analyst ids, empty tables, or tables owned by later phases all degrade to a
-stable placeholder document rather than a 4xx/5xx, so a failing curl never
-poisons a prompt with an error page.
+analyst ids, empty/legacy databases, and the intentionally unwired operator
+digest all degrade to a stable placeholder document rather than a 4xx/5xx, so
+a failing curl never poisons a prompt with an error page.
 """
 from __future__ import annotations
 
@@ -42,11 +42,11 @@ async def analyst_memory(analyst_id: str):
 
 @router.get("/analyst-disputes/{analyst_id}.md")
 async def analyst_disputes(analyst_id: str):
-    """Disputed claims for the analyst — stable placeholder until fact-check v2 (Phase 3)."""
+    """Disputed claims from the live fact-check tables; stable empty document when none."""
     return _md(await digests.analyst_disputes_md(analyst_id))
 
 
 @router.get("/operator-actions-digest.md")
 async def operator_actions_digest():
-    """Operator-actions digest — stable placeholder until the operator console (Phase 6)."""
+    """Legacy placeholder route; the live action feed is under ``/api/operator``."""
     return _md(await digests.operator_actions_md())

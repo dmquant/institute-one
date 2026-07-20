@@ -2,8 +2,7 @@
 
 Same /api/research prefix as the research-queue router (FastAPI merges
 routers; the /tree* paths are disjoint from /queue*). The SSE viewer contract
-(events + polling shape for the /research/tree/:id SPA page) is documented in
-PATCH-NOTES-D4.md — the frontend itself is another partition.
+(events + polling shape) serves the ``/research/tree/:id`` SPA page.
 """
 from __future__ import annotations
 

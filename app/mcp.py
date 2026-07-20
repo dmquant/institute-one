@@ -806,9 +806,8 @@ async def _t_topic_pool_add(args: dict) -> Any:
     # rowcount (atomic under the db write lock). Any pre-check here is both racy
     # and inequivalent to the domain content hash — sha256(topic + question) has
     # no separator, so e.g. ("机器人产业链", "") and ("机器人", "产业链") collide
-    # (REVIEW-A2 M1/M2). Until PATCH-NOTES-A2.md lands the "inserted" key in
-    # add_topic(), this conservatively reports duplicate (the row is written
-    # either way) and never emits a phantom topic_pool.added.
+    # (REVIEW-A2 M1/M2). add_topic() returns the INSERT's atomic ``inserted``
+    # verdict, so this path never emits a phantom topic_pool.added.
     if not row.get("inserted"):
         return {"added": False, "duplicate": True, "id": row.get("id"), "topic": topic}
     await bus.emit("topic_pool.added", "topic", str(row.get("id", "")), {"topic": topic, "source": "mcp"})

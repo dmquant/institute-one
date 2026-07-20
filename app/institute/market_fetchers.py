@@ -29,9 +29,9 @@ problem. Rendered bundles are upserted into ``shared_data`` keyed
 ``(topic, work_date)`` (migrations/0014) as audit trail + API cache. Missing
 data renders as "" so prompts degrade without a trace.
 
-Settings bridge: config.py is outside this card's partition, so the settings
-below read ``getattr(settings, ...)`` first (works as soon as the main agent
-adds the fields per PATCH-NOTES-B5.md) and fall back to os.environ:
+Settings bridge: these fields are declared in ``config.py``. The helpers below
+read the settings object first and retain a raw-process-environment fallback
+for compatibility:
   INSTITUTE_FMP_API_KEY           -> settings.fmp_api_key
   INSTITUTE_FETCH_PROXY           -> settings.fetch_proxy
   INSTITUTE_MARKET_FETCH_ENABLED  -> settings.market_fetch_enabled
@@ -75,7 +75,7 @@ USER_AGENT = "Mozilla/5.0 (institute-one market fetcher)"
 # ---- settings bridge --------------------------------------------------------
 
 def _setting(attr: str, env: str) -> str:
-    """settings field when config.py has grown it (PATCH-NOTES-B5), else env."""
+    """Configured settings field, with a raw process-environment fallback."""
     val = getattr(get_settings(), attr, None)
     if val is not None and str(val).strip():
         return str(val).strip()
@@ -650,8 +650,8 @@ async def refresh_security(security_id: str, *, days: int = BUNDLE_BAR_DAYS) -> 
 
 async def refresh_all(limit: int = 20) -> dict[str, Any]:
     """Refresh the stalest active securities (fetchable markets only). The
-    scheduler mounts this hourly (PATCH-NOTES-B5.md); it no-ops when fetching
-    is disabled or there is nothing to refresh, and never raises per item."""
+    scheduler mounts this as ``market-refresh``; it no-ops when fetching is
+    disabled or there is nothing to refresh, and never raises per item."""
     if not market_fetch_enabled():
         return {"enabled": False, "refreshed": 0, "items": []}
     rows = await db.query(

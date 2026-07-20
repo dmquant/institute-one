@@ -35,9 +35,9 @@ artifacts is the HAPPY path here, never a stub.
 Scheduling: run_once() never raises (errors come back in the summary dict);
 called with no date it settles the PREVIOUS SGT day (designed for a 00:05 SGT
 daily job — settling "today" at 23:45 would permanently miss end-of-day tasks,
-REVIEW-B2 M2). Job registration lives with the main agent — see
-PATCH-NOTES-B2.md; this module deliberately does not import or touch
-scheduler.py.
+REVIEW-B2 M2). ``scheduler.py`` mounts it as the ungated
+``hand-scorecard`` job; this module deliberately does not import the
+scheduler.
 """
 from __future__ import annotations
 
@@ -297,7 +297,7 @@ async def run_once(date: str | None = None) -> dict[str, Any]:
     scorecard.completed event — re-running is safe, not strictly idempotent
     in side effects).
 
-    Never raises: scheduler-facing (the PATCH-NOTES-B2 job wraps this in
+    Never raises: scheduler-facing (the ``hand-scorecard`` job wraps this in
     @metered as a second belt). Errors come back as {"date", "error"}.
     """
     d = date or previous_work_date()

@@ -14,11 +14,10 @@ Contract for every renderer in this module:
   summaries, memory compacts) is quoted verbatim, never paraphrased.
 - **Bounded.** Each digest is clamped to ``DIGEST_CAP_BYTES`` (8KB) with an
   explicit truncation marker — a digest is a context block, not an archive.
-- **Degrade, never 500.** Tables owned by other phases may be missing on an
-  older checkout (``analyst_memory`` from the memory card; ``fact_cards`` /
-  ``verified_facts`` from Phase 3; ``operator_actions`` is Phase 6). Missing
-  table/column ⇒ a stable placeholder document, so prompts can already embed
-  the curl today.
+- **Degrade, never 500.** Memory and fact-check renderers retain compatibility
+  with databases that predate their tables: a missing table/column yields the
+  same stable empty document as no rows. The operator-actions digest remains a
+  legacy placeholder; the live operator feed is exposed by the operator API.
 """
 from __future__ import annotations
 
@@ -120,9 +119,8 @@ async def recent_reports_md(days: int = 7) -> str:
 async def analyst_memory_md(analyst_id: str) -> str:
     """Latest ``analyst_memory`` compact for one analyst, verbatim.
 
-    The table belongs to the Phase 2 analyst-memory card (may not be migrated
-    yet on this checkout): missing table/column or no rows ⇒ the stable
-    placeholder ``# no memory yet`` instead of a 500.
+    A database that predates the analyst-memory migration, or one with no
+    rows, yields the stable placeholder ``# no memory yet`` instead of a 500.
     """
     try:
         row = await db.query_one(
@@ -149,10 +147,10 @@ _DISPUTE_LABELS = {
 async def analyst_disputes_md(analyst_id: str) -> str:
     """Disputed / self-contradicted claims charged to one analyst, newest first.
 
-    Backed by the Phase 3 fact-check tables (``fact_cards`` joined to
-    ``verified_facts`` for evidence/urls). A checkout without migration 0015
-    degrades to the stable ``# no disputes recorded`` placeholder — same
-    document an analyst with a clean record gets.
+    Backed by ``fact_cards`` joined to ``verified_facts`` for evidence/urls.
+    A database without migration 0015 degrades to the stable
+    ``# no disputes recorded`` placeholder — the same document an analyst
+    with a clean record gets.
     """
     try:
         rows = await db.query(
@@ -192,14 +190,13 @@ async def analyst_disputes_md(analyst_id: str) -> str:
     return clamp_md("\n".join(lines) + "\n")
 
 
-# ---- placeholders for later phases ------------------------------------------
+# ---- legacy compatibility placeholder ---------------------------------------
 
 
 async def operator_actions_md() -> str:
-    """Operator-actions digest — **placeholder until the operator console**.
+    """Legacy stable placeholder for the operator-actions digest route.
 
-    The ``operator_actions`` table arrives in ROADMAP Phase 6; the URL shape
-    is stable now so prompts can embed the curl before the data exists (the
-    path :func:`analyst_disputes_md` already went down).
+    The operator console and action feed are live under ``/api/operator``;
+    this original curl-back route has not been connected to that feed.
     """
     return "# no operator actions recorded\n\n_operator console lands in ROADMAP Phase 6_\n"

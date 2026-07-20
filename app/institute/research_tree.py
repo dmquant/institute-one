@@ -15,8 +15,8 @@ The loop (house rules throughout):
    the counter reads "attempts booked", not "trees created"; REVIEW-D4 N2),
    then inserts the tree + its root node (depth 0, pending) in one
    transaction.
-2. **tick()** is the scheduler entrypoint (5-min gated interval; the mount
-   lives in PATCH-NOTES-D4.md) and never raises. It first sweeps strays
+2. **tick()** is the scheduler entrypoint (5-min gated interval) and never
+   raises. It first sweeps strays
    (pending rows stranded under terminal trees are pruned; stalled trees are
    settled/announced), then conditional-claims up to :data:`NODES_PER_TICK`
    pending nodes in BFS order (``ORDER BY depth, created_at`` — same layer
@@ -60,10 +60,9 @@ The loop (house rules throughout):
    conditional claim on the ``announced_at`` column — exactly one event per
    drain generation (a manual failed-node retry starts a new generation),
    payload read from the database rows after the terminal state is durable.
-   Crash recovery: ``recover_orphans()`` at boot prunes running
-   nodes under terminal trees and requeues the rest (mount in
-   PATCH-NOTES-D4.md); the tick sweep settles/announces whatever a crash
-   left unflipped or unannounced.
+   Crash recovery: the app lifespan calls ``recover_orphans()`` to prune
+   running nodes under terminal trees and requeue the rest; the tick sweep
+   settles/announces whatever a crash left unflipped or unannounced.
 
 Bus events (SSE-visible via /api/events/stream?types=tree.):
 ``tree.node_completed`` (every node reaching completed/failed),
@@ -710,8 +709,8 @@ async def _sweep_trees() -> int:
 
 
 async def tick() -> dict[str, Any]:
-    """Scheduler job body (5-min gated interval — it starts model work;
-    mount in PATCH-NOTES-D4.md). Never raises."""
+    """Scheduler job body (5-min gated interval — it starts model work).
+    Never raises."""
     out: dict[str, Any] = {"claimed": 0, "completed": 0, "failed": 0, "finalized": 0}
     try:
         out["finalized"] = await _sweep_trees()
@@ -739,8 +738,8 @@ async def tick() -> dict[str, Any]:
 
 
 async def recover_orphans() -> int:
-    """Boot-time sweep (the research.py idiom; lifespan mount line in
-    PATCH-NOTES-D4.md). Running nodes under TERMINAL trees are pruned — a
+    """Boot-time sweep (the research.py idiom), called by the app lifespan.
+    Running nodes under TERMINAL trees are pruned — a
     stopped/finished tree must never re-run work, and a requeued pending row
     there would be unclaimable by design (REVIEW-D4 H2). Running nodes under
     live trees requeue as pending. Unannounced terminal trees are settled by

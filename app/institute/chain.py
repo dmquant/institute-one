@@ -52,10 +52,9 @@ Vault writes all flow through ``vault.writer`` (never-clobber ledger).
 Historical notes exported BEFORE a node existed are healed on demand by
 ``reproject_footers()`` (``POST /api/chain/reproject``): footers are
 recomputed from the on-disk bodies and rewritten through the writer.
-Wiring that lives OUTSIDE this partition is documented in PATCH-NOTES-C2.md:
-``chain.register()`` in the app lifespan, the scheduler tick job, the API
-router mount, and the ``entity_footer`` / ``## Entities`` injection points in
-``vault/exporter.py``.
+The app lifespan calls ``chain.register()``, the scheduler mounts the hourly
+tick, the API router is mounted, and ``vault/exporter.py`` injects
+``entity_footer`` / ``## Entities`` projections.
 """
 from __future__ import annotations
 
@@ -970,7 +969,7 @@ async def _auto_promote() -> int:
     return promoted
 
 
-# ---- hourly tick (scheduler job body; mounting lives in PATCH-NOTES-C2) -------------
+# ---- hourly tick (scheduler job body) -----------------------------------------------
 
 _tick_lock = asyncio.Lock()
 
@@ -1142,8 +1141,7 @@ async def entity_footer(text: str) -> str:
     """``## Entities`` wikilink footer for an exported note body: every known
     node whose name/alias appears in ``text``, in first-appearance order.
     Links target each node's persisted unique slug (REVIEW-C2 M3). Empty
-    string when nothing matches — callers append only non-empty footers.
-    (Exporter-side injection diffs live in PATCH-NOTES-C2.md.)"""
+    string when nothing matches — callers append only non-empty footers."""
     hits = await _match_hits(text or "")
     if not hits:
         return ""
@@ -1380,7 +1378,7 @@ async def reproject_footers(kind: str | None = None, cap: int = 50) -> dict[str,
 
 def register() -> None:
     """Hook the chain tagger + vault projection into the bus. Called once from
-    the app lifespan (the one-line mount lives in PATCH-NOTES-C2.md)."""
+    the app lifespan."""
     for event_type in ARTIFACT_EVENT_TYPES:
         bus.on(event_type, _on_artifact_event)
     bus.on("chain.node_updated", _on_node_updated)

@@ -7,7 +7,7 @@ from ..institute import factcheck
 
 # No prefix: the writing-time check lives under /api/meta/* per ROADMAP
 # Phase 3 ("claim-check-before-write"), not under a /api/factcheck tree.
-# Mounted in app/main.py (one-line include; see PATCH-NOTES-C1.md).
+# Mounted in app/main.py.
 router = APIRouter(tags=["factcheck"])
 
 CARD_STATUSES = ("pending", "verified", "disputed", "unverifiable", "reused", "self_contradicted")

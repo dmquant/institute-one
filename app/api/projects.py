@@ -1,15 +1,12 @@
 """Research projects API (ROADMAP Phase 7).
 
-Four routes per the card: create/list projects, attach links, read one
-project (attachments expanded), and the markdown digest. Archive/unlink stay
-domain-level for now (MCP / SPA follow-ups — PATCH-NOTES-D5.md). The digest
-route answers ``text/markdown`` like the /api/institute/*.md family, but 404s
-on an unknown id — a project digest is an addressed resource, not a Step-0
-curl placeholder.
+Create/list/read projects, manage their lifecycle and links, and expose both
+structured and markdown digests. Addressed resources 404 when the project is
+unknown; deleting a link is idempotent and always returns 204.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -54,16 +51,50 @@ async def get_project(project_id: str):
     return project
 
 
+@router.post("/{project_id}/archive")
+async def archive_project(project_id: str):
+    project = await projects.archive(project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    return project
+
+
+@router.post("/{project_id}/unarchive")
+async def unarchive_project(project_id: str):
+    project = await projects.unarchive(project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    return project
+
+
 @router.post("/{project_id}/links")
 async def add_link(project_id: str, body: LinkBody):
     try:
         return await projects.link(project_id, body.kind, body.ref_id)
     except ValueError as exc:  # unknown kind/ref, unknown or archived project
+        status_code = 409 if str(exc).endswith(" is archived") else 400
+        raise HTTPException(status_code, str(exc)) from exc
+
+
+@router.delete("/{project_id}/links/{kind}/{ref_id}", status_code=204)
+async def remove_link(project_id: str, kind: str, ref_id: str):
+    try:
+        await projects.unlink(project_id, kind, ref_id)
+    except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    return Response(status_code=204)
+
+
+@router.get("/{project_id}/digest")
+async def project_digest(project_id: str, limit: int = 10):
+    summary = await projects.digest(project_id, limit=limit)
+    if summary is None:
+        raise HTTPException(404, "project not found")
+    return summary
 
 
 @router.get("/{project_id}/digest.md")
-async def project_digest(project_id: str):
+async def project_digest_md(project_id: str):
     text = await projects.digest_md(project_id)
     if text is None:
         raise HTTPException(404, "project not found")

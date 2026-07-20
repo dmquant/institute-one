@@ -1,7 +1,8 @@
 """institute-one — application factory.
 
 One process: API + scheduler + all domain loops + static operator SPA + vault
-exporter. Bind: 127.0.0.1, no auth (single operator, single machine).
+exporter. The default bind is 127.0.0.1; optional bearer auth is enforced when
+``INSTITUTE_TOKEN`` is configured.
 """
 from __future__ import annotations
 

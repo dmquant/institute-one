@@ -163,8 +163,8 @@ class HandRegistry:
     # is synchronous and resolve() runs inside executor locks, so the registry
     # never touches the DB itself. Instead it holds a process-local cache that
     # async callers push into: the weights API (app/api/hands.py) refreshes it
-    # on every PUT (and opportunistically on GET), and boot code must pre-warm
-    # it once after init_registry() (see PATCH-NOTES-B2.md). The cache starts
+    # on every PUT (and opportunistically on GET), and the app lifespan
+    # pre-warms it after init_registry(). The cache starts
     # as None ("never loaded", REVIEW-B2 M3): picks still work — every hand
     # weighs a neutral 1.0, exactly the DB-empty behaviour — but the first use
     # logs ONE warning so a missing pre-warm is visible instead of silently
@@ -194,7 +194,7 @@ class HandRegistry:
             log.warning(
                 "hand_weights cache never loaded in this process — picking with "
                 "neutral 1.0 weights; pre-warm via refresh_weights_cache() at boot "
-                "(PATCH-NOTES-B2.md) or PUT /api/hands/weights"
+                "or PUT /api/hands/weights"
             )
 
     def weight_for(self, scope: str, hand: str) -> float:
@@ -218,9 +218,9 @@ class HandRegistry:
     ) -> str | None:
         """Weighted-random pick of one hand from ``live_pool``.
 
-        Opt-in for scope callers (whiteboard/research/daily/mailbox rotations):
-        resolve()/resolve_chain() keep their deterministic first-available
-        semantics and do NOT call this. Wiring call sites is a follow-up card.
+        Opt-in scope callers (whiteboard/research/daily/mailbox rotations) call
+        this explicitly. resolve()/resolve_chain() keep their deterministic
+        first-available semantics and do NOT call it.
 
         - ``live_pool``: hand names the caller already established as usable
           (e.g. filtered through ``is_available``). Order does not matter.

@@ -30,9 +30,9 @@ tests/test_operator.py:
    ``operator:confidence_floor`` (``get_confidence_floor()``;
    missing/corrupt row -> 0.7).
 
-Feeds (bus handlers, registered by ``register()`` — mounting: PATCH-NOTES-C4):
-- ``factcheck.disputed``  -> disputed_fact   (C1 is in flight; payload shape is
-  treated as untrusted — see ``FACTCHECK_DISPUTED_EVENT``)
+Feeds (bus handlers, registered by ``register()`` during app startup):
+- ``factcheck.disputed``  -> disputed_fact   (payload shape is treated as
+  untrusted — see ``FACTCHECK_DISPUTED_EVENT``)
 - ``task.failed``         -> failed_run      (skips the router's own
   classification tasks, or a failing hand would breed actions forever)
 - ``workflow.failed``     -> failed_run
@@ -49,11 +49,10 @@ router's propose-once-per-loop claim is likewise DB-backed: migrations/0022's
 partial unique index on ``(action_id, proposed_by)`` arbitrates concurrent
 same-loop calls (REVIEW-C4 P2 / F3 NIT-3).
 
-Scheduling (15-min fast tick + hourly deep tick, gated=True) is mounted by the
-main agent — see PATCH-NOTES-C4.md; this module deliberately does not import
-scheduler.py (the scorecard.py precedent).
+``scheduler.py`` mounts the 15-minute fast tick and hourly deep tick with
+``gated=True``; this module deliberately does not import the scheduler.
 
-Recipes (Phase 6 L item, minimal reuse loop — PATCH-NOTES-E7): a human-
+Recipes (Phase 6 L item, minimal reuse loop): a human-
 APPROVED disposition can be promoted into a recipe
 (``promote_disposition_to_recipe``); ``route_actions`` consults active recipes
 before calling a model — a match records the suggestion directly (marked by
@@ -328,7 +327,7 @@ _registered = False
 
 def register() -> None:
     """Hook the feeds onto the bus. Idempotent (safe to call more than once);
-    mounted once from the app lifespan — see PATCH-NOTES-C4.md."""
+    mounted once from the app lifespan."""
     global _registered
     if _registered:
         return

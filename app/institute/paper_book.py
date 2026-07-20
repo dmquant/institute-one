@@ -1,8 +1,7 @@
 """Paper book — virtual positions opened from forecasts (Phase 5, card C3).
 
 Positions are nominal (size 1.0): the book measures the QUALITY OF CALLS, not
-capital. Two scheduler jobs drive it (mounting is the main agent's patch —
-PATCH-NOTES-C3.md; both jobs are ungated: they spend zero model quota):
+capital. Two ungated scheduler jobs drive it (both spend zero model quota):
 
     opener (5-min tick)   ``opener_tick()`` scans open long/short forecasts
                           that have no position yet, prices the entry with the
@@ -72,7 +71,7 @@ losers count the collision and move on.
 
 Journal: ``render_journal(work_date)`` renders the day's opens/closes/NAV as
 markdown; the MTM job emits ``paper_book.marked`` and the vault exporter
-handler (PATCH-NOTES-C3.md) projects it to ``Book/journal/<date>.md``.
+handler projects it to ``Book/journal/<date>.md``.
 
 Attribution (REVIEW-C3 M5): every ``paper_book.closed`` payload carries the
 ``analyst_id`` recorded on the forecast's extraction claim (0019 provenance;

@@ -119,6 +119,17 @@ async def archive(project_id: str) -> dict[str, Any] | None:
     return await db.query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
 
 
+async def unarchive(project_id: str) -> dict[str, Any] | None:
+    """Re-open an archived project. Idempotent; None for an unknown id."""
+    row = await db.query_one("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if row is None:
+        return None
+    await db.execute(
+        "UPDATE projects SET status='active' WHERE id=? AND status='archived'", (project_id,)
+    )
+    return await db.query_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+
+
 async def link(project_id: str, kind: str, ref_id: str) -> dict[str, Any]:
     """Attach one artifact to a project. Idempotent: re-linking the same
     (kind, ref) returns ``linked=False`` (INSERT OR IGNORE + rowcount is the
@@ -171,13 +182,33 @@ async def link(project_id: str, kind: str, ref_id: str) -> dict[str, Any]:
 
 
 async def unlink(project_id: str, kind: str, ref_id: str) -> bool:
-    """Detach one artifact. True if a row was removed. Works on archived
-    projects too (curation of history is not a new attachment)."""
-    n = await db.execute(
-        "DELETE FROM project_links WHERE project_id=? AND kind=? AND ref_id=?",
-        (project_id, kind, ref_id),
-    )
-    return n > 0
+    """Detach one artifact. True if an association was removed.
+
+    Research has two attachment rails, so unlink clears both an explicit
+    project_links row and a direct research_queue.project_id assignment.
+    Works on archived projects too (curation of history is not a new link).
+    """
+    kind = (kind or "").strip()
+    ref_id = (ref_id or "").strip()
+    if kind not in LINK_KINDS:
+        raise ValueError(f"unknown link kind {kind!r} (one of {', '.join(LINK_KINDS)})")
+    if not ref_id:
+        raise ValueError("ref_id must not be empty")
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "DELETE FROM project_links WHERE project_id=? AND kind=? AND ref_id=?",
+            (project_id, kind, ref_id),
+        )
+        removed = cur.rowcount
+        await cur.close()
+        if kind == "research":
+            cur = await conn.execute(
+                "UPDATE research_queue SET project_id=NULL WHERE id=? AND project_id=?",
+                (ref_id, project_id),
+            )
+            removed += cur.rowcount
+            await cur.close()
+    return removed > 0
 
 
 # ---- read side ---------------------------------------------------------------
@@ -242,6 +273,43 @@ async def get(project_id: str) -> dict[str, Any] | None:
         "tree": await _linked_rows(project_id, "tree"),
     }
     return project
+
+
+async def digest(project_id: str, limit: int = 10) -> dict[str, Any] | None:
+    """Compact JSON-ready project summary with grouped counts and a recent
+    attachment timeline. None for an unknown project."""
+    project = await get(project_id)
+    if project is None:
+        return None
+    links = project["links"]
+    title_fields = {
+        "research": "topic",
+        "board": "topic",
+        "thread": "subject",
+        "tree": "root_topic",
+    }
+    timeline = [
+        {
+            "kind": kind,
+            "ref_id": row["ref_id"],
+            "title": row.get(title_fields[kind]) or row["ref_id"],
+            "created_at": row.get("created_at"),
+        }
+        for kind, rows in links.items()
+        for row in rows
+    ]
+    timeline.sort(
+        key=lambda row: (row["created_at"] or "", row["kind"], row["ref_id"]),
+        reverse=True,
+    )
+    limit = min(max(limit, 1), 50)
+    return {
+        "id": project["id"],
+        "name": project["name"],
+        "status": project["status"],
+        "counts": {kind: len(rows) for kind, rows in links.items()},
+        "timeline": timeline[:limit],
+    }
 
 
 # ---- digest -------------------------------------------------------------------
