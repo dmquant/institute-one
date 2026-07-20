@@ -13,7 +13,6 @@ from ..config import get_settings
 from ..hands.registry import DEFAULT_FALLBACK_CHAINS, get_registry
 from ..institute import memory
 from ..institute.analysts import get_analyst
-from ..institute.prompts import build_analyst_prompt
 from ..router import executor
 
 router = APIRouter(prefix="/api", tags=["tasks"])
@@ -175,8 +174,8 @@ def _prefer_idle_hand(hand: str) -> str:
 async def prepare_ask(body: AskBody) -> tuple[str, str]:
     """Shared ``/api/ask`` + ``/api/ask/stream`` preprocessing → (hand, prompt).
 
-    Persona wrap via ``build_analyst_prompt`` with the standing-memory block
-    (unknown analyst ⇒ 404), hand precedence body > analyst > default — then
+    Persona wrap via ``memory.prompt_with_memory`` (standing-memory block
+    included; unknown analyst ⇒ 404), hand precedence body > analyst > default — then
     the interactive idle-hand preference (交互优先空闲手, ROADMAP Phase 0):
     asks are ``source="api"`` interactive traffic, so when the caller did not
     explicitly pin a hand (``body.hand``) or a model (``body.model`` is
@@ -192,10 +191,7 @@ async def prepare_ask(body: AskBody) -> tuple[str, str]:
         analyst = get_analyst(body.analyst_id)
         if analyst is None:
             raise HTTPException(404, f"unknown analyst {body.analyst_id}")
-        prompt = build_analyst_prompt(
-            analyst, body.prompt,
-            memory_block=await memory.memory_block(analyst.id),
-        )
+        prompt = await memory.prompt_with_memory(analyst, body.prompt)
         hand = body.hand or analyst.hand or settings.default_hand
     if body.hand is None and body.model is None:
         hand = _prefer_idle_hand(hand)

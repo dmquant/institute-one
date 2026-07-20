@@ -825,7 +825,6 @@ async def _t_topic_pool_add(args: dict) -> Any:
 async def _t_institute_ask(args: dict) -> Any:
     from .institute import memory  # lazy: domain modules
     from .institute.analysts import get_analyst
-    from .institute.prompts import build_analyst_prompt
 
     prompt = args["prompt"].strip()
     if not prompt:
@@ -837,10 +836,7 @@ async def _t_institute_ask(args: dict) -> Any:
         analyst = get_analyst(analyst_id)
         if analyst is None:
             raise _invalid(f"unknown analyst: {analyst_id}")
-        prompt = build_analyst_prompt(
-            analyst, prompt,
-            memory_block=await memory.memory_block(analyst.id),
-        )
+        prompt = await memory.prompt_with_memory(analyst, prompt)
         hand = analyst.hand or hand
     task = await executor.submit(hand, prompt, source="mcp")
     output = task.output or ""
