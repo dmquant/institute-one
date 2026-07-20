@@ -158,7 +158,7 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 - ☑ **Actions kanban** (M). `operator_actions` (open/in-progress/done/dismissed) fed by: vault conflicts, disputed facts, scorecard anomalies, failed runs; SPA `/operator` kanban page with triage panel and feature switches; MCP read tool.
 - ☑ **Action router** (L). 15-min fast loop (cheap hand, small budget) + hourly deep loop (strong hand): classify actions, propose dispositions; **shadow mode first** (log, don't act), 0.7 confidence floor, hard human-pins for categories that must never auto-act (prompt/schedule changes).
 - ◔ **Recipes / observations / proposals / effect measurement** (L). Minimal recipe loop shipped: an approved disposition can be promoted to a recipe, recurring same-kind actions get zero-model-call suggestions (still shadow, still through the human approve gate); observations/proposals/parameter-history/effect-measurement remain open (M8-008).
-- ◔ **Triage page** (M). Maintenance toggle + drain status, feature switches (`feature_switches` in admin_state, per-subsystem), hand-weights pane, cron health, conflict list. (Backend switches/triage APIs exist but switches are stored/displayed only — not enforced, PUT is not CAS; no SPA operator route.)
+- ☑ **Triage page** (M). Maintenance toggle + drain status, feature switches (`feature_switches` in admin_state, per-subsystem), hand-weights pane, cron health, conflict list. (SPA `/operator` route with kanban/triage/switches panels; switches are enforced by `scheduler.metered()` — `job:<name>`=false skips the job and records a skip metric, default-enabled; PUT is version-CAS, concurrent writers get 409.)
 
 ## Phase 7 — Depth & breadth
 
