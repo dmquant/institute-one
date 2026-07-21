@@ -579,12 +579,16 @@ async def _t_operator_actions_list(args: dict) -> Any:
 
 @_tool(
     "forecasts_list",
-    "List forecast-ledger entries (falsifiable calls with deterministic settlement rules).",
+    "List forecast-ledger entries (falsifiable calls with deterministic settlement rules). "
+    "Shows the COMPLETE ledger by default, backfilled rows included (performance-stat "
+    "consumers use the HTTP API's default scope instead, which excludes origin='backfill').",
     _schema({
         "status": {"type": "string", "enum": ["open", "settled", "invalid"],
                    "description": "filter by forecast status"},
         "thesis_id": {"type": "string", "description": "filter by owning thesis"},
         "limit": {"type": "integer", "description": "max rows (default 50, cap 200)"},
+        "origin": {"type": "string", "enum": ["standard", "backfill", "all"],
+                   "description": "provenance filter (default all = complete ledger)"},
     }),
     output_cap=_READ_OUTPUT_CAP,
 )
@@ -594,6 +598,7 @@ async def _t_forecasts_list(args: dict) -> Any:
     limit = _clamp(args.get("limit"), 50, 1, 200)
     return await forecasts.list_forecasts(
         status=args.get("status"), thesis_id=args.get("thesis_id"), limit=limit,
+        origin=str(args.get("origin") or "all"),
     )
 
 
@@ -768,8 +773,15 @@ _register_optional_tools()
     "research_queue_add",
     "Queue a topic for autonomous deep research. Duplicate pending/running topics are not re-added; "
     "a topic already researched within the cooldown window is refused (structured result, not an error) "
-    "unless priority > 0.",
-    _schema({"topic": {"type": "string"}, "priority": {"type": "integer"}}, ["topic"]),
+    "unless priority > 0. An optional project_id attaches a new queue item to an active project.",
+    _schema({
+        "topic": {"type": "string"},
+        "priority": {"type": "integer"},
+        "project_id": {
+            "type": "string",
+            "description": "optional active projects.id for the new queue item",
+        },
+    }, ["topic"]),
 )
 async def _t_research_queue_add(args: dict) -> Any:
     from .institute import research  # lazy: domain module
@@ -778,15 +790,24 @@ async def _t_research_queue_add(args: dict) -> Any:
     if not topic:
         raise _invalid("topic must not be empty")
     priority = _clamp(args.get("priority"), 0, -100, 100)
+    project_id = (args.get("project_id") or "").strip() or None
     # the domain function owns dedup, the cooldown gate and the research.queued event
-    res = await research.enqueue(topic, priority=priority, source="mcp")
+    try:
+        res = await research.enqueue(
+            topic, priority=priority, source="mcp", project_id=project_id,
+        )
+    except ValueError as exc:
+        raise _invalid(str(exc)) from exc
     if res.get("refused"):
         return {"queued": False, "refused": res["refused"], "topic": topic,
                 "last_completed_at": res.get("last_completed_at")}
     if res.get("deduped"):
         return {"id": res["id"], "topic": topic, "status": res["status"], "duplicate": True}
-    return {"id": res["id"], "topic": topic, "priority": res["priority"],
-            "status": res["status"], "duplicate": False}
+    result = {"id": res["id"], "topic": topic, "priority": res["priority"],
+              "status": res["status"], "duplicate": False}
+    if project_id:
+        result["project_id"] = res.get("project_id")
+    return result
 
 
 @_tool(

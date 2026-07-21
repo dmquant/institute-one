@@ -3,6 +3,24 @@
 // app/institute/*.py and migrations/0001_init.sql.
 
 const BASE = "";
+export const AUTH_TOKEN_KEY = "institute:token";
+
+export function getAuthToken(): string {
+  return window.localStorage.getItem(AUTH_TOKEN_KEY)?.trim() ?? "";
+}
+
+export function setAuthToken(token: string): void {
+  const value = token.trim();
+  if (value) window.localStorage.setItem(AUTH_TOKEN_KEY, value);
+  else window.localStorage.removeItem(AUTH_TOKEN_KEY);
+}
+
+function withAuthHeaders(headers?: HeadersInit): Headers {
+  const merged = new Headers(headers);
+  const token = getAuthToken();
+  if (token) merged.set("Authorization", `Bearer ${token}`);
+  return merged;
+}
 
 // ---------------------------------------------------------------- types ----
 
@@ -13,7 +31,8 @@ export type TaskStatus =
   | "failed"
   | "rate_limited"
   | "cancelled"
-  | "expired";
+  | "expired"
+  | "overcommitted"; // born-terminal fast-fail: hand queue depth cap reached (0028)
 
 /** Full Task dataclass (GET /api/tasks/{id}, POST /api/ask). */
 export interface Task {
@@ -522,25 +541,38 @@ export interface OperatorTriage {
   };
 }
 
-// Multi-agent compare (C5, in flight) — defensive: 404 renders as 未启用.
-export interface MultiAgentResult {
-  agent?: string;
+// Multi-agent compare. POST /run returns either a settled verdict (200) or a
+// durable async handoff (202) whose tasks keep running and can be inspected.
+export interface MultiAgentOutput {
+  agent: string;
   hand?: string;
-  analyst_id?: string;
-  status?: string;
-  output?: string;
+  status: string;
+  output: string;
   error?: string | null;
-  task_id?: string | null;
+  task_id: string;
+  ballot?: string | null;
   [k: string]: unknown;
 }
 
-export interface MultiAgentRun {
-  id?: string;
-  mode?: string;
-  status?: string;
-  results?: MultiAgentResult[];
-  [k: string]: unknown;
+export interface MultiAgentCompletedRun {
+  run_id: string;
+  mode: string;
+  ok: boolean;
+  output: string | null;
+  outputs: MultiAgentOutput[];
+  votes?: number;
+  ballots?: Array<{ ballot: string; votes: number }>;
 }
+
+export interface MultiAgentPendingRun {
+  run_id: string;
+  mode: string;
+  agents: string[];
+  task_ids: string[];
+  detail: string;
+}
+
+export type MultiAgentRun = MultiAgentCompletedRun | MultiAgentPendingRun;
 
 // BFS research trees (Phase 7 Explore mode — app/api/research_tree.py).
 // GET /tree/{id} returns the tree row plus a FLAT `nodes` list in BFS order
@@ -652,6 +684,32 @@ export interface TwinReadyPayload {
   text_bytes?: number;
 }
 
+export type LocalePreference = "zh" | "en";
+
+export interface LocalePreferenceResponse {
+  locale: LocalePreference;
+}
+
+export type FavoriteKind =
+  | "research"
+  | "whiteboard"
+  | "daily"
+  | "briefing"
+  | "thesis"
+  | "forecast"
+  | "chain_entity"
+  | "research_tree";
+
+export interface Favorite {
+  id: number;
+  ref_kind: FavoriteKind;
+  ref_id: string;
+  note: string;
+  created_at: string;
+  title: string;
+  status: string | null;
+}
+
 // ------------------------------------------------------------- plumbing ----
 
 export class ApiError extends Error {
@@ -663,7 +721,10 @@ export class ApiError extends Error {
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, init);
+  const res = await fetch(BASE + path, {
+    ...init,
+    headers: withAuthHeaders(init?.headers),
+  });
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -685,7 +746,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function reqText(path: string): Promise<string> {
-  const res = await fetch(BASE + path);
+  const res = await fetch(BASE + path, { headers: withAuthHeaders() });
   if (!res.ok) throw new ApiError(res.status, res.statusText);
   return await res.text();
 }
@@ -756,9 +817,25 @@ export function isBilingualEnabled(state: Record<string, string> | null): boolea
   }
 }
 
+export const getLocalePreference = () =>
+  req<LocalePreferenceResponse>("/api/bilingual/preference");
+export const setLocalePreference = (locale: LocalePreference) =>
+  put<LocalePreferenceResponse>("/api/bilingual/preference", { locale });
+
 // events
 export const listEvents = (since = 0, types?: string, limit = 200) =>
   req<BusEvent[]>(`/api/events${qs({ since, types, limit })}`);
+
+// favorites
+export const listFavorites = (kind?: FavoriteKind) =>
+  req<Favorite[]>(`/api/favorites${qs({ kind })}`);
+export const addFavorite = (ref_kind: FavoriteKind, ref_id: string, note = "") =>
+  post<Favorite>("/api/favorites", { ref_kind, ref_id, note });
+export const removeFavorite = (ref_kind: FavoriteKind, ref_id: string) =>
+  req<{ removed: boolean }>(
+    `/api/favorites/${encodeURIComponent(ref_kind)}/${encodeURIComponent(ref_id)}`,
+    { method: "DELETE" },
+  );
 
 // tasks
 export const listTasks = (filters: {
@@ -864,7 +941,9 @@ export const createProject = (name: string, description = "") =>
  * the SPA GET catch-all answers 200 text/html when the router is unmounted,
  * which must surface as 接口未启用, not render as a markdown page. */
 export async function getProjectDigest(id: string): Promise<string> {
-  const res = await fetch(`${BASE}/api/projects/${id}/digest.md`);
+  const res = await fetch(`${BASE}/api/projects/${id}/digest.md`, {
+    headers: withAuthHeaders(),
+  });
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -956,7 +1035,7 @@ export async function askStream(
 ): Promise<AskDoneTask> {
   const res = await fetch("/api/ask/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withAuthHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
     signal,
   });
@@ -1028,7 +1107,7 @@ export async function askStream(
   return done;
 }
 
-// multi-agent compare (C5, in flight — callers must catch ApiError 404/501)
+// multi-agent compare (durable 200 verdict or 202 task handoff)
 export const runMultiAgent = (agents: string[], prompt: string, mode: string) =>
   post<MultiAgentRun>("/api/multi-agent/run", { agents, prompt, mode });
 

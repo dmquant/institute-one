@@ -320,6 +320,40 @@ export interface TriageResult {
 	};
 }
 
+/** GET /api/operator/actions — operator_actions rows with dispositions inlined. */
+export type OperatorActionStatus = "open" | "in_progress" | "done" | "dismissed";
+
+export interface OperatorActionDisposition {
+	id: number;
+	action_id: number;
+	proposed_by: string;
+	disposition: string;
+	confidence: number | null;
+	shadow: number;
+	flags: string;
+	created_at: string;
+}
+
+export interface OperatorAction {
+	id: number;
+	kind: string;
+	ref: string;
+	title: string;
+	detail: string;
+	status: OperatorActionStatus;
+	priority: number;
+	created_at: string;
+	updated_at: string;
+	resolved_at: string | null;
+	resolution: string | null;
+	dispositions: OperatorActionDisposition[];
+}
+
+export interface OperatorActionsResult {
+	actions: OperatorAction[];
+	count: number;
+}
+
 /** GET /api/book/nav — nav_history rows, ascending by work_date */
 export interface NavRow {
 	work_date: string;
@@ -346,6 +380,72 @@ export interface PaperPositionRow {
 	close_reason: string | null;
 	close_price: number | null;
 	realized_pnl: number | null;
+}
+
+/** GET /api/forecasts — forecast ledger row. */
+export interface ForecastRow {
+	id: string;
+	thesis_id: string;
+	security_id: string | null;
+	claim: string;
+	direction: "long" | "short" | "neutral";
+	conviction: number | null;
+	horizon_days: number;
+	settlement_rule: { type: string; threshold?: number; benchmark_id?: string } | string;
+	made_at: string;
+	expires_at: string;
+	status: "open" | "settled" | "invalid";
+	created_at: string;
+	updated_at: string;
+	settlement?: ForecastSettlement | null;
+}
+
+/** GET /api/forecasts/{id} — settlement is present on the detail response. */
+export interface ForecastSettlement {
+	id: string;
+	forecast_id: string;
+	verdict: "hit" | "miss" | "partial" | "invalid";
+	settled_at: string;
+	benchmark_return: number | null;
+	actual_return: number | null;
+	note: string;
+	created_at: string;
+}
+
+/** GET /api/research/trees — list row with node-count aggregates. */
+export type ResearchTreeStatus = "pending" | "exploring" | "completed" | "stopped" | "failed";
+export type ResearchTreeNodeStatus = "pending" | "running" | "completed" | "failed" | "pruned";
+
+export interface ResearchTreeRow {
+	id: string;
+	root_topic: string;
+	status: ResearchTreeStatus;
+	max_depth: number;
+	max_nodes: number;
+	created_at: string;
+	finished_at: string | null;
+	announced_at: string | null;
+	nodes_total?: number;
+	nodes_completed?: number;
+}
+
+export interface ResearchTreeNode {
+	id: string;
+	tree_id: string;
+	parent_id: string | null;
+	depth: number;
+	topic: string;
+	question: string;
+	status: ResearchTreeNodeStatus;
+	task_id: string | null;
+	summary: string | null;
+	score: number | null;
+	created_at: string;
+	finished_at: string | null;
+}
+
+export interface ResearchTreeDetail extends ResearchTreeRow {
+	nodes: ResearchTreeNode[];
 }
 
 /** One NDJSON frame from POST /api/ask/stream (app/api/ask_stream.py) */
@@ -502,10 +602,18 @@ export function researchStatusIcon(status: string): string {
 // ---------------------------------------------------------------------------
 
 export class InstituteApi {
-	constructor(private getBaseUrl: () => string) {}
+	constructor(
+		private getBaseUrl: () => string,
+		private getToken: () => string,
+	) {}
 
 	baseUrl(): string {
 		return this.getBaseUrl().replace(/\/+$/, "");
+	}
+
+	private authHeaders(): Record<string, string> | undefined {
+		const token = this.getToken().trim();
+		return token ? { Authorization: `Bearer ${token}` } : undefined;
 	}
 
 	/** JSON request with a hard timeout (default 10s). Never uses fetch. */
@@ -519,6 +627,7 @@ export class InstituteApi {
 			requestUrl({
 				url,
 				method,
+				headers: this.authHeaders(),
 				contentType: opts.body !== undefined ? "application/json" : undefined,
 				body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
 				throw: false,
@@ -542,7 +651,7 @@ export class InstituteApi {
 	async requestText(path: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string> {
 		const url = this.baseUrl() + path;
 		const resp = await withTimeout(
-			requestUrl({ url, method: "GET", throw: false }),
+			requestUrl({ url, method: "GET", headers: this.authHeaders(), throw: false }),
 			timeoutMs,
 			`GET ${path}`,
 		);
@@ -783,6 +892,16 @@ export class InstituteApi {
 		return this.request<TriageResult>("/api/operator/triage");
 	}
 
+	/** GET /api/operator/actions — `open` is the backend's pending-inbox state. */
+	operatorActions(
+		status: OperatorActionStatus = "open",
+		limit = 1000,
+	): Promise<OperatorActionsResult> {
+		return this.request<OperatorActionsResult>(
+			`/api/operator/actions?status=${encodeURIComponent(status)}&limit=${limit}`,
+		);
+	}
+
 	// ---- paper book ---------------------------------------------------------------
 
 	/** GET /api/book/nav — nav_history rows ascending; last row = latest NAV. */
@@ -794,6 +913,35 @@ export class InstituteApi {
 	bookPositions(status = "open", limit = 200): Promise<PaperPositionRow[]> {
 		return this.request<PaperPositionRow[]>(
 			`/api/book/positions?status=${encodeURIComponent(status)}&limit=${limit}`,
+		);
+	}
+
+	// ---- forecasts ----------------------------------------------------------------
+
+	/** GET /api/forecasts — newest first. */
+	forecasts(limit = 5): Promise<ForecastRow[]> {
+		return this.request<ForecastRow[]>(`/api/forecasts?limit=${limit}`);
+	}
+
+	/** GET /api/forecasts/{id} — includes the settlement row. */
+	forecast(forecastId: string): Promise<ForecastRow> {
+		return this.request<ForecastRow>(
+			`/api/forecasts/${encodeURIComponent(forecastId)}`,
+		);
+	}
+
+	// ---- research trees -----------------------------------------------------------
+
+	researchTrees(status?: ResearchTreeStatus, limit = 200): Promise<ResearchTreeRow[]> {
+		const q = status
+			? `?status=${encodeURIComponent(status)}&limit=${limit}`
+			: `?limit=${limit}`;
+		return this.request<ResearchTreeRow[]>(`/api/research/trees${q}`);
+	}
+
+	researchTree(treeId: string): Promise<ResearchTreeDetail> {
+		return this.request<ResearchTreeDetail>(
+			`/api/research/tree/${encodeURIComponent(treeId)}`,
 		);
 	}
 

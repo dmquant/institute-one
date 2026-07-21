@@ -3,17 +3,21 @@ import { Link } from "react-router-dom";
 import {
   clearHandCooldown,
   getAdminState,
+  getAuthToken,
   getCronHealth,
+  getLocalePreference,
   getMeta,
   getTask,
   getVaultStatus,
   isBilingualEnabled,
   isMaintenancePaused,
   listEvents,
+  setAuthToken,
+  setLocalePreference,
   setMaintenance,
   vaultDoctor,
 } from "../api";
-import type { TwinReadyPayload } from "../api";
+import type { LocalePreference, TwinReadyPayload } from "../api";
 import { useSSE } from "../useSSE";
 import {
   Empty,
@@ -96,6 +100,8 @@ export default function Settings() {
       <PageHead zh="设置" en="Settings" />
       {note && <div className="ok-note">{note}</div>}
       <ErrorNote error={err} />
+
+      <AuthTokenCard />
 
       <div className="card">
         <h2>
@@ -284,15 +290,66 @@ function Fragment2({ k, v }: { k: string; v: number }) {
   );
 }
 
+function AuthTokenCard() {
+  const [token, setToken] = useState(getAuthToken);
+
+  const save = () => {
+    setAuthToken(token);
+    window.location.reload();
+  };
+
+  return (
+    <div className="card">
+      <h2>
+        访问令牌<span className="en">API bearer token</span>
+      </h2>
+      <div className="form-row" style={{ alignItems: "end" }}>
+        <label className="field grow">
+          <span className="lbl">INSTITUTE_TOKEN（未启用后端鉴权时留空）</span>
+          <input
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            style={{ width: "100%" }}
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Bearer token"
+          />
+        </label>
+        <button onClick={save}>保存并重新连接</button>
+      </div>
+      <p className="dim" style={{ fontSize: 12.5, margin: "10px 0 0" }}>
+        令牌保存在此浏览器的 <span className="mono">localStorage</span>，后续 API 请求会自动附加{" "}
+        <span className="mono">Authorization: Bearer …</span>。清空后保存即可移除。
+      </p>
+    </div>
+  );
+}
+
 /** Bilingual twins (Phase 7): read-only switch state + twin_ready feed.
- * The switch has NO write endpoint yet (PATCH-NOTES-D5 §3 follow-up), so
- * this card only mirrors admin_state and explains how to flip the row.
+ * The enabled switch has no write endpoint, while the independent locale
+ * preference is read/write through /api/bilingual/preference.
  * Full twin text is BY REFERENCE: payload.task_id -> GET /api/tasks/{id}. */
 function BilingualCard({ enabled }: { enabled: boolean }) {
   const { lastEvent } = useSSE({ types: ["bilingual."], max: 1 });
   const twins = useLoad(() => listEvents(0, "bilingual.twin_ready", 200), [lastEvent?.id ?? 0]);
+  const locale = useLoad(getLocalePreference, []);
   const [viewing, setViewing] = useState<{ taskId: string; text: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [savingLocale, setSavingLocale] = useState(false);
+
+  const chooseLocale = async (next: LocalePreference) => {
+    setErr(null);
+    setSavingLocale(true);
+    try {
+      await setLocalePreference(next);
+      locale.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingLocale(false);
+    }
+  };
 
   const openTwin = async (taskId: string) => {
     setErr(null);
@@ -312,6 +369,25 @@ function BilingualCard({ enabled }: { enabled: boolean }) {
         双语孪生<span className="en">bilingual twins</span>
       </h2>
       <ErrorNote error={err} />
+      <ErrorNote error={locale.error} />
+      <div className="form-row" style={{ alignItems: "center", marginBottom: 10 }}>
+        <span>默认内容语言：</span>
+        <button
+          className={locale.data?.locale === "zh" ? undefined : "ghost"}
+          disabled={savingLocale || locale.loading || locale.data?.locale === "zh"}
+          onClick={() => chooseLocale("zh")}
+        >
+          中文 zh
+        </button>
+        <button
+          className={locale.data?.locale === "en" ? undefined : "ghost"}
+          disabled={savingLocale || locale.loading || locale.data?.locale === "en"}
+          onClick={() => chooseLocale("en")}
+        >
+          English en
+        </button>
+        {locale.loading && !locale.data && <span className="faint">读取中…</span>}
+      </div>
       <div className="form-row" style={{ alignItems: "center" }}>
         <span>
           当前状态：

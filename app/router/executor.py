@@ -6,7 +6,10 @@ spine). There is no queue service and no polling: dispatch is a function call
 under semaphores, completion is a function return plus a bus event.
 
 Concurrency: one global semaphore (settings.max_concurrent) plus one mutex per
-hand (a CLI binary runs at most one task at a time).
+hand (a CLI binary runs at most one task at a time), acquired hand-mutex first
+so a busy hand's waiters never pin global slots. Admission: a per-hand
+queued-depth cap (settings.hand_queue_depth) sheds excess submits/spawns as
+born-terminal 'overcommitted' rows instead of queueing without bound.
 Crash recovery: ``recover_orphans()`` marks non-terminal rows failed at boot;
 domain loops re-drive themselves from their own durable pending rows.
 """
@@ -27,8 +30,9 @@ from ..hands.registry import get_registry
 
 log = logging.getLogger("institute.executor")
 
-TERMINAL = {"completed", "failed", "rate_limited", "cancelled", "expired"}
-# Non-terminal tasks statuses; TERMINAL | ACTIVE is the full 0001 CHECK enum.
+TERMINAL = {"completed", "failed", "rate_limited", "cancelled", "expired", "overcommitted"}
+# Non-terminal tasks statuses; TERMINAL | ACTIVE is the full CHECK enum
+# (0001 as rebuilt by 0028, which added 'overcommitted').
 # Canonical import point for API surfaces (e.g. /api/contract) — do not restate.
 ACTIVE = ("queued", "running")
 
@@ -55,7 +59,9 @@ def hand_busy(name: str) -> bool:
 
     Locks are created lazily by ``_hand_lock()``: a hand that never ran has no
     lock and is not busy. Waiters do not hold the lock, so "busy" means one
-    task is actually executing; it says nothing about queue depth behind it.
+    task is executing on the hand or is about to (it may hold the mutex while
+    waiting for a global slot — the hand-lock-first order); it says nothing
+    about queue depth behind it.
     Read-only — callers (interactive ask routing, ROADMAP Phase 0) use it to
     prefer an idle hand instead of queueing behind a long workflow step.
     """
@@ -94,6 +100,36 @@ class Task:
             fallback_chain=json.loads(r["fallback_chain"]) if r["fallback_chain"] else None,
             lineage_root=r["lineage_root"],
         )
+
+
+@dataclass(frozen=True)
+class PreparedRespawn:
+    """One durable source -> canonical retry binding.
+
+    ``created`` distinguishes the transaction winner from a caller that
+    converged on the already-bound canonical child. Both callers receive the
+    same immutable task id.
+    """
+
+    task_id: str
+    lineage_root: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class _RespawnSpec:
+    task_id: str
+    source_task_id: str
+    lineage_root: str
+    hand: str
+    prompt: str
+    source: str
+    model: str | None
+    session_id: str | None
+    parent_run_id: str | None
+    workspace: Path
+    timeout_s: int
+    fallback_chain: tuple[str, ...] | None
 
 
 TRUNCATION_MARKER = "\n…[truncated]"
@@ -136,27 +172,105 @@ def compact_error(text: str, cap: int = 1000) -> str:
     return f"{text[:head_budget].rstrip()}\n…\n{text[-tail_budget:].lstrip()}"[:cap]
 
 
-async def _create_row(
+def _queued_row_statement(
     *, task_id: str, hand: str, prompt: str, source: str, model: str | None,
     session_id: str | None, parent_run_id: str | None, workspace: Path, timeout_s: int,
     fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
-) -> None:
+    revived_from_task_id: str | None = None,
+) -> tuple[str, tuple[Any, ...]]:
     # fallback_chain/lineage_root persist the caller's actual execution policy
     # and retry ancestry (0024): the retry endpoint replays the STORED chain
     # instead of re-deriving it from live settings, and the 0024 partial
     # unique index on lineage_root arbitrates duplicate live retries — this
     # INSERT raises IntegrityError when the lineage already has a live task.
-    await db.execute(
+    return (
         """INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source,
                               parent_run_id, workspace_dir, timeout_s, fallback_chain,
-                              lineage_root, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                              lineage_root, revived_from_task_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (task_id, session_id, hand, model, prompt, "queued", source,
          parent_run_id, str(workspace), timeout_s,
          None if fallback_chain is None else json.dumps(list(fallback_chain)),
-         lineage_root, bus.now_iso()),
+         lineage_root, revived_from_task_id, bus.now_iso()),
     )
+
+
+async def _create_row(
+    *, task_id: str, hand: str, prompt: str, source: str, model: str | None,
+    session_id: str | None, parent_run_id: str | None, workspace: Path, timeout_s: int,
+    fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
+    revived_from_task_id: str | None = None,
+) -> None:
+    sql, params = _queued_row_statement(
+        task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
+        session_id=session_id, parent_run_id=parent_run_id, workspace=workspace,
+        timeout_s=timeout_s, fallback_chain=fallback_chain,
+        lineage_root=lineage_root, revived_from_task_id=revived_from_task_id,
+    )
+    await db.execute(sql, params)
     await bus.emit("task.queued", "task", task_id, {"hand": hand, "source": source})
+
+
+async def _queued_depth(hand: str) -> int:
+    """Queued rows already waiting on this hand (by requested_hand: ``hand``
+    stays NULL until the running claim, and fallback must not let a busy
+    hand's backlog hide behind the hand that eventually picks a task up)."""
+    row = await db.query_one(
+        "SELECT COUNT(*) AS n FROM tasks WHERE requested_hand = ? AND status = 'queued'",
+        (hand,),
+    )
+    return int(row["n"]) if row else 0
+
+
+async def _overcommit_depth(hand: str) -> tuple[int, int] | None:
+    """(depth, cap) when the hand's queued backlog EXCEEDS the cap, else None.
+
+    The cap is the tolerated backlog: a submit finding exactly cap queued
+    rows is still admitted, one finding more is shed. Strictly-greater
+    matters: a legitimate burst (e.g. the analyst-daily sweep fanning the
+    whole roster onto one hand) parks up to roster-size rows in 'queued'
+    while the per-hand mutex drains them one by one — the cap bounds runaway
+    pileups without shedding the tail of a normal burst. Best-effort: the
+    count and the later INSERT are separate statements, so concurrent
+    submits can overshoot by a few rows (no invariant rides on the exact
+    number). cap <= 0 disables the check entirely.
+    """
+    cap = get_settings().hand_queue_depth
+    if cap <= 0:
+        return None
+    depth = await _queued_depth(hand)
+    return (depth, cap) if depth > cap else None
+
+
+async def _create_overcommitted_row(
+    *, task_id: str, hand: str, prompt: str, source: str, model: str | None,
+    session_id: str | None, parent_run_id: str | None, workspace: Path, timeout_s: int,
+    fallback_chain: Sequence[str] | None, lineage_root: str | None,
+    depth: int, cap: int,
+) -> None:
+    """Persist a fast-fail as a born-terminal 'overcommitted' row.
+
+    The row IS the audit trail (every model request = one tasks row), but it
+    never enters the queue: hand stays NULL, finished_at == created_at, and
+    the only event is task.overcommitted — no task.queued, so nothing ever
+    treats it as pending work.
+    """
+    now = bus.now_iso()
+    await db.execute(
+        """INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source,
+                              parent_run_id, workspace_dir, timeout_s, fallback_chain,
+                              lineage_root, error, created_at, finished_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (task_id, session_id, hand, model, prompt, "overcommitted", source,
+         parent_run_id, str(workspace), timeout_s,
+         None if fallback_chain is None else json.dumps(list(fallback_chain)),
+         lineage_root,
+         f"hand '{hand}' already has {depth} queued tasks (cap {cap})", now, now),
+    )
+    await bus.emit(
+        "task.overcommitted", "task", task_id,
+        {"hand": hand, "source": source, "status": "overcommitted"},
+    )
 
 
 async def _finish(task_id: str, status: str, **fields: Any) -> None:
@@ -206,7 +320,13 @@ async def _execute(
     if hand.name != requested:
         model = None  # never carry an explicit model across a hand family boundary
 
-    async with _sem(), _hand_lock(hand.name):
+    # Lock order (LOOP-P1): hand mutex FIRST, global semaphore second — and
+    # nowhere else acquires both, so the order is process-wide and deadlock-free.
+    # The old order (semaphore first) let tasks parked behind ONE busy hand pin
+    # global slots while waiting for its mutex, starving every idle hand once
+    # max_concurrent waiters piled up. Waiting on a hand lock now costs nothing
+    # globally; a semaphore slot is only held while a task actually runs.
+    async with _hand_lock(hand.name), _sem():
         claimed = await db.execute(
             "UPDATE tasks SET status='running', hand=?, model=?, started_at=? WHERE id=? AND status='queued'",
             (hand.name, model, bus.now_iso(), task_id),
@@ -296,6 +416,16 @@ async def submit(
     task_id = uuid.uuid4().hex[:12]
     ws = workspace or (settings.workspaces_dir / "adhoc" / task_id)
     ws.mkdir(parents=True, exist_ok=True)
+    over = await _overcommit_depth(hand)
+    if over is not None:
+        await _create_overcommitted_row(
+            task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
+            session_id=session_id, parent_run_id=parent_run_id, workspace=ws,
+            timeout_s=timeout_s or settings.default_timeout_s,
+            fallback_chain=fallback_chain, lineage_root=lineage_root,
+            depth=over[0], cap=over[1],
+        )
+        return await get_task(task_id)  # type: ignore[return-value]
     await _create_row(
         task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
         session_id=session_id, parent_run_id=parent_run_id, workspace=ws,
@@ -323,18 +453,30 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     fallback_chain = kwargs.pop("fallback_chain", None)
     lineage_root = kwargs.pop("lineage_root", None)
     timeout_s = kwargs.pop("timeout_s", None) or settings.default_timeout_s
+    source = kwargs.pop("source", "api")
+    model = kwargs.pop("model", None)
+    session_id = kwargs.pop("session_id", None)
+    parent_run_id = kwargs.pop("parent_run_id", None)
+    over = await _overcommit_depth(hand)
+    if over is not None:
+        await _create_overcommitted_row(
+            task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
+            session_id=session_id, parent_run_id=parent_run_id, workspace=ws,
+            timeout_s=timeout_s, fallback_chain=fallback_chain, lineage_root=lineage_root,
+            depth=over[0], cap=over[1],
+        )
+        return task_id
     await _create_row(
         task_id=task_id, hand=hand, prompt=prompt,
-        source=kwargs.pop("source", "api"), model=kwargs.pop("model", None),
-        session_id=kwargs.pop("session_id", None), parent_run_id=kwargs.pop("parent_run_id", None),
+        source=source, model=model,
+        session_id=session_id, parent_run_id=parent_run_id,
         workspace=ws, timeout_s=timeout_s,
         fallback_chain=fallback_chain, lineage_root=lineage_root,
     )
     atask = asyncio.create_task(
         _execute(task_id, on_chunk=on_chunk, allow_fallback=fallback, fallback_chain=fallback_chain)
     )
-    _running[task_id] = atask
-    atask.add_done_callback(lambda _t: _running.pop(task_id, None))
+    _register_driver(task_id, atask)
     return task_id
 
 
@@ -347,6 +489,317 @@ def _legacy_retry_policy(source: str, requested_hand: str) -> tuple[str, dict[st
     return requested_hand, {}
 
 
+def _respawn_spec(row: dict[str, Any], *, task_id: str | None = None) -> _RespawnSpec:
+    """Reconstruct the exact persisted retry policy in one place.
+
+    Manual retry (``respawn_from_row``) and the scheduler's transactional
+    prepare path both consume this spec; scheduler.py never duplicates task
+    row construction or fallback-policy rules.
+    """
+    task_id = task_id or uuid.uuid4().hex[:12]
+    requested = row["requested_hand"]
+    if not requested:
+        raise ValueError(f"task {row['id']} has no requested hand")
+    lineage_root = row["lineage_root"] or row["id"]
+    if row["fallback_chain"] is not None:
+        hand = requested
+        fallback_chain = tuple(json.loads(row["fallback_chain"]))
+    else:
+        hand, policy = _legacy_retry_policy(row["source"], requested)
+        chain = policy.get("fallback_chain")
+        fallback_chain = tuple(chain) if chain is not None else None
+    # An explicit model never crosses a hand family boundary.
+    model = row["model"] if hand == requested else None
+    workspace = (
+        Path(row["workspace_dir"])
+        if row["workspace_dir"]
+        else get_settings().workspaces_dir / "adhoc" / task_id
+    )
+    return _RespawnSpec(
+        task_id=task_id,
+        source_task_id=row["id"],
+        lineage_root=lineage_root,
+        hand=hand,
+        prompt=row["prompt"],
+        source=row["source"],
+        model=model,
+        session_id=row["session_id"],
+        parent_run_id=row["parent_run_id"],
+        workspace=workspace,
+        timeout_s=row["timeout_s"] or get_settings().default_timeout_s,
+        fallback_chain=fallback_chain,
+    )
+
+
+def _stored_chain(raw: str | None) -> tuple[str, ...] | None:
+    return tuple(json.loads(raw)) if raw is not None else None
+
+
+def prepared_respawn_matches(source: dict[str, Any], child: dict[str, Any]) -> bool:
+    """Prove that ``child`` is the canonical retry built from ``source``.
+
+    Used after an IntegrityError: only a reciprocal winner with the exact
+    expected retry policy may converge. An unrelated CHECK/id/schema failure
+    can never consume the source.
+    """
+    if not source.get("revival_task_id") or source["revival_task_id"] != child.get("id"):
+        return False
+    try:
+        spec = _respawn_spec(source, task_id=child["id"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        child.get("revived_from_task_id") == source["id"]
+        and child.get("lineage_root") == spec.lineage_root
+        and child.get("requested_hand") == spec.hand
+        and child.get("prompt") == spec.prompt
+        and child.get("source") == spec.source
+        and child.get("model") == spec.model
+        and child.get("session_id") == spec.session_id
+        and child.get("parent_run_id") == spec.parent_run_id
+        and child.get("workspace_dir") == str(spec.workspace)
+        and child.get("timeout_s") == spec.timeout_s
+        and _stored_chain(child.get("fallback_chain")) == spec.fallback_chain
+    )
+
+
+async def get_canonical_respawn(source_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    source = await db.query_one("SELECT * FROM tasks WHERE id = ?", (source_id,))
+    if source is None or not source["revival_task_id"]:
+        return None
+    child = await db.query_one(
+        "SELECT * FROM tasks WHERE id = ?", (source["revival_task_id"],)
+    )
+    if child is None or not prepared_respawn_matches(source, child):
+        return None
+    return source, child
+
+
+async def _conn_query_one(conn: Any, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
+    cur = await conn.execute(sql, params)
+    row = await cur.fetchone()
+    await cur.close()
+    return dict(row) if row is not None else None
+
+
+async def _conn_execute(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    cur = await conn.execute(sql, params)
+    rowcount = cur.rowcount
+    await cur.close()
+    return rowcount
+
+
+async def prepare_respawn_from_row(
+    conn: Any,
+    row: dict[str, Any],
+    *,
+    max_attempts: int,
+) -> PreparedRespawn | None:
+    """Atomically bind a rate-limited source to one born-queued child.
+
+    The caller owns ``conn``'s surrounding transaction. A capacity rejection
+    returns None without changing source/attempt state. The source claim and
+    child INSERT commit together; a losing caller converges on the reciprocal
+    canonical child instead of creating another generation.
+    """
+    if row.get("revival_task_id"):
+        child = await _conn_query_one(
+            conn, "SELECT * FROM tasks WHERE id = ?", (row["revival_task_id"],)
+        )
+        if child is None or not prepared_respawn_matches(row, child):
+            raise RuntimeError(f"invalid canonical revival binding for source {row['id']}")
+        return PreparedRespawn(
+            task_id=child["id"],
+            lineage_root=child["lineage_root"],
+            created=False,
+        )
+
+    spec = _respawn_spec(row)
+    cap = get_settings().hand_queue_depth
+    if cap > 0:
+        depth = await _conn_query_one(
+            conn,
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE requested_hand = ? AND status = 'queued'",
+            (spec.hand,),
+        )
+        if depth is not None and int(depth["n"]) > cap:
+            return None
+
+    spec.workspace.mkdir(parents=True, exist_ok=True)
+    claimed = await _conn_execute(
+        conn,
+        "UPDATE tasks SET revival_task_id = ?, "
+        "revival_attempts = revival_attempts + 1, "
+        "revival_lease_id = NULL, revival_leased_at = NULL "
+        "WHERE id = ? AND status = 'rate_limited' "
+        "AND revival_task_id IS NULL AND revived_from_task_id IS NULL "
+        "AND revival_attempts < ?",
+        (spec.task_id, row["id"], max_attempts),
+    )
+    if not claimed:
+        winner = await _conn_query_one(
+            conn, "SELECT * FROM tasks WHERE id = ?", (row["id"],)
+        )
+        if winner is None or not winner["revival_task_id"]:
+            return None
+        child = await _conn_query_one(
+            conn, "SELECT * FROM tasks WHERE id = ?", (winner["revival_task_id"],)
+        )
+        if child is None or not prepared_respawn_matches(winner, child):
+            raise RuntimeError(f"invalid canonical revival winner for source {row['id']}")
+        return PreparedRespawn(
+            task_id=child["id"],
+            lineage_root=child["lineage_root"],
+            created=False,
+        )
+
+    sql, params = _queued_row_statement(
+        task_id=spec.task_id,
+        hand=spec.hand,
+        prompt=spec.prompt,
+        source=spec.source,
+        model=spec.model,
+        session_id=spec.session_id,
+        parent_run_id=spec.parent_run_id,
+        workspace=spec.workspace,
+        timeout_s=spec.timeout_s,
+        fallback_chain=spec.fallback_chain,
+        lineage_root=spec.lineage_root,
+        revived_from_task_id=row["id"],
+    )
+    await _conn_execute(conn, sql, params)
+    return PreparedRespawn(
+        task_id=spec.task_id,
+        lineage_root=spec.lineage_root,
+        created=True,
+    )
+
+
+def _register_driver(task_id: str, atask: asyncio.Task) -> None:
+    _running[task_id] = atask
+
+    def _done(done: asyncio.Task) -> None:
+        if _running.get(task_id) is done:
+            _running.pop(task_id, None)
+
+    atask.add_done_callback(_done)
+
+
+async def drive_prepared(task_id: str) -> bool:
+    """Attach an in-process driver to one durable canonical queued child.
+
+    Multiple callers may race (boot + scheduler): ``_execute``'s conditional
+    queued->running UPDATE is the final arbiter, so only one reaches the hand.
+    A missing task.queued event never strands the durable row.
+    """
+    active = _running.get(task_id)
+    if active is not None and not active.done():
+        return False
+    row = await db.query_one(
+        "SELECT child.* FROM tasks child "
+        "JOIN tasks source ON source.id = child.revived_from_task_id "
+        "AND source.revival_task_id = child.id "
+        "WHERE child.id = ?",
+        (task_id,),
+    )
+    if row is None:
+        return False
+    if row["status"] == "running":
+        # No in-memory driver owns it in this process: this is restart residue
+        # or a driver that died before settling the row. Requeue the same id.
+        requeued = await db.execute(
+            "UPDATE tasks SET status='queued', hand=NULL, started_at=NULL, "
+            "finished_at=NULL, error='recovered orphaned prepared revival' "
+            "WHERE id=? AND status='running' AND revived_from_task_id IS NOT NULL",
+            (task_id,),
+        )
+        if not requeued:
+            return False
+        row["status"] = "queued"
+    if row["status"] != "queued":
+        return False
+
+    try:
+        await bus.emit(
+            "task.queued", "task", task_id,
+            {"hand": row["requested_hand"], "source": row["source"]},
+        )
+    except Exception:  # noqa: BLE001 - observability cannot orphan durable work
+        log.exception("task.queued emit failed for prepared revival %s", task_id)
+
+    fallback_chain = (
+        json.loads(row["fallback_chain"]) if row["fallback_chain"] is not None else None
+    )
+    coro = _execute(task_id, allow_fallback=True, fallback_chain=fallback_chain)
+    try:
+        atask = asyncio.create_task(coro)
+    except BaseException:
+        coro.close()
+        raise
+    _register_driver(task_id, atask)
+    return True
+
+
+class _PreparedRequeueLost(RuntimeError):
+    pass
+
+
+async def requeue_prepared(
+    source_id: str,
+    task_id: str,
+    *,
+    max_attempts: int,
+) -> bool:
+    """Retry one terminal canonical child in place, bounded by source attempts.
+
+    The immutable source<->child binding survives every attempt. Queue
+    pressure is checked before the transaction and consumes no attempt.
+    """
+    pair = await get_canonical_respawn(source_id)
+    if pair is None or pair[1]["id"] != task_id:
+        return False
+    source, child = pair
+    if child["status"] not in {"failed", "rate_limited", "expired", "overcommitted"}:
+        return False
+    spec = _respawn_spec(source, task_id=task_id)
+    over = await _overcommit_depth(spec.hand)
+    if over is not None:
+        return False
+
+    try:
+        async with db.transaction() as conn:
+            claimed = await _conn_execute(
+                conn,
+                "UPDATE tasks SET revival_attempts = revival_attempts + 1 "
+                "WHERE id=? AND status='rate_limited' AND revival_task_id=? "
+                "AND revival_attempts < ?",
+                (source_id, task_id, max_attempts),
+            )
+            if not claimed:
+                return False
+            moved = await _conn_execute(
+                conn,
+                "UPDATE tasks SET status='queued', hand=NULL, requested_hand=?, model=?, "
+                "tried=NULL, output=NULL, error=NULL, artifacts=NULL, exit_code=NULL, "
+                "started_at=NULL, finished_at=NULL, fallback_chain=? "
+                "WHERE id=? AND revived_from_task_id=? "
+                "AND status IN ('failed','rate_limited','expired','overcommitted')",
+                (
+                    spec.hand,
+                    spec.model,
+                    None if spec.fallback_chain is None else json.dumps(list(spec.fallback_chain)),
+                    task_id,
+                    source_id,
+                ),
+            )
+            if not moved:
+                raise _PreparedRequeueLost(task_id)
+    except _PreparedRequeueLost:
+        return False
+    return True
+
+
 async def respawn_from_row(row: dict[str, Any]) -> tuple[str, str]:
     """Spawn a new generation while preserving one task row's stored policy.
 
@@ -354,24 +807,20 @@ async def respawn_from_row(row: dict[str, Any]) -> tuple[str, str]:
     only the reconstruction here lets the manual retry endpoint and automatic
     rate-limit revival replay the exact same hand/model/chain semantics.
     """
-    lineage_root = row["lineage_root"] or row["id"]
-    if row["fallback_chain"] is not None:
-        hand = row["requested_hand"]
-        policy: dict[str, Any] = {"fallback_chain": json.loads(row["fallback_chain"])}
-    else:
-        hand, policy = _legacy_retry_policy(row["source"], row["requested_hand"])
-    # An explicit model never crosses a hand family boundary.
-    model = row["model"] if hand == row["requested_hand"] else None
+    spec = _respawn_spec(row)
     new_id = await spawn(
-        hand, row["prompt"],
-        source=row["source"], model=model,
-        session_id=row["session_id"], parent_run_id=row["parent_run_id"],
+        spec.hand,
+        spec.prompt,
+        source=spec.source,
+        model=spec.model,
+        session_id=spec.session_id,
+        parent_run_id=spec.parent_run_id,
         workspace=Path(row["workspace_dir"]) if row["workspace_dir"] else None,
-        timeout_s=row["timeout_s"],
-        lineage_root=lineage_root,
-        **policy,
+        timeout_s=spec.timeout_s,
+        lineage_root=spec.lineage_root,
+        fallback_chain=spec.fallback_chain,
     )
-    return new_id, lineage_root
+    return new_id, spec.lineage_root
 
 
 async def get_task(task_id: str) -> Task | None:
@@ -453,16 +902,80 @@ async def cancel(task_id: str) -> bool:
     return n > 0
 
 
-async def recover_orphans() -> int:
-    """Boot-time sweep: any non-terminal task row was orphaned by a restart."""
-    n = await db.execute(
+async def recover_prepared(*, drive: bool = True) -> int:
+    """Boot-time adoption of durable canonical revival children.
+
+    A queued child is already prepared work and only needs an in-process
+    driver. A running child lost that driver with the process, so conditionally
+    requeue the SAME immutable id before driving it. The reciprocal binding is
+    required; corrupt one-sided rows fall through to generic orphan failure.
+    ``drive=False`` performs only the durable running-to-queued reconciliation;
+    the gated revival scheduler can attach the driver after maintenance ends.
+    """
+    requeued = await db.execute(
+        "UPDATE tasks SET status='queued', hand=NULL, started_at=NULL, "
+        "finished_at=NULL, error='recovered orphaned prepared revival' "
+        "WHERE status='running' AND revived_from_task_id IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM tasks source "
+        "            WHERE source.id = tasks.revived_from_task_id "
+        "            AND source.revival_task_id = tasks.id)"
+    )
+    if drive:
+        rows = await db.query(
+            "SELECT child.id FROM tasks child "
+            "JOIN tasks source ON source.id = child.revived_from_task_id "
+            "AND source.revival_task_id = child.id "
+            "WHERE child.status='queued' ORDER BY child.created_at, child.id"
+        )
+        for row in rows:
+            try:
+                await drive_prepared(row["id"])
+            except Exception:  # noqa: BLE001 - next scheduler tick retries same id
+                log.exception("could not drive recovered prepared revival %s", row["id"])
+    if requeued:
+        log.warning("requeued %d orphaned prepared revival task(s)", requeued)
+    return requeued
+
+
+async def recover_orphans(*, drive_prepared: bool = True) -> int:
+    """Boot-time sweep with durable revival and mailbox partitions.
+
+    Generic non-terminal tasks are failed as before. Canonical revival
+    children are outbox-like prepared work: preserve queued rows, requeue
+    running rows, and normally attach drivers to the same ids. Mailbox tasks
+    whose reciprocal pending dispatch still names them follow the same
+    preserve/requeue rule; ``mailbox.recover_orphans()`` attaches their driver
+    immediately after this generic executor pass.  ``drive_prepared=False``
+    keeps every database transition but defers model execution to the gated
+    scheduler, which is required when booting under maintenance.
+    """
+    recovered = await recover_prepared(drive=drive_prepared)
+    mailbox_requeued = await db.execute(
+        "UPDATE tasks SET status='queued', hand=NULL, started_at=NULL, "
+        "finished_at=NULL, error='recovered orphaned prepared mailbox task' "
+        "WHERE status='running' AND mailbox_dispatch_id IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM mailbox_messages m "
+        "            WHERE m.id=tasks.mailbox_dispatch_id "
+        "            AND m.kind='dispatch' AND m.status='pending' "
+        "            AND m.task_id=tasks.id)"
+    )
+    failed = await db.execute(
         "UPDATE tasks SET status='failed', error='orphaned by restart', finished_at=? "
-        "WHERE status IN ('queued','running')",
+        "WHERE status IN ('queued','running') "
+        "AND NOT EXISTS (SELECT 1 FROM tasks source "
+        "                WHERE source.id = tasks.revived_from_task_id "
+        "                AND source.revival_task_id = tasks.id) "
+        "AND NOT EXISTS (SELECT 1 FROM mailbox_messages m "
+        "                WHERE m.id=tasks.mailbox_dispatch_id "
+        "                AND m.kind='dispatch' AND m.status='pending' "
+        "                AND m.task_id=tasks.id)",
         (bus.now_iso(),),
     )
-    if n:
-        log.warning("marked %d orphaned tasks failed", n)
-    return n
+    if mailbox_requeued:
+        log.warning("requeued %d orphaned prepared mailbox task(s)", mailbox_requeued)
+    if failed:
+        log.warning("marked %d orphaned tasks failed", failed)
+    return recovered + mailbox_requeued + failed
 
 
 async def queue_stats() -> dict[str, Any]:

@@ -90,7 +90,6 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
-from ..config import get_settings
 from . import forecasts, market_data
 from .prompts import work_date
 
@@ -98,11 +97,19 @@ log = logging.getLogger("institute.paper_book")
 
 SIZE = 1.0                      # nominal notional per position
 DEFAULT_MAX_POSITIONS = 20
+# loop-fix P8c: one opener tick considers at most this many candidates — the
+# 5-min tick drains a large backlog batch by batch instead of turning one
+# tick into an unbounded full-table sweep on the event loop
+OPENER_BATCH_LIMIT = 50
 DEFAULT_STOP_PCT = 0.05
 DEFAULT_TARGET_PCT = 0.10
 BENCHMARK_ID = "CSI300"
 ADMIN_KEY = "paper_book"
 BENCH_BASE_KEY = "paper_book:benchmark_base"
+# loop-fix R3: the opener's rotation position — (made_at, id) of the last
+# candidate CONSIDERED, persisted so the batched tick round-robins through
+# the whole candidate keyset instead of re-selecting the same head forever
+OPENER_CURSOR_KEY = "paper_book:opener_cursor"
 RECONCILE_DIFFERENCE_EVENT = "paper_book.reconcile_difference"
 STATUSES = ("open", "closed")
 CLOSE_REASONS = ("stop", "target", "horizon", "manual", "unpriced")
@@ -142,6 +149,21 @@ async def max_positions() -> int:
         return DEFAULT_MAX_POSITIONS
 
 
+async def _opener_cursor() -> tuple[str, str] | None:
+    """The persisted (made_at, id) rotation position, or None = start from the
+    head. Pure scheduling state: a missing or corrupt row degrades to the
+    head (the max_positions idiom) — worst case one rotation restarts."""
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (OPENER_CURSOR_KEY,))
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["value"])
+        made_at, fid = str(data.get("made_at") or ""), str(data.get("id") or "")
+        return (made_at, fid) if made_at and fid else None
+    except Exception:  # noqa: BLE001 - corrupt cursor degrades to the head
+        return None
+
+
 # ---- pricing helpers (B6 whitelist reused verbatim) ---------------------------
 
 def _signed_return(direction: str, entry: Any, price: Any) -> float | None:
@@ -165,12 +187,16 @@ def _bar_price(bar: dict[str, Any]) -> float | None:
 
 async def _entry_bar(security_id: str, made_at: str) -> tuple[str, float] | None:
     """The B6 entry leg: last bar at or before made_at's calendar date AS
-    KNOWN AT made_at. Corrections ingested after made_at can never move it."""
-    bars = await market_data.get_bars_pit(security_id, made_at, end=made_at[:10])
-    if not bars:
+    KNOWN AT made_at. Corrections ingested after made_at can never move it.
+
+    Single-row read (loop-fix P8c): only the newest such bar is ever used —
+    an unusable newest bar still fails closed (skip, retry next tick), never
+    falls back to an older price."""
+    bar = await market_data.get_last_bar_pit(security_id, made_at, end=made_at[:10])
+    if bar is None:
         return None
-    price = _bar_price(bars[-1])
-    return (bars[-1]["bar_date"], price) if price is not None else None
+    price = _bar_price(bar)
+    return (bar["bar_date"], price) if price is not None else None
 
 
 async def _latest_mark(security_id: str, end_date: str) -> tuple[str, float] | None:
@@ -178,12 +204,13 @@ async def _latest_mark(security_id: str, end_date: str) -> tuple[str, float] | N
 
     Callers clamp ``end_date`` to the position's window
     (min(work_date, expires_date), see _mark_window) — a bar printed after
-    the forecast expired must never price a close (REVIEW-C3 H2)."""
-    bars = await market_data.get_bars_pit(security_id, end=end_date)
-    if not bars:
+    the forecast expired must never price a close (REVIEW-C3 H2). Single-row
+    read (loop-fix P8c), same fails-closed posture as _entry_bar."""
+    bar = await market_data.get_last_bar_pit(security_id, end=end_date)
+    if bar is None:
         return None
-    price = _bar_price(bars[-1])
-    return (bars[-1]["bar_date"], price) if price is not None else None
+    price = _bar_price(bar)
+    return (bar["bar_date"], price) if price is not None else None
 
 
 def _mark_window(wd: str, expires_at: str) -> str:
@@ -199,7 +226,7 @@ def _mark_window(wd: str, expires_at: str) -> str:
 # ---- opener (5-min tick) -------------------------------------------------------
 
 async def _insert_position(fc: dict[str, Any], entry_date: str, entry_price: float,
-                           cap: int, now: str) -> str:
+                           cap: int, now: str) -> str | None:
     """One conditional INSERT is the whole arbitration (REVIEW-C3 M3, the
     B6/0012 "the INSERT is the arbiter" precedent): the cap check rides in
     the statement's own WHERE (atomic under SQLite's single writer — no
@@ -207,39 +234,43 @@ async def _insert_position(fc: dict[str, Any], entry_date: str, entry_price: flo
     of the same forecast, and the 0017 partial unique index rejects a second
     OPEN position on the same security.
 
-    With ``paper_book_enforce_caps`` disabled only the configurable aggregate
-    cap becomes advisory; the schema invariants (one position per forecast,
-    one open position per security) remain hard. A hard aggregate-cap refusal
-    raises ``RiskLimitConflict`` rather than returning an advisory outcome.
+    Returns the new POSITION id on success, None on a lost race; the
+    aggregate cap is ALWAYS enforced (the old INSTITUTE_PAPER_BOOK_ENFORCE_CAPS
+    escape hatch is gone — a risk limit that can be switched off is not a
+    limit) and a cap refusal raises ``RiskLimitConflict``. The schema
+    invariants (one position per forecast, one open position per security)
+    are hard regardless.
     """
-    enforce_cap = get_settings().paper_book_enforce_caps
+    pid = _new_id()
     sql = (
         "INSERT INTO paper_positions (id, forecast_id, security_id, direction, "
         "entry_date, entry_price, size, stop_pct, target_pct, status, opened_at, updated_at) "
-        "SELECT ?,?,?,?,?,?,?,?,?,'open',?,?"
+        "SELECT ?,?,?,?,?,?,?,?,?,'open',?,? "
+        "WHERE (SELECT COUNT(*) FROM paper_positions WHERE status = 'open') < ?"
     )
     params: tuple[Any, ...] = (
-        _new_id(), fc["id"], fc["security_id"], fc["direction"], entry_date,
-        entry_price, SIZE, DEFAULT_STOP_PCT, DEFAULT_TARGET_PCT, now, now,
+        pid, fc["id"], fc["security_id"], fc["direction"], entry_date,
+        entry_price, SIZE, DEFAULT_STOP_PCT, DEFAULT_TARGET_PCT, now, now, cap,
     )
-    if enforce_cap:
-        sql += " WHERE (SELECT COUNT(*) FROM paper_positions WHERE status = 'open') < ?"
-        params += (cap,)
     try:
         inserted = await db.execute(sql, params)
     except sqlite3.IntegrityError:
-        return "lost_race"  # a concurrent opener won this forecast or security
+        return None  # a concurrent opener won this forecast or security
     if not inserted:
         raise RiskLimitConflict(
             f"paper-book max_positions cap {cap} reached; opening forecast {fc['id']} refused"
         )
-    return "opened"
+    return pid
 
 
 async def _emit_opened(
-    fc: dict[str, Any], entry_date: str, entry_price: float,
+    position_id: str, fc: dict[str, Any], entry_date: str, entry_price: float,
 ) -> None:
-    await bus.emit("paper_book.opened", "paper_position", fc["id"], {
+    # ref_id is the POSITION id (loop-fix P11d) — ref_kind always said
+    # 'paper_position' and paper_book.closed already refs the position row;
+    # payload keeps forecast_id so payload consumers are unaffected
+    await bus.emit("paper_book.opened", "paper_position", position_id, {
+        "position_id": position_id,
         "forecast_id": fc["id"], "security_id": fc["security_id"],
         "direction": fc["direction"], "entry_date": entry_date,
         "entry_price": entry_price,
@@ -253,31 +284,62 @@ async def opener_tick() -> dict[str, Any]:
     a forecast with no usable entry price is skipped and retried next tick.
     Caps: at most ``max_positions()`` open positions overall, at most one
     open position per security — both enforced BY THE DATABASE at insert
-    time (see _insert_position); the candidate query and the in-tick
-    security set are just cheap pre-filters. Expired forecasts are never
-    opened. Per-item failures never stop the sweep.
+    time (see _insert_position; the cap is not switchable); the candidate
+    query and the in-tick security set are just cheap pre-filters. One tick
+    considers at most OPENER_BATCH_LIMIT candidates (loop-fix P8c) and the
+    batch ROTATES through the (made_at, id) keyset via a persisted cursor
+    with wrap-around (loop-fix R3): a permanently unpriceable head occupies
+    only its own slice instead of starving every candidate behind it —
+    skipped rows are reconsidered next rotation, not next tick. Expired
+    forecasts are never opened, and neither are origin='backfill' rows (a
+    backdated made_at would hand the book a historically frozen entry — the
+    look-ahead the ledger exists to prevent; backfill stays out of every
+    performance scope). Per-item failures never stop the sweep; every opened
+    row stamps its own bus.now_iso() (loop-fix P11f), not one tick-start
+    timestamp.
     """
     now = bus.now_iso()
     cap = await max_positions()
-    enforce_cap = get_settings().paper_book_enforce_caps
     row = await db.query_one("SELECT COUNT(*) AS n FROM paper_positions WHERE status = 'open'")
     summary = {"cap": cap, "open_before": row["n"] if row else 0, "opened": 0,
                "skipped_no_price": 0, "skipped_security_dup": 0, "lost_race": 0,
-               "rejected_cap": 0, "cap_enforced": enforce_cap, "considered": 0}
-    if enforce_cap and summary["open_before"] >= cap:
+               "rejected_cap": 0, "considered": 0}
+    if summary["open_before"] >= cap:
         summary["rejected_cap"] = 1
         return summary
 
-    candidates = await db.query(
-        "SELECT * FROM forecasts f WHERE f.status = 'open' "
+    base_where = (
+        "f.status = 'open' "
         "AND f.direction IN ('long','short') AND f.security_id IS NOT NULL "
-        "AND f.expires_at > ? "
+        "AND f.expires_at > ? AND f.origin <> 'backfill' "
         "AND NOT EXISTS (SELECT 1 FROM paper_positions p WHERE p.forecast_id = f.id) "
         "AND NOT EXISTS (SELECT 1 FROM paper_positions q "
-        "                WHERE q.security_id = f.security_id AND q.status = 'open') "
-        "ORDER BY f.made_at, f.id",
-        (now,),
+        "                WHERE q.security_id = f.security_id AND q.status = 'open')"
     )
+    # keyset rotation (R3): first the slice strictly AFTER the cursor, then —
+    # if the batch has room — wrap to the head up to and including the cursor.
+    # The two slices partition the keyset, so one batch never sees a row twice.
+    cursor = await _opener_cursor()
+    candidates: list[dict[str, Any]] = []
+    if cursor is not None:
+        candidates = await db.query(
+            f"SELECT * FROM forecasts f WHERE {base_where} "
+            "AND (f.made_at > ? OR (f.made_at = ? AND f.id > ?)) "
+            "ORDER BY f.made_at, f.id LIMIT ?",
+            (now, cursor[0], cursor[0], cursor[1], OPENER_BATCH_LIMIT),
+        )
+    if len(candidates) < OPENER_BATCH_LIMIT:
+        head_clause = ""
+        params: list[Any] = [now]
+        if cursor is not None:
+            head_clause = " AND (f.made_at < ? OR (f.made_at = ? AND f.id <= ?))"
+            params += [cursor[0], cursor[0], cursor[1]]
+        params.append(OPENER_BATCH_LIMIT - len(candidates))
+        candidates += await db.query(
+            f"SELECT * FROM forecasts f WHERE {base_where}{head_clause} "
+            "ORDER BY f.made_at, f.id LIMIT ?",
+            params,
+        )
     seen_securities: set[str] = set()
     for fc in candidates:
         summary["considered"] += 1
@@ -290,19 +352,31 @@ async def opener_tick() -> dict[str, Any]:
                 summary["skipped_no_price"] += 1
                 continue  # no usable knowledge at made_at — retry next tick
             entry_date, entry_price = entry
+            opened_at = bus.now_iso()  # P11f: per-iteration clock, not tick start
             try:
-                outcome = await _insert_position(fc, entry_date, entry_price, cap, now)
+                pid = await _insert_position(fc, entry_date, entry_price, cap, opened_at)
             except RiskLimitConflict:
                 summary["rejected_cap"] += 1
                 break  # the database says the enforced book is full
-            if outcome == "lost_race":
+            if pid is None:
                 summary["lost_race"] += 1
                 continue
             seen_securities.add(fc["security_id"])
             summary["opened"] += 1
-            await _emit_opened(fc, entry_date, entry_price)
+            await _emit_opened(pid, fc, entry_date, entry_price)
         except Exception:  # noqa: BLE001 - one bad forecast must not stop the sweep
             log.exception("opener failed for forecast %s", fc["id"])
+    if summary["considered"]:
+        # advance the rotation to the last row actually considered (an early
+        # cap break leaves the unconsidered remainder first in line after the
+        # wrap); scheduling state only — concurrent ticks may race the write,
+        # the position inserts above are what actually arbitrate opens
+        last = candidates[summary["considered"] - 1]
+        await db.execute(
+            "INSERT INTO admin_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (OPENER_CURSOR_KEY, json.dumps({"made_at": last["made_at"], "id": last["id"]})),
+        )
     return summary
 
 
@@ -311,8 +385,10 @@ async def open_forecast_position(forecast_id: str) -> dict[str, Any] | None:
 
     This is the operator/API path: validation failures are 400s, while an
     aggregate cap, per-security open-position limit, duplicate forecast, or
-    concurrent state change is a 409. The setting switch can make only
-    ``max_positions`` advisory; schema uniqueness remains non-bypassable.
+    concurrent state change is a 409. Every cap is hard — there is no
+    advisory mode; schema uniqueness remains non-bypassable. Backfilled
+    forecasts (origin='backfill') are refused: their frozen historical entry
+    would be pure look-ahead in the book.
     """
     fc = await db.query_one("SELECT * FROM forecasts WHERE id = ?", (forecast_id,))
     if fc is None:
@@ -322,6 +398,11 @@ async def open_forecast_position(forecast_id: str) -> dict[str, Any] | None:
         raise TransitionConflict(f"forecast {forecast_id} is {fc['status']!r}, not open")
     if fc["direction"] not in ("long", "short"):
         raise PaperBookError(f"forecast {forecast_id} direction {fc['direction']!r} is not tradable")
+    if fc["origin"] == "backfill":
+        raise PaperBookError(
+            f"forecast {forecast_id} is a backfill record (origin='backfill'); "
+            "backfills never enter the paper book"
+        )
     if not fc["security_id"]:
         raise PaperBookError(f"forecast {forecast_id} has no security to open")
     if fc["expires_at"] <= now:
@@ -332,8 +413,8 @@ async def open_forecast_position(forecast_id: str) -> dict[str, Any] | None:
             f"no usable entry price known for {fc['security_id']} at {fc['made_at']}"
         )
     entry_date, entry_price = entry
-    outcome = await _insert_position(fc, entry_date, entry_price, await max_positions(), now)
-    if outcome == "lost_race":
+    pid = await _insert_position(fc, entry_date, entry_price, await max_positions(), now)
+    if pid is None:  # lost race — diagnose which invariant won
         prior = await db.query_one(
             "SELECT id FROM paper_positions WHERE forecast_id = ?", (forecast_id,))
         if prior:
@@ -347,7 +428,7 @@ async def open_forecast_position(forecast_id: str) -> dict[str, Any] | None:
                 f"security {fc['security_id']} already has open position {other['id']}"
             )
         raise TransitionConflict(f"opening forecast {forecast_id} lost a concurrent claim")
-    await _emit_opened(fc, entry_date, entry_price)
+    await _emit_opened(pid, fc, entry_date, entry_price)
     return await db.query_one(
         "SELECT * FROM paper_positions WHERE forecast_id = ?", (forecast_id,))
 
@@ -419,9 +500,15 @@ async def _maybe_settle(forecast_id: str) -> str | None:
 async def _benchmark_nav(wd: str) -> float | None:
     """CSI300 mark <= wd (latest knowledge) normalized to the pinned base.
 
-    The base is pinned in admin_state on first sight of a usable mark (that
-    day's benchmark_nav = 1.0). No usable mark, or an unusable stored base →
-    NULL: the column fails closed rather than guess a proxy.
+    The base is pinned in admin_state on FIRST SIGHT of a usable mark — only
+    when no base row exists at all, and only the call whose INSERT actually
+    landed answers 1.0 (rowcount-checked; a pin-race loser re-reads and
+    normalizes against the winner's base — loop-fix R3). A stored base that
+    is corrupt or unusable is NOT a first sight (loop-fix P11e): silently
+    re-pinning at today's level would quietly reset the whole benchmark_nav
+    history, so it fails closed to NULL with a log.error and the row is left
+    in place; the deliberate operator repin path is deleting the admin_state
+    row. No usable mark → NULL, never a proxy.
     """
     marks = await market_data.get_marks_pit(BENCHMARK_ID, end=wd)
     if not marks:
@@ -430,22 +517,37 @@ async def _benchmark_nav(wd: str) -> float | None:
     if not forecasts._usable_price(value):
         return None
     row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (BENCH_BASE_KEY,))
-    base = None
-    if row is not None:
-        try:
-            base = json.loads(row["value"]).get("value")
-        except Exception:  # noqa: BLE001 - corrupt base: fail closed below
-            base = None
-    if not forecasts._usable_price(base):
-        await db.execute(
+    if row is None:
+        # first sight: pin the base. The INSERT is the arbiter (rowcount-
+        # checked, R3): only the call whose row actually landed may answer
+        # 1.0 — a loser that read stale absence must re-read and normalize
+        # against the base that REALLY stuck, or it writes an inconsistent
+        # benchmark NAV for its own work date.
+        pinned = await db.execute(
             "INSERT INTO admin_state (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "ON CONFLICT(key) DO NOTHING",
             (BENCH_BASE_KEY, json.dumps({
                 "benchmark_id": BENCHMARK_ID, "mark_date": marks[-1]["mark_date"],
                 "value": value,
             })),
         )
-        return 1.0
+        if pinned:
+            return 1.0
+        row = await db.query_one(
+            "SELECT value FROM admin_state WHERE key = ?", (BENCH_BASE_KEY,))
+        if row is None:  # pin lost AND row gone again: fail closed, next MTM re-pins
+            return None
+    try:
+        base = json.loads(row["value"]).get("value")
+    except Exception:  # noqa: BLE001 - corrupt base: fail closed below
+        base = None
+    if not forecasts._usable_price(base):
+        log.error(
+            "benchmark base %r is corrupt/unusable (%r): benchmark_nav fails closed to "
+            "NULL; DELETE that admin_state row to re-pin deliberately",
+            BENCH_BASE_KEY, row["value"],
+        )
+        return None
     ratio = value / base
     return ratio if math.isfinite(ratio) else None
 

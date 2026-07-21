@@ -515,8 +515,13 @@ async def _on_factcheck_disputed(event: bus.Event) -> None:
             if urls:
                 lines.append("- 链接：" + " ".join(urls))
             parts.append("\n".join(lines))
+        body = "\n\n".join(parts)
+        from ..institute.chain import entity_footer  # lazy: domain module
+        ef = await entity_footer(body)
+        if ef:
+            body = f"{body}\n\n{ef}"
         await get_writer().write_note(
-            "Inbox/Disputed Claims.md", {"type": "factcheck"}, "\n\n".join(parts),
+            "Inbox/Disputed Claims.md", {"type": "factcheck"}, body,
             artifact_kind="factcheck", artifact_id="factcheck-disputes",
         )
         # source dossier warning callout: re-project the source note so the
@@ -552,6 +557,10 @@ async def _on_paper_book(event: bus.Event) -> None:
         body = await paper_book.render_journal(wd)
         if not body.strip():
             return
+        from ..institute.chain import entity_footer  # lazy: domain module
+        ef = await entity_footer(body)
+        if ef:
+            body = f"{body.rstrip()}\n\n{ef}"
         rel = f"Book/journal/{wd}.md"
         await get_writer().write_note(
             rel, {"type": "paper-book-journal", "work_date": wd}, body,
@@ -600,6 +609,10 @@ async def _on_research_tree_completed(event: bus.Event) -> None:
             f"- 创建：{tree['created_at']}　结束：{tree['finished_at'] or '—'}"
         )
         body = f"## 研究树概览\n\n{header}\n\n## 节点树\n\n" + "\n".join(lines)
+        from ..institute.chain import entity_footer  # lazy: domain module
+        ef = await entity_footer(body)
+        if ef:
+            body = f"{body.rstrip()}\n\n{ef}"
         rel = f"Research/{_slug(tree['root_topic'])}/tree.md"
         await get_writer().write_note(
             rel, {"type": "research_tree", "tree_id": tree_id}, body,
@@ -632,6 +645,10 @@ async def _on_twin_ready(event: bus.Event) -> None:
         if not text.strip():
             log.warning("twin task %s has no output; skipping export", task_id)
             return
+        from ..institute.chain import entity_footer  # lazy: domain module
+        ef = await entity_footer(text)
+        if ef:
+            text = f"{text.rstrip()}\n\n{ef}"
         _fname, folder, title = _COMPILED[wf_id]
         wd = str(p.get("work_date") or "") or work_date()
         rel = f"{folder}/{wd} {title}_en.md"
@@ -643,6 +660,88 @@ async def _on_twin_ready(event: bus.Event) -> None:
         log.info("vault export: %s", rel)
     except Exception:
         log.exception("bilingual twin export failed for %s", event.ref_id)
+
+
+# ---- committee (weekly deliberation, M8-012) ---------------------------------
+
+_COMMITTEE_WF_ID = "committee"
+_COMMITTEE_TERMINAL = ("workflow.completed", "workflow.failed", "workflow.cancelled")
+
+
+async def _on_committee(event: bus.Event) -> None:
+    """workflow.* for the committee workflow → durable run record + vault note.
+
+    Registered on the ``workflow.`` prefix and self-filters: non-committee
+    workflows return immediately. Rows first (rows are truth): started opens
+    the multi_agent_runs committee record, terminal events settle it — BOTH
+    regardless of whether the vault is enabled. Then, for completed runs
+    only, the note is projected to ``Committee/<WORK_DATE> 委员会裁决.md``
+    with the verdict text AND the input snapshot (the frozen ${WEEK_DISPUTES}
+    whiteboard digest the agenda step saw — persisted on the run's variables).
+    """
+    try:
+        p = event.payload or {}
+        run_id = str(p.get("run_id") or event.ref_id or "") or None
+        wf_id = str(p.get("workflow_id") or "")
+        run = None
+        if not wf_id and run_id:
+            run = await _get_run(run_id)
+            wf_id = str(_get(run, "workflow_id") or "")
+        if wf_id != _COMMITTEE_WF_ID or not run_id:
+            return
+
+        from ..institute import multi_agent  # lazy: domain module
+
+        if event.type == "workflow.started":
+            await multi_agent.open_committee_run(run_id)
+            return
+        if event.type not in _COMMITTEE_TERMINAL:
+            return
+        try:
+            await multi_agent.finalize_committee_run(run_id)
+        except Exception:
+            log.exception("committee run record settle failed for %s", run_id)
+
+        if event.type != "workflow.completed" or not get_writer().enabled:
+            return
+        if run is None:
+            run = await _get_run(run_id)
+        ws = await _session_workspace(p.get("session_id") or _get(run, "session_id"))
+        verdict = (_read_text(ws / "委员会裁决.md") if ws else None) or _steps_text(run)
+        if not verdict.strip():
+            log.warning("nothing to export for committee run %s", run_id)
+            return
+
+        variables = p.get("variables") or _get(run, "variables")
+        if isinstance(variables, str):
+            try:
+                variables = json.loads(variables)
+            except ValueError:
+                variables = {}
+        snapshot = str((variables or {}).get("WEEK_DISPUTES") or "").strip()
+        parts = [
+            verdict.strip(),
+            "## 输入快照（当周白板研讨摘要）\n\n"
+            + (snapshot or "（本周无已完结的白板研讨记录）"),
+        ]
+        footer = _workspace_footer(ws)
+        if footer:
+            parts.append(footer)
+        text = "\n\n".join(parts)
+        from ..institute.chain import entity_footer  # lazy: domain module
+        ef = await entity_footer(text)
+        if ef:
+            text = f"{text}\n\n{ef}"
+
+        wd = _run_work_date(p, run)
+        rel = f"Committee/{wd} 委员会裁决.md"
+        await get_writer().write_note(
+            rel, {"type": "committee", "run_id": run_id, "work_date": wd}, text,
+            artifact_kind="committee", artifact_id=str(run_id),
+        )
+        log.info("vault export: %s", rel)
+    except Exception:
+        log.exception("committee export failed for %s", event.ref_id)
 
 
 # ---- wiring ------------------------------------------------------------------
@@ -658,4 +757,5 @@ def register() -> None:
     bus.on("paper_book.marked", _on_paper_book)
     bus.on("tree.completed", _on_research_tree_completed)
     bus.on("bilingual.twin_ready", _on_twin_ready)
+    bus.on("workflow.", _on_committee)
     log.info("vault exporter registered (vault_dir=%s)", get_settings().vault_dir or "disabled")

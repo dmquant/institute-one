@@ -15,34 +15,45 @@ ROADMAP Phase 3 (proposal §6.2 row 3). The pipeline:
 3. **Tier-1 reuse gate** (``check_reuse``): the claim is embedded and compared
    (cosine, in Python — the whiteboard_topic_vectors precedent, no sqlite-vec
    needed) against live verified facts. Per-category threshold + TTL come from
-   the ``factcheck_reuse_policy`` admin_state row. A VERIFIED near-neighbor
-   marks the card ``reused`` (no re-verification); a DISPUTED near-neighbor
-   marks it ``self_contradicted`` (the claim repeats an already-refuted fact —
-   surfaced like a dispute, never verified). Vectors degraded == everything is
-   fresh (the documented degrade-open posture).
+   the ``factcheck_reuse_policy`` admin_state row. The HIGHEST-similarity
+   neighbor over the threshold decides — ``reused`` off a VERIFIED winner,
+   ``self_contradicted`` off a DISPUTED one — but only after a consistency
+   gate (numbers / date patterns / negation polarity must agree between the
+   old and new claim); a top-similarity tie between conflicting verdicts, or
+   a gate mismatch, sends the claim to normal verification instead. Vectors
+   degraded == everything is fresh (the documented degrade-open posture).
 4. **Verification** (``verify_pending``): pending cards are conditional-claimed
    pending→verifying IN THE DATABASE before any model call (two processes can
-   never double-verify a card; REVIEW-C1 P1-1), and one slot of the SGT daily
-   attempt budget is consumed atomically per model call — successes AND
-   failures count, no refunds (the cap is a quota ceiling; refunding failures
-   would let a flapping hand burn unbounded quota). The verdict is parsed by
-   canonical-line extraction (only bare line-anchored ``VERDICT: <word>``
-   lines count; quotes/code fences are context, conflicts collapse
-   conservatively UNVERIFIABLE > DISPUTED > VERIFIED; REVIEW-C1 P1-2). The
-   verdict row and the card's terminal status commit in one transaction.
+   never double-verify a card; REVIEW-C1 P1-1) under a random per-attempt
+   lease token — settle/release carry ``AND lease_id = ?`` so a stale worker's
+   late write loses once the sweep re-opens its card — and one slot of the
+   SGT daily attempt budget is consumed atomically per model call — successes
+   AND failures count, no refunds (the cap is a quota ceiling; refunding
+   failures would let a flapping hand burn unbounded quota). The verdict is
+   parsed by canonical-line extraction (only bare line-anchored ``VERDICT:
+   <word>`` lines count; quotes/fences/indented code/HTML comments are
+   context; conflicting canonical lines land UNVERIFIABLE outright), and
+   VERIFIED/DISPUTED without non-empty evidence plus at least one source URL
+   are downgraded UNVERIFIABLE. The verdict row and the card's terminal
+   status commit in one transaction.
 5. **Disputed surfacing**: DISPUTED verdicts and self_contradicted cards write
-   a durable outbox intent in the same transaction as the dispute. The drain
-   atomically materializes one mailbox thread/note/dispatch and marks the row
-   delivered; ``factcheck.disputed`` remains the vault exporter signal.
+   durable outbox intents in the same transaction as the dispute — a
+   'mailbox' intent (analyst notification) and an 'event' intent (the
+   ``factcheck.disputed`` bus event the vault exporter consumes, now durable
+   instead of a lossy post-commit emit). The drain atomically materializes
+   one mailbox thread/note/dispatch per mailbox row, emits events
+   at-least-once per event row, and marks rows delivered.
 
 The app lifespan calls ``register()``, and ``scheduler.py`` mounts ``tick()``
 as the gated 30-minute ``factcheck-tick`` job. Everything in this module
 follows the house rules: model calls only via executor.submit, conditional
-claims by rowcount, bus.now_iso() / work_date() for time, handlers/tick never
-raise.
+claims by rowcount, bus.now_iso() / work_date() for time, bus handlers never
+raise (tick/drain top-level failures propagate to their @metered wrappers so
+cron health sees them; per-row failures are absorbed inside).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -72,10 +83,13 @@ MAX_CLAIM_CHARS = 500          # a claim is one sentence; longer == parser junk
 EXTRACT_TEXT_CAP = 6000        # source text slice fed to the extraction prompt
 EXTRACT_PER_TICK = 2           # extraction tasks one tick may run
 VERIFY_PER_TICK = 3            # verification tasks one tick may run (within the daily cap)
+VERIFY_MAX_ATTEMPTS = 3        # failed verification attempts before a card goes terminal (LOOP-P3)
+VECTOR_SCAN_LIMIT = 2000       # bound for reuse-gate / claim_check embedding scans (LOOP-P10e)
 STALE_RUNNING_MINUTES = 60     # extraction rows / verifying cards stuck longer are re-opened
 DEFAULT_DAILY_CAP = 10         # INSTITUTE_FACTCHECK_DAILY_CAP fallback
 OUTBOX_MAX_ATTEMPTS = 5        # terminal failed after this many delivery attempts
 OUTBOX_PER_DRAIN = 20          # bounded scheduler batch
+OUTBOX_LEASE_STALE_MINUTES = 10  # event-row drainer leases older than this are re-opened
 CLAIM_CHECK_MIN_SIM = 0.75     # claim_check vector recall floor (loose on purpose: writing-time hints)
 KEYWORD_MIN_OVERLAP = 0.4      # claim_check keyword fallback: claim-token coverage floor
 CLAIM_CHECK_MAX_HITS = 5
@@ -83,8 +97,10 @@ CLAIM_CHECK_TEXT_CAP = 20000   # draft slice claim_check will embed/tokenize (MC
 RESEARCH_REPORT_FILE = "06_深度报告.md"   # same artifact exporter._export_research reads
 
 # Daily verification budget: one admin_state counter row per SGT work date
-# ('factcheck_attempts:<date>'), consumed by _reserve_attempt()'s conditional
-# UPDATE BEFORE each model call. Successes and failures both count, no refunds.
+# ('factcheck_attempts:<date>'), consumed by _book_verification()'s
+# conditional UPDATE — inside the same transaction as the card attempts+1 and
+# the durable queued task row, BEFORE each model call (R4). Successes and
+# failures both count, no refunds.
 ATTEMPTS_KEY_PREFIX = "factcheck_attempts:"
 
 # ---- reuse policy (config row over in-code defaults; 0011/whiteboard idiom) --
@@ -322,8 +338,81 @@ def _content_hash(source_kind: str, source_ref: str, claim: str) -> str:
 
 # ---- tier-1 reuse gate ---------------------------------------------------------
 
+# Consistency-gate token extraction (deliberately lightweight, not NLP):
+# numbers (commas stripped, %/‰ kept — "37%" and "37" are different claims),
+# date-shaped patterns (ISO-ish, 中文年月日, quarters/halves), a small CN/EN
+# negation lexicon whose occurrence counts are compared, and the ORDERED
+# anchor sequence (numbers + latin words + CJK runs, in appearance order).
+_NUM_RE = re.compile(r"\d+(?:[.,]\d+)*[%‰]?")
+_DATE_RES = (
+    re.compile(r"\d{4}[-/.]\d{1,2}(?:[-/.]\d{1,2})?"),
+    re.compile(r"\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?"),
+    re.compile(r"\d{1,2}月(?:\d{1,2}日)?"),
+    re.compile(r"[QqHh][1-4]"),
+)
+_NEGATION_CN = ("没有", "不再", "未能", "无法", "不", "未", "没", "非", "无")
+_NEGATION_EN_RE = re.compile(r"\b(?:not|no|never|without|none|n't)\b", re.IGNORECASE)
+# Anchor tokens for the ORDER comparison (R2 P1-2): numbers, latin words,
+# single CJK characters — everything except whitespace/punctuation, in
+# sequence. CJK anchors are per CHARACTER so spacing inside Chinese text
+# (which carries no meaning) cannot flip the comparison, while any actual
+# reordering (subject/object swap, number re-attribution) still does.
+_ANCHOR_RE = re.compile(r"\d+(?:[.,]\d+)*[%‰]?|[A-Za-z][A-Za-z0-9.\-]*|[\u4e00-\u9fff]")
+
+
+def _claim_numbers(text: str) -> set[str]:
+    return {m.group(0).replace(",", "") for m in _NUM_RE.finditer(text or "")}
+
+
+def _claim_dates(text: str) -> set[str]:
+    out: set[str] = set()
+    for pat in _DATE_RES:
+        out.update(m.group(0).casefold() for m in pat.finditer(text or ""))
+    return out
+
+
+def _negation_count(text: str) -> int:
+    text = text or ""
+    count = len(_NEGATION_EN_RE.findall(text))
+    for word in _NEGATION_CN:
+        count += text.count(word)
+    return count
+
+
+def _claim_anchor_seq(text: str) -> list[str]:
+    """Ordered content-token sequence: 数字/拉丁词/中文连续段 in appearance
+    order, case- and thousands-separator-normalized. Whitespace, punctuation
+    and (unhandled) symbols are not anchors, so pure re-punctuation of the
+    same statement compares equal."""
+    return [m.group(0).replace(",", "").casefold() for m in _ANCHOR_RE.finditer(text or "")]
+
+
+def _consistency_gate(new_claim: str, old_claim: str) -> bool:
+    """True == the near-duplicate claims agree on numbers, date patterns,
+    negation polarity AND the ordered anchor sequence, so the verdict may be
+    reused. Any mismatch answers False and the new claim goes through normal
+    verification — cosine similarity alone cannot tell "涨了10%" from
+    "涨了40%" or "获批" from "未获批" (audit finding 4), and bag-of-token
+    equality cannot tell "A收购B" from "B收购A" or re-attributed numbers
+    (R2 P1-2) — the SEQUENCE comparison binds numbers and entities to their
+    positions, so any subject/object or attribution swap fails the gate.
+    Deliberately conservative: not NLP, just set/count/sequence comparison;
+    disagreeing means verify, never means dispute. The sequence check
+    tightens reuse to statements identical modulo punctuation/whitespace/
+    case — the cost of a false mismatch is one extra verification."""
+    if _claim_numbers(new_claim) != _claim_numbers(old_claim):
+        return False
+    if _claim_dates(new_claim) != _claim_dates(old_claim):
+        return False
+    if _negation_count(new_claim) != _negation_count(old_claim):
+        return False
+    if _claim_anchor_seq(new_claim) != _claim_anchor_seq(old_claim):
+        return False
+    return True
+
+
 async def _reuse_state(
-    vec: list[float] | None, category: str,
+    claim: str, vec: list[float] | None, category: str,
 ) -> tuple[str, str | None, float]:
     """(state, related verified_facts.id, similarity) for an embedded claim.
 
@@ -332,37 +421,58 @@ async def _reuse_state(
     rows only (expires_at in the future, current embed model); the candidate
     set is NOT restricted to the same category — categories are model labels
     with jitter, and semantic similarity is category-agnostic — but the
-    threshold applied is the NEW claim's category threshold. A DISPUTED
-    neighbor over the threshold wins over a VERIFIED one (repeating a refuted
-    fact must never be silently reused). Never raises.
+    threshold applied is the NEW claim's category threshold.
+
+    The HIGHEST-similarity neighbor over the threshold decides (a DISPUTED
+    neighbor no longer unconditionally outranks a closer VERIFIED one); if
+    conflicting verdicts tie exactly at the top similarity, the gate refuses
+    to guess and the claim goes to verification. The winner must also pass
+    _consistency_gate against the new claim (numbers / dates / negation
+    polarity), otherwise the claim is fresh and gets verified. Never raises.
     """
     if vec is None:
         return "fresh", None, 0.0
     try:
         policy = await get_reuse_policy()
         threshold = float(policy.get(category, policy["other"])["threshold"])
+        # newest verdicts first, clamped (LOOP-P10e): the in-Python cosine
+        # loop must stay bounded as the fact store grows; a fact old enough
+        # to fall outside the window simply stops gating (degrade-open)
         rows = await db.query(
-            "SELECT fv.embedding, fv.dim, vf.id AS fact_id, vf.verdict "
+            "SELECT fv.embedding, fv.dim, vf.id AS fact_id, vf.verdict, c.claim AS old_claim "
             "FROM fact_claim_vectors fv "
             "JOIN verified_facts vf ON vf.fact_card_id = fv.fact_card_id "
-            "WHERE fv.model = ? AND vf.verdict IN ('VERIFIED','DISPUTED') AND vf.expires_at > ?",
-            (vectors.model_name(), bus.now_iso()),
+            "JOIN fact_cards c ON c.id = fv.fact_card_id "
+            "WHERE fv.model = ? AND vf.expires_at > ? "
+            "AND ((c.status='verified' AND vf.verdict='VERIFIED') "
+            "  OR (c.status='disputed' AND vf.verdict='DISPUTED')) "
+            "ORDER BY vf.verified_at DESC LIMIT ?",
+            (vectors.model_name(), bus.now_iso(), VECTOR_SCAN_LIMIT),
         )
-        best: dict[str, tuple[float, str]] = {}
+        best_sim = -1.0
+        best: list[dict[str, Any]] = []   # every neighbor tied at best_sim
         for r in rows:
             other = _unpack_vec(r["embedding"], r["dim"])
             if len(other) != len(vec):
                 continue  # different embedding space (defensive; model already filtered)
             sim = _cosine(vec, other)
-            if sim >= threshold and (r["verdict"] not in best or sim > best[r["verdict"]][0]):
-                best[r["verdict"]] = (sim, r["fact_id"])
-        if "DISPUTED" in best:
-            sim, fact_id = best["DISPUTED"]
-            return "self_contradicted", fact_id, sim
-        if "VERIFIED" in best:
-            sim, fact_id = best["VERIFIED"]
-            return "reused", fact_id, sim
-        return "fresh", None, 0.0
+            if sim < threshold:
+                continue
+            if sim > best_sim:
+                best_sim = sim
+                best = [r]
+            elif sim == best_sim:
+                best.append(r)
+        if not best:
+            return "fresh", None, 0.0
+        if len({r["verdict"] for r in best}) != 1:
+            # conflicting verdicts tied at the top: verify instead of guessing
+            return "fresh", None, 0.0
+        winner = best[0]
+        if not _consistency_gate(claim, winner["old_claim"] or ""):
+            return "fresh", None, 0.0
+        state = "self_contradicted" if winner["verdict"] == "DISPUTED" else "reused"
+        return state, winner["fact_id"], best_sim
     except Exception:  # noqa: BLE001 - the gate must never block extraction
         log.exception("reuse gate failed; treating claim as fresh")
         return "fresh", None, 0.0
@@ -371,7 +481,7 @@ async def _reuse_state(
 async def check_reuse(claim: str, category: str) -> dict[str, Any]:
     """Public tier-1 gate: embed one claim and classify it against live facts."""
     vec = await vectors.embed(claim)
-    state, fact_id, sim = await _reuse_state(vec, _category(category))
+    state, fact_id, sim = await _reuse_state(claim, vec, _category(category))
     return {"state": state, "related_fact_id": fact_id, "similarity": round(sim, 4)}
 
 
@@ -424,7 +534,7 @@ async def extract_claims(
     for item in parse_claims(task.output or ""):
         claim, category = item["claim"], item["category"]
         vec = await vectors.embed(claim)
-        state, related_fact_id, sim = await _reuse_state(vec, category)
+        state, related_fact_id, sim = await _reuse_state(claim, vec, category)
         status = {"fresh": "pending", "reused": "reused", "self_contradicted": "self_contradicted"}[state]
         card_id = uuid.uuid4().hex[:12]
         row = {
@@ -434,8 +544,10 @@ async def extract_claims(
         }
         # the INSERT is the arbiter: OR IGNORE on content_hash makes re-runs
         # of the same source a per-claim no-op. A self-contradiction's outbox
-        # intent lands in THIS transaction with the terminal card.
+        # intents (mailbox + durable event) land in THIS transaction with the
+        # terminal card.
         outbox_id: str | None = None
+        event_outbox_id: str | None = None
         async with db.transaction() as conn:
             cur = await conn.execute(
                 "INSERT OR IGNORE INTO fact_cards "
@@ -447,22 +559,23 @@ async def extract_claims(
             inserted = bool(cur.rowcount)
             await cur.close()
             if inserted and state == "self_contradicted":
+                evidence = f"与已被驳斥的事实相似度 {sim:.3f}（fact {related_fact_id}）"
                 outbox_id = await _enqueue_dispute_outbox(
                     conn, row, kind="self_contradicted",
                     verdict_label=SELF_CONTRADICTED_LABEL,
-                    evidence=f"与已被驳斥的事实相似度 {sim:.3f}（fact {related_fact_id}）",
-                    sources="",
+                    evidence=evidence, sources="",
+                )
+                event_outbox_id = await _enqueue_dispute_event(
+                    conn, row, kind="self_contradicted",
+                    verdict_label=SELF_CONTRADICTED_LABEL,
+                    evidence=evidence, sources="", thread_outbox_id=outbox_id,
                 )
         if not inserted:
             continue  # already extracted from this source
         await _store_claim_vector(card_id, vec)
         created.append(row)
         if state == "self_contradicted":
-            await _surface_dispute(
-                row, kind="self_contradicted", verdict_label=SELF_CONTRADICTED_LABEL,
-                evidence=f"与已被驳斥的事实相似度 {sim:.3f}（fact {related_fact_id}）", sources="",
-                outbox_id=outbox_id,
-            )
+            await _surface_dispute(card_id, [outbox_id, event_outbox_id])
     if created:
         await bus.emit("factcheck.extracted", "factcheck", str(source_ref), {
             "source_kind": source_kind, "source_ref": str(source_ref),
@@ -484,18 +597,29 @@ _CANON_VERDICT_LINE = re.compile(
     r"^\s*\**\s*VERDICT\s*[:：]\s*\**\s*(VERIFIED|DISPUTED|UNVERIFIABLE)\b\s*\**\s*[.。！!]?\s*$",
     re.IGNORECASE,
 )
-_FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
+# CommonMark-ish fences: an opener is a run of >=3 backticks OR tildes at <=3
+# spaces of indent (4+ spaces is an indented code block, handled separately);
+# the closer must repeat the SAME character at least as many times and carry
+# nothing but whitespace (an info-string line inside a fence is content, and a
+# ~~~ inside a ``` fence must never close it — kind and length pair up).
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*$")
+_INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
 
-# Conflict collapse order — most conservative first (UNVERIFIABLE only keeps
-# the claim out of the fact store; a wrong VERIFIED would poison reuse and a
-# wrong DISPUTED would page the analyst).
-_VERDICT_CONSERVATIVE_ORDER = ("UNVERIFIABLE", "DISPUTED", "VERIFIED")
-
-_EVIDENCE_RE = re.compile(r"EVIDENCE\s*[:：]\s*(.+?)(?=\n\s*SOURCES\s*[:：]|\Z)", re.IGNORECASE | re.DOTALL)
-_SOURCES_LINE_RE = re.compile(r"SOURCES\s*[:：]\s*(.+)", re.IGNORECASE)
+# Line-anchored like the canonical verdict line (R2 P1-1): an EVIDENCE/SOURCES
+# label buried mid-line (e.g. injected via the claim material, which
+# _quote_material folds inline into the 【论断】 line) must not start an
+# extraction. Markdown bold around the label is tolerated, same as VERDICT.
+_EVIDENCE_RE = re.compile(
+    r"^\s*\**\s*EVIDENCE\s*[:：]\s*\**\s*(.+?)(?=\n\s*\**\s*SOURCES\s*[:：]|\Z)",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+_SOURCES_LINE_RE = re.compile(
+    r"^\s*\**\s*SOURCES\s*[:：]\s*(.+)", re.IGNORECASE | re.MULTILINE,
+)
 _URL_RE = re.compile(r"https?://[^\s)\]>」』]+")
 
-_VERDICT_MATERIAL_GUARD = re.compile(r"(VERDICT)(\s*[:：])", re.IGNORECASE)
+_VERDICT_MATERIAL_GUARD = re.compile(r"(VERDICT|EVIDENCE|SOURCES)(\s*[:：])", re.IGNORECASE)
 
 
 def _quote_material(text: str) -> str:
@@ -503,43 +627,85 @@ def _quote_material(text: str) -> str:
     (REVIEW-C1 P1-2; the C4 ``_quote_detail`` precedent). Claims are one
     sentence by contract: collapsing whitespace keeps the material inline
     after the 【论断】 label, so nothing from it can sit at line start; the
-    colon spacing is belt and braces for hands that re-wrap lines."""
+    label guard (VERDICT plus, since R2 P1-1, EVIDENCE/SOURCES — injected
+    proof labels must not survive either) is belt and braces for hands that
+    re-wrap lines."""
     flat = " ".join((text or "").split())
     return _VERDICT_MATERIAL_GUARD.sub(r"\1 -\2", flat)
+
+
+def _bare_lines(text: str) -> list[str]:
+    """The answer surface of a verifier output: lines OUTSIDE fenced code
+    blocks (```` ``` ````/``~~~`` paired by kind AND length — a mismatched
+    fence can never fake a close), indented code blocks (4 spaces / tab at
+    line start), HTML comment blocks and blockquotes (``>``).
+
+    ONE filter for every parsing stage — verdict, evidence AND sources (R2
+    P1-1: quoted material that cannot decide the verdict must not be able to
+    satisfy the proof gate either)."""
+    out: list[str] = []
+    fence: tuple[str, int] | None = None   # (fence char, opener length)
+    in_comment = False
+    for line in (text or "").splitlines():
+        if fence is not None:
+            m = _FENCE_CLOSE.match(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1]:
+                fence = None
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if _INDENTED_CODE.match(line):
+            continue
+        m = _FENCE_OPEN.match(line)
+        if m:
+            fence = (m.group(1)[0], len(m.group(1)))
+            continue
+        if "<!--" in line:
+            if "-->" not in line.split("<!--", 1)[1]:
+                in_comment = True
+            # a line containing comment markers can never be a bare canonical
+            # line (the verdict word must own the line), so skip it either way
+            continue
+        if line.lstrip().startswith(">"):
+            continue
+        out.append(line)
+    return out
 
 
 def parse_verdict(text: str) -> str | None:
     """Canonical-line extraction, replacing the global regex cascade.
 
-    Only bare, line-anchored ``VERDICT: <word>`` lines count; lines inside
-    blockquotes (``>``) or code fences are quoted material and are skipped.
-    Multiple canonical lines that AGREE return that verdict; conflicting
-    lines collapse conservatively (UNVERIFIABLE > DISPUTED > VERIFIED — an
-    ambiguous answer must never mint a fact or page an analyst on the weaker
-    reading). No canonical line — including prose-only mentions, negations
-    and the echoed prompt format line — returns None, which the caller lands
-    as UNVERIFIABLE (the model was told the exact format; an answer that
-    ignores it is not evidence)."""
+    Only bare, line-anchored ``VERDICT: <word>`` lines count; quoted material
+    (see _bare_lines) is skipped. Multiple canonical lines that AGREE return
+    that verdict; DISAGREEING lines are an ambiguous answer and land
+    UNVERIFIABLE outright (the old conservative-order collapse still let
+    VERIFIED+DISPUTED escalate to DISPUTED and page an analyst off a
+    self-contradicting reply). No canonical line — including prose-only
+    mentions, negations and the echoed prompt format line — returns None,
+    which the caller lands as UNVERIFIABLE (the model was told the exact
+    format; an answer that ignores it is not evidence)."""
     found: list[str] = []
-    in_fence = False
-    for line in (text or "").splitlines():
-        if _FENCE_LINE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence or line.lstrip().startswith(">"):
-            continue
+    for line in _bare_lines(text):
         m = _CANON_VERDICT_LINE.match(line)
         if m:
             found.append(m.group(1).upper())
-    for verdict in _VERDICT_CONSERVATIVE_ORDER:
-        if verdict in found:
-            return verdict
-    return None
+    if not found:
+        return None
+    if len(set(found)) != 1:
+        return "UNVERIFIABLE"
+    return found[0]
 
 
 def _parse_evidence(text: str) -> tuple[str, list[str]]:
-    """(evidence, source_urls) off the verifier output; both degrade to empty."""
-    text = text or ""
+    """(evidence, source_urls) off the verifier output; both degrade to empty.
+
+    Extraction runs over the SAME bare-line surface as parse_verdict (R2
+    P1-1): EVIDENCE/SOURCES lines — and URLs — inside fences, indented code,
+    HTML comments or blockquotes are quoted material; they must not let a
+    VERIFIED/DISPUTED pass the actionable-verdict proof gate."""
+    text = "\n".join(_bare_lines(text))
     m = _EVIDENCE_RE.search(text)
     evidence = " ".join(m.group(1).split())[:2000] if m else ""
     urls: list[str] = []
@@ -566,60 +732,284 @@ async def attempts_today() -> int:
         return 0
 
 
-async def _reserve_attempt() -> bool:
-    """Atomically book ONE slot of today's verification budget (P1-1).
+class _BookingRefused(Exception):
+    """Internal control flow for _book_verification: raising inside the
+    booking transaction rolls back EVERY leg (daily slot included)."""
 
-    INSERT OR IGNORE seeds the counter row, then a conditional UPDATE
-    (value < cap) is the arbiter — the rowcount says whether THIS caller got
-    the slot, so concurrent sweeps can never jointly exceed the cap. The slot
-    is booked BEFORE the model call and never refunded: failed attempts spend
-    quota too, and a refund would let a flapping hand burn calls unbounded.
-    """
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def _book_verification(
+    card: dict[str, Any], lease_id: str,
+) -> tuple[str | None, str]:
+    """Book one verification attempt ATOMICALLY (R4 P1+P3): the daily-slot
+    conditional increment, the card's attempts+1 + verify_task_id binding
+    (under OUR lease), and a durable born-'queued' tasks row all commit in
+    ONE transaction — or none of them do. Returns (task_id, "ok") on
+    success, (None, "budget") when today's cap is spent, (None, "lost") when
+    the claim was lost mid-way (everything, the daily slot included, rolled
+    back — the R3 standalone prebook could burn a slot and crash before the
+    card bump, and could count an attempt with no task row behind it).
+
+    After a hard crash the booked attempt is never a phantom: its queued
+    tasks row exists and is either driven to a verdict or explicitly settled
+    by the boot orphan sweep (executor.recover_orphans) — nothing guesses
+    whether the model started. Successes and failures both stay booked, no
+    refunds (the cap is a quota ceiling)."""
     cap = _daily_cap()
     if cap <= 0:
-        return False
+        return None, "budget"
+    settings = get_settings()
+    task_id = uuid.uuid4().hex[:12]
+    workspace = settings.workspaces_dir / "adhoc" / task_id
+    prompt = (
+        f"{date_anchor()}\n\n"
+        + CLAIM_VERIFY_PROMPT.format(claim=_quote_material(card["claim"]), category=card["category"])
+    )
+    hand = _verify_hand()
     key = _attempts_key()
-    await db.execute(
-        "INSERT OR IGNORE INTO admin_state (key, value) VALUES (?, '0')", (key,)
-    )
-    n = await db.execute(
-        "UPDATE admin_state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
-        "WHERE key = ? AND CAST(value AS INTEGER) < ?",
-        (key, cap),
-    )
-    return bool(n)
+    try:
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT OR IGNORE INTO admin_state (key, value) VALUES (?, '0')", (key,)
+            )
+            cur = await conn.execute(
+                "UPDATE admin_state SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+                "WHERE key = ? AND CAST(value AS INTEGER) < ?",
+                (key, cap),
+            )
+            if cur.rowcount == 0:
+                raise _BookingRefused("budget")
+            cur = await conn.execute(
+                "UPDATE fact_cards SET attempts=attempts+1, verify_task_id=? "
+                "WHERE id=? AND status='verifying' AND lease_id=?",
+                (task_id, card["id"], lease_id),
+            )
+            if cur.rowcount == 0:
+                raise _BookingRefused("lost")
+            # the executor row shape (_create_row), born 'queued' inside OUR
+            # transaction; the task.queued event is emitted post-commit
+            # (bus.emit inside transaction() would deadlock)
+            await conn.execute(
+                "INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source, "
+                "parent_run_id, workspace_dir, timeout_s, fallback_chain, lineage_root, created_at) "
+                "VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?,?)",
+                (task_id, None, hand, None, prompt, SOURCE, None, str(workspace),
+                 settings.default_timeout_s, None, None, bus.now_iso()),
+            )
+    except _BookingRefused as refusal:
+        return None, refusal.reason
+    workspace.mkdir(parents=True, exist_ok=True)
+    await bus.emit("task.queued", "task", task_id, {"hand": hand, "source": SOURCE})
+    return task_id, "ok"
 
 
-async def _claim_card(card_id: str) -> bool:
-    """pending→verifying conditional claim, BEFORE the model call (P1-1)."""
+async def _run_verification_task(task_id: str) -> executor.Task:
+    """Drive one pre-booked queued verification task through the executor
+    core: _execute() is the executor's own claim-and-run layer (conditional
+    queued→running claim, hand mutex + global semaphore, fallback, terminal
+    settle) — the ONE execution path, entered one layer in because
+    submit()/spawn() insist on creating their own rows and R4 P1 requires
+    the row to pre-exist in the booking transaction. The _running
+    registration mirrors submit()'s body exactly, so operator cancel and the
+    shutdown drain keep working on in-flight verifications. Deliberate,
+    documented private-API use; a public executor.submit_prepared(task_id)
+    is the follow-up once executor.py unfreezes (PATCH-NOTES-LOOP-P3 R4)."""
+    atask = asyncio.ensure_future(executor._execute(task_id))  # noqa: SLF001 - see docstring
+    executor._running[task_id] = atask  # noqa: SLF001
+    try:
+        return await atask
+    finally:
+        executor._running.pop(task_id, None)  # noqa: SLF001
+
+
+async def _claim_card(card_id: str) -> str | None:
+    """pending→verifying conditional claim, BEFORE the model call (P1-1).
+
+    Returns the fresh lease token written into the row, or None when the
+    claim was lost. Every later transition of THIS attempt (settle / release)
+    must present the lease — a stale worker whose card was re-opened by the
+    sweep (and possibly re-claimed under a new lease) fails the ``AND
+    lease_id = ?`` condition and its late write is dropped (finding 5).
+    Claiming clears the prior generation id; booking atomically installs the
+    new one, making NULL an explicit pre-book/unspent state."""
+    lease_id = uuid.uuid4().hex
     n = await db.execute(
-        "UPDATE fact_cards SET status='verifying', verify_started_at=? "
+        "UPDATE fact_cards SET status='verifying', verify_started_at=?, lease_id=?, "
+        "verify_task_id=NULL "
         "WHERE id=? AND status='pending'",
-        (bus.now_iso(), card_id),
+        (bus.now_iso(), lease_id, card_id),
     )
-    return bool(n)
+    return lease_id if n else None
 
 
-async def _release_card(card_id: str) -> None:
-    """verifying→pending (transient failure: retry on a later tick — the
-    booked attempt slot is NOT refunded)."""
+async def _release_card(card_id: str, lease_id: str) -> None:
+    """verifying→pending WITHOUT counting a card attempt (used when the
+    daily budget ran out before any model call — the card itself did nothing
+    wrong, and the attempt pre-book deliberately happens AFTER the budget
+    check; R3 P1). Conditional on OUR lease: a card someone else re-claimed
+    is theirs to release."""
     await db.execute(
-        "UPDATE fact_cards SET status='pending', verify_started_at=NULL "
-        "WHERE id=? AND status='verifying'",
-        (card_id,),
+        "UPDATE fact_cards SET status='pending', verify_started_at=NULL, lease_id=NULL "
+        "WHERE id=? AND status='verifying' AND lease_id=? AND verify_task_id IS NULL",
+        (card_id, lease_id),
+    )
+
+
+async def _settle_exhausted_card(
+    card_id: str, category: str, *, lease_id: str | None,
+    verify_task_id: str | None = None,
+) -> bool:
+    """Settle a retry-exhausted card terminal in ONE transaction (LOOP-P3):
+    status 'unverifiable' + a verified_facts row naming the exhaustion — a
+    card must never be terminal without its verdict row ('unverifiable' is
+    the terminal used because the 0015 status CHECK is immutable and has no
+    'failed' member; semantics match: no verdict could be obtained, and
+    UNVERIFIABLE rows never feed the reuse gate or claim_check).
+
+    attempts are NOT bumped here — every attempt is booked atomically by
+    _book_verification before its model call (R3 P1/R4), so settling only
+    checks the exhaustion. ``lease_id`` set == settling OUR 'verifying' claim
+    after its final failed attempt; ``lease_id=None`` == the recovery sweep
+    settling a 'pending' card whose attempts are already exhausted (hard
+    crash mid-attempt, or a lowered limit)."""
+    policy = await get_reuse_policy()
+    ttl_days = float(policy.get(category, policy["other"])["ttl_days"])
+    now = bus.now_iso()
+    evidence = (f"验证任务连续失败 {VERIFY_MAX_ATTEMPTS} 次，超出重试上限，"
+                "不再自动重试（操作员可重开）。")
+    async with db.transaction() as conn:
+        if lease_id is not None:
+            cur = await conn.execute(
+                "UPDATE fact_cards SET status='unverifiable', verify_started_at=NULL, "
+                "lease_id=NULL "
+                "WHERE id=? AND status='verifying' AND lease_id=? "
+                "AND verify_task_id IS ? AND attempts>=?",
+                (card_id, lease_id, verify_task_id, VERIFY_MAX_ATTEMPTS),
+            )
+        else:
+            cur = await conn.execute(
+                "UPDATE fact_cards SET status='unverifiable' "
+                "WHERE id=? AND status='pending' AND attempts>=?",
+                (card_id, VERIFY_MAX_ATTEMPTS),
+            )
+        settled = bool(cur.rowcount)
+        await cur.close()
+        if not settled:
+            return False
+        # UPSERT, not OR IGNORE (R4 P1): an operator-reset card may already
+        # own a verdict row (UNIQUE fact_card_id) — and if that row says
+        # VERIFIED/DISPUTED, IGNORE would leave it ACTIVE while the card says
+        # unverifiable, feeding the dead card's old conclusion to the reuse
+        # gate and claim_check forever. The active row flips to UNVERIFIABLE
+        # in the same generation as the card status (row id preserved).
+        await conn.execute(
+            "INSERT INTO verified_facts "
+            "(id, fact_card_id, verdict, evidence, source_urls, work_date, verified_at, expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(fact_card_id) DO UPDATE SET "
+            "verdict=excluded.verdict, evidence=excluded.evidence, "
+            "source_urls=excluded.source_urls, work_date=excluded.work_date, "
+            "verified_at=excluded.verified_at, expires_at=excluded.expires_at",
+            (uuid.uuid4().hex[:12], card_id, "UNVERIFIABLE", evidence, "[]",
+             work_date(), now, _now_plus_days(ttl_days)),
+        )
+    log.warning("card %s exhausted %d verification attempts; settled unverifiable",
+                card_id, VERIFY_MAX_ATTEMPTS)
+    return True
+
+
+async def _quarantine_verification_binding(
+    card: dict[str, Any], reason: str,
+) -> bool:
+    """Fail closed when a stale card's durable task binding cannot be trusted.
+
+    A non-null id whose task is missing/mismatched is not retry permission:
+    silently re-opening would create an unbounded new generation with no
+    auditable relationship to the booked attempt. Preserve ``verify_task_id``
+    as provenance and settle an explicit UNVERIFIABLE row under the exact
+    stale lease + binding snapshot.
+    """
+    policy = await get_reuse_policy()
+    category = str(card["category"])
+    ttl_days = float(policy.get(category, policy["other"])["ttl_days"])
+    now = bus.now_iso()
+    evidence = f"验证任务绑定异常，已隔离且不自动重试：{reason}"[:2000]
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "UPDATE fact_cards SET status='unverifiable', verify_started_at=NULL, "
+            "lease_id=NULL "
+            "WHERE id=? AND status='verifying' AND lease_id IS ? "
+            "AND verify_task_id IS ?",
+            (card["id"], card.get("lease_id"), card.get("verify_task_id")),
+        )
+        settled = bool(cur.rowcount)
+        await cur.close()
+        if not settled:
+            return False
+        await conn.execute(
+            "INSERT INTO verified_facts "
+            "(id, fact_card_id, verdict, evidence, source_urls, work_date, verified_at, expires_at) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(fact_card_id) DO UPDATE SET "
+            "verdict=excluded.verdict, evidence=excluded.evidence, "
+            "source_urls=excluded.source_urls, work_date=excluded.work_date, "
+            "verified_at=excluded.verified_at, expires_at=excluded.expires_at",
+            (uuid.uuid4().hex[:12], card["id"], "UNVERIFIABLE", evidence, "[]",
+             work_date(), now, _now_plus_days(ttl_days)),
+        )
+    log.error("quarantined fact card %s: %s", card["id"], reason)
+    return True
+
+
+async def _release_failed_card(
+    card: dict[str, Any], lease_id: str, verify_task_id: str,
+) -> None:
+    """Release a claimed card after a FAILED verification attempt (LOOP-P3).
+    The attempt itself was already booked atomically by _book_verification
+    BEFORE the model call (R3 P1/R4) — no second bump here, exactly one
+    count per attempt whether it ends in a handler or a hard crash. The
+    release only lands while retries remain; a card at VERIFY_MAX_ATTEMPTS
+    is settled terminal instead of going back into rotation — one poison
+    card used to re-enter the picker every tick and burn the whole daily
+    cap."""
+    n = await db.execute(
+        "UPDATE fact_cards SET status='pending', verify_started_at=NULL, lease_id=NULL "
+        "WHERE id=? AND status='verifying' AND lease_id=? "
+        "AND verify_task_id=? AND attempts < ?",
+        (card["id"], lease_id, verify_task_id, VERIFY_MAX_ATTEMPTS),
+    )
+    if n:
+        return
+    # zero rows == either our claim was lost (the guarded settle below no-ops
+    # too — the new owner does its own accounting) or this attempt exhausted
+    # the retry budget: settle terminal under OUR lease
+    await _settle_exhausted_card(
+        card["id"], card["category"], lease_id=lease_id,
+        verify_task_id=verify_task_id,
     )
 
 
 async def verify_pending(cap: int | None = None) -> list[dict[str, Any]]:
-    """Verify pending fact cards, oldest first, within the daily attempt cap.
+    """Verify pending fact cards within the daily attempt cap, least-retried
+    first (attempts ASC, then created_at ASC — a poison card must not shadow
+    fresh work; LOOP-P3), skipping cards whose retries are exhausted.
 
     ``cap`` further bounds THIS call (the tick passes VERIFY_PER_TICK). Per
     card, in order: pending→verifying conditional claim (the cross-process
-    double-verification guard), atomic attempt-slot booking (successes and
-    failures both count), ONE model task, then verdict row + terminal status
-    in one transaction conditional on status='verifying'. A failed model task
-    releases the card back to pending for a later tick (its slot stays
-    spent); a completed task whose output has no parseable verdict lands
+    double-verification guard), then ONE atomic booking transaction (R4
+    P1+P3: daily-slot increment + card attempts+1 + verify_task_id binding +
+    a durable born-'queued' tasks row — all or nothing, so no crash window
+    can consume a slot without a card attempt, or a card attempt without a
+    recoverable task), then the executor drives the booked task, then
+    verdict row + terminal status in one transaction conditional on the
+    lease. A failed model task/crash releases the card back to pending
+    WITHOUT a second bump (the booking already counted it); the failure that
+    finds VERIFY_MAX_ATTEMPTS spent settles the card terminal instead — one
+    poison card used to re-enter the picker every tick and burn the whole
+    daily cap. A completed task whose output has no parseable verdict lands
     UNVERIFIABLE (retrying an unparseable answer forever would burn quota
     for nothing).
     """
@@ -627,45 +1017,58 @@ async def verify_pending(cap: int | None = None) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     while call_budget is None or len(results) < call_budget:
         card = await db.query_one(
-            "SELECT * FROM fact_cards WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+            "SELECT * FROM fact_cards WHERE status = 'pending' AND attempts < ? "
+            "ORDER BY attempts ASC, created_at ASC LIMIT 1",
+            (VERIFY_MAX_ATTEMPTS,),
         )
         if card is None:
             break
-        if not await _claim_card(card["id"]):
+        lease_id = await _claim_card(card["id"])
+        if lease_id is None:
             continue  # lost the race; the next loop picks another card
-        if not await _reserve_attempt():
-            # today's budget is gone: hand the card back untouched and stop
-            await _release_card(card["id"])
-            break
+        task_id, reason = await _book_verification(card, lease_id)
+        if task_id is None:
+            if reason == "budget":
+                # today's budget is gone: hand the card back untouched and
+                # stop — the refused booking rolled back whole, so neither a
+                # daily slot nor a card attempt was consumed
+                await _release_card(card["id"], lease_id)
+                break
+            continue  # "lost": claim gone mid-way; nothing was consumed
         try:
-            results.append(await _verify_card(card))
+            results.append(await _verify_card(card, lease_id, task_id))
         except Exception as exc:  # noqa: BLE001 - one card must never break the sweep
             log.exception("verification crashed for card %s", card["id"])
-            await _release_card(card["id"])
+            await _release_failed_card(card, lease_id, task_id)
             results.append({"card_id": card["id"], "status": "crashed", "error": str(exc)[:200]})
     return results
 
 
-async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
-    """Run one verification task for a card THIS caller already claimed
-    (status='verifying') and whose attempt slot is already booked."""
-    prompt = (
-        f"{date_anchor()}\n\n"
-        + CLAIM_VERIFY_PROMPT.format(claim=_quote_material(card["claim"]), category=card["category"])
-    )
-    task = await executor.submit(_verify_hand(), prompt, source=SOURCE)
-    if task.status != "completed":
-        # transient hand failure: back to pending for a later tick (the
-        # booked attempt slot stays spent — failures are quota too)
-        log.warning("verification task %s ended %s for card %s", task.id, task.status, card["id"])
-        await _release_card(card["id"])
-        return {"card_id": card["id"], "status": "task_failed", "task_id": task.id}
+async def _settle_completed_verification(
+    card: dict[str, Any], lease_id: str, task_id: str, output: str,
+) -> dict[str, Any]:
+    """Parse and settle an ALREADY completed verification task.
 
-    verdict = parse_verdict(task.output or "")
-    evidence, urls = _parse_evidence(task.output or "")
+    Shared by the normal driver and task-aware crash recovery (R5 P1-1):
+    recovery must reuse durable output without entering the executor. The
+    card transition is claimed by the exact triple
+    ``card.id + lease_id + verify_task_id`` so an old task can never settle
+    a card that a newer lease/generation has reclaimed.
+    """
+    verdict = parse_verdict(output)
+    evidence, urls = _parse_evidence(output)
     if verdict is None:
         verdict = "UNVERIFIABLE"
-        evidence = ("核查输出无法解析出判定：" + " ".join((task.output or "").split()))[:500]
+        evidence = ("核查输出无法解析出判定：" + " ".join(output.split()))[:500]
+    elif verdict != "UNVERIFIABLE" and (not evidence or not urls):
+        # actionable verdicts need proof: a bare "VERDICT: VERIFIED" without
+        # non-empty EVIDENCE and at least one SOURCES URL must neither mint a
+        # reusable fact nor page an analyst (findings 2/3)
+        log.info("card %s: %s lacked evidence/sources; downgraded UNVERIFIABLE",
+                 card["id"], verdict)
+        evidence = (f"{verdict} 判定缺少证据或来源链接，降级 UNVERIFIABLE。"
+                    + (evidence or ""))[:2000]
+        verdict = "UNVERIFIABLE"
 
     policy = await get_reuse_policy()
     ttl_days = float(policy.get(card["category"], policy["other"])["ttl_days"])
@@ -673,32 +1076,67 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
     fact_id = uuid.uuid4().hex[:12]
     status = verdict.lower()  # VERIFIED→verified / DISPUTED→disputed / UNVERIFIABLE→unverifiable
     outbox_id: str | None = None
+    event_outbox_id: str | None = None
 
     # one transaction: terminal status + verdict row + (for DISPUTED) delivery
-    # intent land together, conditional on the claim WE hold.
+    # intents land together, conditional on the claim WE hold (status AND
+    # lease — a card the stale sweep re-opened, even if re-claimed since, has
+    # a different lease and our late write is dropped; finding 5).
     # NB: transaction() holds the db write lock — use the yielded conn
     # directly (db.execute/bus.emit in here would deadlock); events after.
     async with db.transaction() as conn:
         cur = await conn.execute(
-            "UPDATE fact_cards SET status = ?, verify_started_at = NULL "
-            "WHERE id = ? AND status = 'verifying'",
-            (status, card["id"]),
+            "UPDATE fact_cards SET status = ?, verify_started_at = NULL, lease_id = NULL "
+            "WHERE id = ? AND status = 'verifying' AND lease_id = ? "
+            "AND verify_task_id = ?",
+            (status, card["id"], lease_id, task_id),
         )
-        if cur.rowcount == 0:
-            # claim lost mid-flight (operator reset / stale sweep): discard ours
-            log.info("card %s no longer verifying; discarding verification result", card["id"])
-            return {"card_id": card["id"], "status": "lost_claim", "task_id": task.id}
+        settled = bool(cur.rowcount)
+        await cur.close()
+        if not settled:
+            # claim/generation lost mid-flight: discard THIS task's result
+            log.info(
+                "card %s no longer held under lease/task %s; discarding result",
+                card["id"], task_id,
+            )
+            return {"card_id": card["id"], "status": "lost_claim", "task_id": task_id}
+        # UPSERT on the UNIQUE fact_card_id (R4 P1): an operator-reset card
+        # already owns a verdict row — the ACTIVE row must flip to the new
+        # generation's verdict (a bare INSERT crashed; OR IGNORE would keep a
+        # stale VERIFIED alive under an unverifiable/re-verified card). The
+        # conflict path keeps the existing row id, so re-read the live id for
+        # the outbox/event provenance.
         await conn.execute(
             "INSERT INTO verified_facts "
             "(id, fact_card_id, verdict, evidence, source_urls, work_date, verified_at, expires_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(fact_card_id) DO UPDATE SET "
+            "verdict=excluded.verdict, evidence=excluded.evidence, "
+            "source_urls=excluded.source_urls, work_date=excluded.work_date, "
+            "verified_at=excluded.verified_at, expires_at=excluded.expires_at",
             (fact_id, card["id"], verdict, evidence, json.dumps(urls, ensure_ascii=False),
              work_date(), now, _now_plus_days(ttl_days)),
         )
+        cur = await conn.execute(
+            "SELECT id FROM verified_facts WHERE fact_card_id = ?", (card["id"],)
+        )
+        live = await cur.fetchone()
+        await cur.close()
+        if live is not None:
+            fact_id = str(live["id"])
         if verdict == "DISPUTED":
+            disputed_card = {
+                **card, "related_fact_id": fact_id,
+                "verify_task_id": task_id,
+            }
             outbox_id = await _enqueue_dispute_outbox(
-                conn, {**card, "related_fact_id": fact_id}, kind="disputed",
+                conn, disputed_card, kind="disputed",
                 verdict_label=DISPUTED_LABEL, evidence=evidence, sources=" ".join(urls),
+            )
+            event_outbox_id = await _enqueue_dispute_event(
+                conn, disputed_card, kind="disputed",
+                verdict_label=DISPUTED_LABEL, evidence=evidence, sources=" ".join(urls),
+                thread_outbox_id=outbox_id,
             )
 
     await bus.emit("factcheck.verified", "fact_card", card["id"], {
@@ -707,14 +1145,29 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
         "source_kind": card["source_kind"], "source_ref": card["source_ref"],
     })
     if verdict == "DISPUTED":
-        await _surface_dispute(
-            {**card, "related_fact_id": fact_id}, kind="disputed",
-            verdict_label=DISPUTED_LABEL, evidence=evidence, sources=" ".join(urls),
-            outbox_id=outbox_id,
-        )
+        await _surface_dispute(card["id"], [outbox_id, event_outbox_id])
     log.info("card %s verified: %s (%s)", card["id"], verdict, card["category"])
     return {"card_id": card["id"], "status": "completed", "verdict": verdict,
-            "fact_id": fact_id, "task_id": task.id}
+            "fact_id": fact_id, "task_id": task_id}
+
+
+async def _verify_card(
+    card: dict[str, Any], lease_id: str, task_id: str,
+) -> dict[str, Any]:
+    """Drive one atomically booked task, then settle its durable result."""
+    task = await _run_verification_task(task_id)
+    if task.status != "completed":
+        # terminal hand failure: the booked slot + card attempt stay spent;
+        # release only THIS exact lease/task generation
+        log.warning(
+            "verification task %s ended %s for card %s",
+            task.id, task.status, card["id"],
+        )
+        await _release_failed_card(card, lease_id, task_id)
+        return {"card_id": card["id"], "status": "task_failed", "task_id": task.id}
+    return await _settle_completed_verification(
+        card, lease_id, task_id, task.output or "",
+    )
 
 
 # ---- disputed surfacing + durable outbox -------------------------------------
@@ -722,7 +1175,26 @@ async def _verify_card(card: dict[str, Any]) -> dict[str, Any]:
 def _dispute_payload(
     card: dict[str, Any], *, kind: str, verdict_label: str, evidence: str, sources: str,
 ) -> dict[str, Any]:
+    if kind == "disputed":
+        generation = str(card.get("verify_task_id") or "")
+        if not generation:
+            raise ValueError("disputed outbox requires verify_task_id generation")
+        snapshot_verdict = "DISPUTED"
+    else:
+        # self-contradicted cards are terminal at extraction and never own a
+        # verification task; their immutable card id is their one generation.
+        generation = f"extract:{card['id']}"
+        snapshot_verdict = "SELF_CONTRADICTED"
     return {
+        "verification_generation": generation,
+        "verify_task_id": generation if kind == "disputed" else None,
+        "snapshot": {
+            "verdict": snapshot_verdict,
+            "claim": card["claim"][:500],
+            "category": card.get("category"),
+            "evidence": (evidence or "")[:1000],
+            "source_urls": sources or "",
+        },
         "subject": DISPUTE_MAIL_SUBJECT.format(claim_head=card["claim"][:40]),
         "body": DISPUTE_MAIL_BODY.format(
             claim=card["claim"],
@@ -738,10 +1210,21 @@ def _dispute_payload(
             "source_kind": card.get("source_kind"),
             "source_ref": card.get("source_ref"),
             "related_fact_id": card.get("related_fact_id"),
+            "verdict": snapshot_verdict,
+            "verify_task_id": generation if kind == "disputed" else None,
             "evidence": (evidence or "")[:1000],
             "source_urls": sources or "",
         },
     }
+
+
+def _dispute_generation(card: dict[str, Any], kind: str) -> str:
+    if kind == "disputed":
+        generation = str(card.get("verify_task_id") or "")
+        if not generation:
+            raise ValueError("disputed outbox requires verify_task_id generation")
+        return generation
+    return f"extract:{card['id']}"
 
 
 async def _enqueue_dispute_outbox(
@@ -753,7 +1236,7 @@ async def _enqueue_dispute_outbox(
     if not recipient_id:
         return None
     outbox_id = uuid.uuid4().hex[:12]
-    dispute_id = f"{kind}:{card['id']}"
+    dispute_id = f"{kind}:{card['id']}:{_dispute_generation(card, kind)}"
     payload = json.dumps(
         _dispute_payload(
             card, kind=kind, verdict_label=verdict_label,
@@ -780,17 +1263,136 @@ async def _enqueue_dispute_outbox(
     return str(existing["id"]) if existing else None
 
 
-async def _record_outbox_failure(row: dict[str, Any], error: str) -> str | None:
-    """Count one failed attempt with attempts as the CAS version."""
-    attempts = int(row["attempts"])
-    next_status = "failed" if attempts + 1 >= OUTBOX_MAX_ATTEMPTS else "pending"
+async def _enqueue_dispute_event(
+    conn: Any, card: dict[str, Any], *, kind: str, verdict_label: str,
+    evidence: str, sources: str, thread_outbox_id: str | None,
+) -> str | None:
+    """Write the durable ``factcheck.disputed`` emission intent in the
+    caller's dispute transaction (R1 finding 4: the old post-commit
+    best-effort emit was simply lost if the process died first).
+
+    recipient_id='' rides the 0025 UNIQUE(dispute_id, recipient_id) key —
+    exactly one event intent per dispute, analyst or not. thread_id is the
+    DETERMINISTIC mailbox thread id the sibling mailbox intent will
+    materialize (factcheck-<outbox id>), or None when the card has no
+    analyst — same shape consumers always saw."""
+    outbox_id = uuid.uuid4().hex[:12]
+    dispute_id = f"{kind}:{card['id']}:{_dispute_generation(card, kind)}"
+    payload = _dispute_payload(
+        card, kind=kind, verdict_label=verdict_label,
+        evidence=evidence, sources=sources,
+    )
+    event = payload["event"]
+    event["thread_id"] = f"factcheck-{thread_outbox_id}" if thread_outbox_id else None
+    cur = await conn.execute(
+        "INSERT OR IGNORE INTO factcheck_dispute_outbox "
+        "(id, dispute_id, fact_card_id, recipient_id, payload, status, attempts, created_at, intent) "
+        "VALUES (?,?,?,'',?,'pending',0,?,'event')",
+        (outbox_id, dispute_id, card["id"],
+         json.dumps(payload, ensure_ascii=False), bus.now_iso()),
+    )
+    inserted = bool(cur.rowcount)
+    await cur.close()
+    if inserted:
+        return outbox_id
+    cur = await conn.execute(
+        "SELECT id FROM factcheck_dispute_outbox WHERE dispute_id=? AND recipient_id=''",
+        (dispute_id,),
+    )
+    existing = await cur.fetchone()
+    await cur.close()
+    return str(existing["id"]) if existing else None
+
+
+def _parse_outbox_payload(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid outbox payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("outbox payload must be an object")
+    return payload
+
+
+async def _dispute_generation_is_current(
+    row: dict[str, Any], payload: dict[str, Any],
+) -> bool:
+    """Whether a DISPUTED intent still describes the card's active generation.
+
+    Other intent kinds retain their existing semantics. Legacy DISPUTED
+    payloads without immutable task provenance fail closed: they cannot prove
+    which mutable verified_facts value they describe.
+    """
+    event = payload.get("event")
+    is_disputed = (
+        str(row.get("dispute_id") or "").startswith("disputed:")
+        or (isinstance(event, dict) and event.get("kind") == "disputed")
+    )
+    if not is_disputed:
+        return True
+    generation = payload.get("verify_task_id")
+    snapshot = payload.get("snapshot")
+    if (
+        not isinstance(generation, str)
+        or not generation
+        or not isinstance(snapshot, dict)
+        or snapshot.get("verdict") != "DISPUTED"
+    ):
+        return False
+    live = await db.query_one(
+        "SELECT c.status, c.verify_task_id, vf.verdict "
+        "FROM fact_cards c "
+        "LEFT JOIN verified_facts vf ON vf.fact_card_id=c.id "
+        "WHERE c.id=?",
+        (row["fact_card_id"],),
+    )
+    return bool(
+        live
+        and live["status"] == "disputed"
+        and live["verdict"] == "DISPUTED"
+        and live["verify_task_id"] == generation
+    )
+
+
+async def _mark_outbox_superseded(row: dict[str, Any]) -> bool:
+    """Terminalize, but retain, a stale-generation audit row."""
     n = await db.execute(
         "UPDATE factcheck_dispute_outbox "
-        "SET attempts=attempts+1, status=?, last_error=? "
-        "WHERE id=? AND status='pending' AND attempts=?",
-        (next_status, error[:500], row["id"], attempts),
+        "SET status='failed', last_error='superseded-generation', "
+        "lease_id=NULL, leased_at=NULL "
+        "WHERE id=? AND status='pending' AND lease_id IS NULL AND attempts=?",
+        (row["id"], int(row["attempts"])),
     )
-    return next_status if n else None
+    return bool(n)
+
+
+async def _record_outbox_failure(row: dict[str, Any], error: str) -> str | None:
+    """Count one failed attempt with attempts as the CAS version.
+
+    A CAS miss on the snapshot's attempts re-reads the live row ONCE and
+    retries at the fresh value (LOOP-P10c: a concurrent drain's own failure
+    record used to make this a silent no-op — the failure went uncounted).
+    A row that is no longer pending (delivered/failed elsewhere) or still
+    leased records nothing."""
+    attempts = int(row["attempts"])
+    for _ in range(2):
+        next_status = "failed" if attempts + 1 >= OUTBOX_MAX_ATTEMPTS else "pending"
+        n = await db.execute(
+            "UPDATE factcheck_dispute_outbox "
+            "SET attempts=attempts+1, status=?, last_error=? "
+            "WHERE id=? AND status='pending' AND lease_id IS NULL AND attempts=?",
+            (next_status, error[:500], row["id"], attempts),
+        )
+        if n:
+            return next_status
+        fresh = await db.query_one(
+            "SELECT status, attempts, lease_id FROM factcheck_dispute_outbox WHERE id=?",
+            (row["id"],),
+        )
+        if fresh is None or fresh["status"] != "pending" or fresh["lease_id"] is not None:
+            return None  # settled or actively leased elsewhere: not ours to record
+        attempts = int(fresh["attempts"])
+    return None
 
 
 async def _deliver_dispute_outbox_row(row: dict[str, Any]) -> str | None:
@@ -800,11 +1402,8 @@ async def _deliver_dispute_outbox_row(row: dict[str, Any]) -> str | None:
     operator note, pending dispatch, attempt increment, and delivered marker
     commit together, so a crash can expose either all of them or none.
     """
-    try:
-        payload = json.loads(row["payload"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid outbox payload JSON") from exc
-    if not isinstance(payload, dict) or not payload.get("subject") or not payload.get("body"):
+    payload = _parse_outbox_payload(row)
+    if not payload.get("subject") or not payload.get("body"):
         raise ValueError("outbox payload requires subject and body")
 
     from .analysts import get_analyst
@@ -864,76 +1463,178 @@ async def _deliver_dispute_outbox_row(row: dict[str, Any]) -> str | None:
     return thread_id
 
 
+async def _emit_dispute_event_row(row: dict[str, Any]) -> str:
+    """Emit one durable ``factcheck.disputed`` event and mark the row
+    delivered. Returns ``emitted`` / ``skipped`` (lost the claim) /
+    ``retry`` / ``failed`` (emit failure, before / at the attempts limit).
+
+    The claim is a drainer LEASE (``SET lease_id WHERE lease_id IS NULL`` —
+    the fact_cards pattern), not a bare attempts CAS: bus.emit cannot run
+    inside a transaction (it writes the events table itself — the
+    _verify_card deadlock note applies), and a value-CAS alone lets a second
+    drainer re-SELECT the row after our claim and win a CAS at the
+    incremented value before our emit lands (R2 P1-3 double emit). One
+    attempt is booked at claim time; every later write on this attempt
+    carries ``AND lease_id = ?``. Post-claim failures are fully accounted
+    HERE (attempts already booked; the generic _record_outbox_failure must
+    not double-count them — LOOP-P10c) and never raise:
+
+    - emit FAILED → the event did not go out: release the lease with
+      last_error and the row pending (or failed when this was the last
+      attempt);
+    - emit OK but the delivered marker failed → the row stays PENDING and
+      retryable, never failed (R2 P1-3: at-least-once is the declared
+      posture and consumers project idempotently) — lease released
+      best-effort, else the stale-lease sweep re-opens it."""
+    payload = _parse_outbox_payload(row)
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        raise ValueError("event outbox payload requires an event object")
+    lease_id = uuid.uuid4().hex
+    n = await db.execute(
+        "UPDATE factcheck_dispute_outbox "
+        "SET lease_id=?, leased_at=?, attempts=attempts+1 "
+        "WHERE id=? AND status='pending' AND lease_id IS NULL AND attempts<?",
+        (lease_id, bus.now_iso(), row["id"], OUTBOX_MAX_ATTEMPTS),
+    )
+    if not n:
+        return "skipped"  # another drainer holds/handled it, or attempts exhausted
+    try:
+        await bus.emit("factcheck.disputed", "fact_card", str(row["fact_card_id"]), event)
+    except Exception as exc:  # noqa: BLE001 - accounted here, never re-raised (P10c)
+        # the event did NOT go out: release under OUR lease, pending for a
+        # later retry — or terminal failed when this attempt was the last
+        next_status = "failed" if int(row["attempts"]) + 1 >= OUTBOX_MAX_ATTEMPTS else "pending"
+        log.warning("dispute event emit failed for outbox row %s: %s", row["id"], exc)
+        try:
+            await db.execute(
+                "UPDATE factcheck_dispute_outbox "
+                "SET lease_id=NULL, leased_at=NULL, last_error=?, status=? "
+                "WHERE id=? AND lease_id=?",
+                (str(exc)[:500], next_status, row["id"], lease_id),
+            )
+        except Exception:  # noqa: BLE001 - the stale-lease sweep recovers
+            log.warning("lease release failed for outbox row %s after emit failure", row["id"])
+        return "failed" if next_status == "failed" else "retry"
+    try:
+        marked = await db.execute(
+            "UPDATE factcheck_dispute_outbox "
+            "SET status='delivered', delivered_at=?, last_error=NULL, lease_id=NULL, leased_at=NULL "
+            "WHERE id=? AND lease_id=?",
+            (bus.now_iso(), row["id"], lease_id),
+        )
+        if not marked:
+            # our lease was swept mid-window (stale sweep): someone else may
+            # re-emit — documented at-least-once
+            log.info("event outbox row %s lost its lease after emit; may re-deliver", row["id"])
+    except Exception:  # noqa: BLE001 - the event DID go out: never escalate to failed
+        log.exception(
+            "delivered marker failed for event outbox row %s (event already emitted; "
+            "row stays pending for an at-least-once retry)", row["id"])
+        try:
+            await db.execute(
+                "UPDATE factcheck_dispute_outbox "
+                "SET lease_id=NULL, leased_at=NULL, last_error=? "
+                "WHERE id=? AND lease_id=?",
+                ("delivered marker failed after emit", row["id"], lease_id),
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("lease release failed for %s; stale-lease sweep will recover", row["id"])
+    return "emitted"
+
+
 async def drain_dispute_outbox(
     limit: int = OUTBOX_PER_DRAIN, *, outbox_id: str | None = None,
 ) -> dict[str, Any]:
-    """Retry pending analyst notifications without invoking a model.
+    """Retry pending delivery intents without invoking a model: 'mailbox'
+    rows materialize the analyst thread (the separately gated mailbox sweep
+    starts the model call), 'event' rows emit the durable
+    ``factcheck.disputed`` bus event.
 
-    This job only writes mailbox's durable pending dispatch. The separately
-    gated mailbox sweep starts the analyst model call.
-    """
+    Per-item failures are caught, counted and retried up to
+    OUTBOX_MAX_ATTEMPTS (a poison row must not stop the batch). TOP-LEVEL
+    failures (the retry-limit sweep / the batch SELECT) now PROPAGATE to the
+    caller — the scheduler wraps this in @metered("factcheck-outbox"), which
+    records the firing as failed in cron health instead of the old silent
+    self-swallow (finding 7); in-process callers (_surface_dispute) guard
+    themselves."""
     result: dict[str, Any] = {
-        "delivered": 0, "retried": 0, "failed": 0, "thread_ids": {},
+        "delivered": 0, "events": 0, "retried": 0, "failed": 0, "thread_ids": {},
     }
-    try:
-        result["failed"] += await db.execute(
-            "UPDATE factcheck_dispute_outbox "
-            "SET status='failed', last_error=COALESCE(last_error, 'retry limit reached') "
-            "WHERE status='pending' AND attempts>=?",
-            (OUTBOX_MAX_ATTEMPTS,),
-        )
-        params: list[Any] = []
-        sql = (
-            "SELECT * FROM factcheck_dispute_outbox "
-            "WHERE status='pending' AND attempts<?"
-        )
-        params.append(OUTBOX_MAX_ATTEMPTS)
-        if outbox_id is not None:
-            sql += " AND id=?"
-            params.append(outbox_id)
-        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
-        params.append(min(max(int(limit), 1), 200))
-        for row in await db.query(sql, params):
-            try:
-                thread_id = await _deliver_dispute_outbox_row(row)
-            except Exception as exc:  # noqa: BLE001 - one poison row must not stop the drain
-                log.warning("dispute outbox delivery failed for %s: %s", row["id"], exc)
-                state = await _record_outbox_failure(row, str(exc))
-                if state == "failed":
+    # re-open event rows whose drainer died inside the claim→emit→delivered
+    # window (lease stale); their booked attempts stay spent
+    stale_cutoff = (
+        datetime.fromisoformat(bus.now_iso())
+        - timedelta(minutes=OUTBOX_LEASE_STALE_MINUTES)
+    ).isoformat(timespec="seconds")
+    n = await db.execute(
+        "UPDATE factcheck_dispute_outbox SET lease_id=NULL, leased_at=NULL "
+        "WHERE status='pending' AND lease_id IS NOT NULL AND leased_at < ?",
+        (stale_cutoff,),
+    )
+    if n:
+        log.warning("re-opened %d stale-leased dispute outbox rows", n)
+    result["failed"] += await db.execute(
+        "UPDATE factcheck_dispute_outbox "
+        "SET status='failed', last_error=COALESCE(last_error, 'retry limit reached') "
+        "WHERE status='pending' AND lease_id IS NULL AND attempts>=?",
+        (OUTBOX_MAX_ATTEMPTS,),
+    )
+    params: list[Any] = []
+    sql = (
+        "SELECT * FROM factcheck_dispute_outbox "
+        "WHERE status='pending' AND attempts<? AND lease_id IS NULL"
+    )
+    params.append(OUTBOX_MAX_ATTEMPTS)
+    if outbox_id is not None:
+        sql += " AND id=?"
+        params.append(outbox_id)
+    sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+    params.append(min(max(int(limit), 1), 200))
+    for row in await db.query(sql, params):
+        try:
+            payload = _parse_outbox_payload(row)
+            if not await _dispute_generation_is_current(row, payload):
+                if await _mark_outbox_superseded(row):
                     result["failed"] += 1
-                elif state == "pending":
-                    result["retried"] += 1
                 continue
-            if thread_id:
-                result["delivered"] += 1
-                result["thread_ids"][row["id"]] = thread_id
-    except Exception:  # noqa: BLE001 - scheduler-driven, must not raise
-        log.exception("dispute outbox drain failed")
+            if row["intent"] == "event":
+                outcome = await _emit_dispute_event_row(row)
+                if outcome == "emitted":
+                    result["events"] += 1
+                elif outcome == "retry":
+                    result["retried"] += 1
+                elif outcome == "failed":
+                    result["failed"] += 1
+                continue
+            thread_id = await _deliver_dispute_outbox_row(row)
+        except Exception as exc:  # noqa: BLE001 - one poison row must not stop the drain
+            log.warning("dispute outbox delivery failed for %s: %s", row["id"], exc)
+            state = await _record_outbox_failure(row, str(exc))
+            if state == "failed":
+                result["failed"] += 1
+            elif state == "pending":
+                result["retried"] += 1
+            continue
+        if thread_id:
+            result["delivered"] += 1
+            result["thread_ids"][row["id"]] = thread_id
     return result
 
-async def _surface_dispute(
-    card: dict[str, Any], *, kind: str, verdict_label: str, evidence: str, sources: str,
-    outbox_id: str | None = None,
-) -> None:
-    """Best-effort immediate drain, then the existing dispute event. Never raises."""
-    thread_id: str | None = None
-    if outbox_id:
+
+async def _surface_dispute(card_id: str, outbox_ids: list[str | None]) -> None:
+    """Best-effort immediate drain of the intents this dispute just enqueued
+    (mailbox thread first, then the durable event, so the emitted payload's
+    thread pointer refers to a thread that already exists on the happy path).
+    Never raises — rows left pending are re-driven by the factcheck-outbox
+    scheduler drain."""
+    for outbox_id in outbox_ids:
+        if not outbox_id:
+            continue
         try:
-            drained = await drain_dispute_outbox(limit=1, outbox_id=outbox_id)
-            thread_id = drained["thread_ids"].get(outbox_id)
+            await drain_dispute_outbox(limit=1, outbox_id=outbox_id)
         except Exception:  # noqa: BLE001 - surfacing must never break verification
-            log.exception("immediate dispute outbox drain failed for card %s", card.get("id"))
-    payload = _dispute_payload(
-        card, kind=kind, verdict_label=verdict_label,
-        evidence=evidence, sources=sources,
-    )["event"]
-    payload["thread_id"] = thread_id
-    try:
-        await bus.emit(
-            "factcheck.disputed", "fact_card", str(card.get("id") or ""), payload,
-        )
-    except Exception:  # noqa: BLE001
-        log.exception("factcheck.disputed emit failed for card %s", card.get("id"))
+            log.exception("immediate dispute outbox drain failed for card %s", card_id)
 
 
 # ---- hooks (bus.on subscriptions; registered by the app lifespan) ------------
@@ -1058,28 +1759,140 @@ async def _recover_stale_running() -> None:
     cutoff = (
         datetime.fromisoformat(bus.now_iso()) - timedelta(minutes=STALE_RUNNING_MINUTES)
     ).isoformat(timespec="seconds")
+    # Clearing lease_id invalidates the dead worker's lease — its late
+    # done/failed write carries "AND lease_id = ?" and silently loses (P7).
     n = await db.execute(
-        "UPDATE fact_extract_queue SET status='pending', started_at=NULL "
+        "UPDATE fact_extract_queue SET status='pending', started_at=NULL, lease_id=NULL "
         "WHERE status='running' AND started_at < ?",
         (cutoff,),
     )
     if n:
         log.warning("re-opened %d stale running extraction rows", n)
-    # a crash mid-verification leaves 'verifying' cards behind; hand them
-    # back after the same staleness window (their attempt slots stay spent)
-    n = await db.execute(
-        "UPDATE fact_cards SET status='pending', verify_started_at=NULL "
-        "WHERE status='verifying' AND verify_started_at < ?",
+    # R5 P1-1: the bound durable task is the authority for every recoverable
+    # verification generation (terminal tasks converge immediately; active
+    # tasks only after card staleness). Never blindly re-open a completed
+    # task or let a corrupt binding create a fresh generation. Every card
+    # transition carries the id+lease+verify_task_id snapshot.
+    recovery_cards = await db.query(
+        "SELECT * FROM fact_cards "
+        "WHERE status='verifying' AND (verify_started_at < ? "
+        "OR verify_task_id IN ("
+        "  SELECT id FROM tasks WHERE status IN "
+        "  ('completed','failed','rate_limited','cancelled','expired','overcommitted')"
+        ")) "
+        "ORDER BY verify_started_at, id",
         (cutoff,),
     )
-    if n:
-        log.warning("re-opened %d stale verifying fact cards", n)
+    terminal_failures = {
+        "failed", "rate_limited", "cancelled", "expired", "overcommitted",
+    }
+    for card in recovery_cards:
+        task_id = card.get("verify_task_id")
+        lease_id = card.get("lease_id")
+        if not task_id:
+            # pending→verifying claim and atomic booking are separate by
+            # necessity. A crash in that tiny pre-book window has no task,
+            # attempt or daily slot to recover. _claim_card clears any prior
+            # generation id, so NULL is an explicit unbooked state rather
+            # than a broken binding; release the exact stale claim.
+            released = await db.execute(
+                "UPDATE fact_cards SET status='pending', verify_started_at=NULL, lease_id=NULL "
+                "WHERE id=? AND status='verifying' AND lease_id IS ? "
+                "AND verify_task_id IS NULL",
+                (card["id"], lease_id),
+            )
+            if released:
+                log.warning("re-opened stale unbooked fact card %s", card["id"])
+            continue
+        if not lease_id:
+            await _quarantine_verification_binding(
+                card, f"bound task {task_id} has no card lease",
+            )
+            continue
+        task = await db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if task is None:
+            await _quarantine_verification_binding(
+                card, f"bound task {task_id} is missing",
+            )
+            continue
+        expected_claim = _quote_material(str(card["claim"]))
+        task_prompt = str(task["prompt"] or "")
+        if (
+            task["source"] != SOURCE
+            or "你是研究所的事实核查员" not in task_prompt
+            or expected_claim not in task_prompt
+        ):
+            await _quarantine_verification_binding(
+                card, f"bound task {task_id} does not match this verification",
+            )
+            continue
+
+        status = str(task["status"])
+        if status == "completed":
+            await _settle_completed_verification(
+                card, lease_id, task_id, str(task["output"] or ""),
+            )
+            continue
+        if status in terminal_failures:
+            await _release_failed_card(card, lease_id, task_id)
+            continue
+        if status in {"queued", "running"}:
+            owner = executor._running.get(task_id)  # noqa: SLF001 - executor's local owner registry
+            if owner is not None and not owner.done():
+                # A slow but live owner still has the exact lease/task; stale
+                # wall-clock age alone is not permission to steal its card.
+                continue
+            # Boot normally made this terminal via recover_orphans(). If the
+            # factcheck sweep runs independently, explicitly terminalize an
+            # ownerless task, then converge the card through the same failure
+            # path. The conditional task claim avoids overwriting a result
+            # that completed between our read and write.
+            failed = await db.execute(
+                "UPDATE tasks SET status='failed', error='orphaned factcheck verification', "
+                "finished_at=? WHERE id=? AND status IN ('queued','running')",
+                (bus.now_iso(), task_id),
+            )
+            if failed:
+                await _release_failed_card(card, lease_id, task_id)
+                continue
+            task = await db.query_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+            if task and task["status"] == "completed":
+                await _settle_completed_verification(
+                    card, lease_id, task_id, str(task["output"] or ""),
+                )
+            elif task and task["status"] in terminal_failures:
+                await _release_failed_card(card, lease_id, task_id)
+            else:
+                await _quarantine_verification_binding(
+                    card, f"bound task {task_id} changed to invalid status",
+                )
+            continue
+        await _quarantine_verification_binding(
+            card, f"bound task {task_id} has invalid status {status!r}",
+        )
+
+    # LOOP-P3/R3 exhaustion backstop for legacy/manual pending rows.
+    rows = await db.query(
+        "SELECT id, category FROM fact_cards WHERE status='pending' AND attempts >= ?",
+        (VERIFY_MAX_ATTEMPTS,),
+    )
+    for row in rows:
+        await _settle_exhausted_card(row["id"], row["category"], lease_id=None)
+
+
+async def _fail_extract_row(row_id: str, lease_id: str, error: str) -> None:
+    await db.execute(
+        "UPDATE fact_extract_queue SET status='failed', error=?, finished_at=?, lease_id=NULL "
+        "WHERE id=? AND status='running' AND lease_id=?",
+        (error[:500], bus.now_iso(), row_id, lease_id),
+    )
 
 
 async def _drain_extractions(cap: int) -> int:
-    """Run up to ``cap`` queued extractions. Conditional claim per row; a
-    model-task failure marks the row failed (operator can reset it — blind
-    retries would burn quota on a source that keeps failing)."""
+    """Run up to ``cap`` queued extractions. Conditional claim per row under a
+    worker lease (LOOP-P7, the fact_cards pattern); a model-task failure marks
+    the row failed (operator can reset it — blind retries would burn quota on
+    a source that keeps failing)."""
     done = 0
     for _ in range(max(0, cap)):
         row = await db.query_one(
@@ -1087,62 +1900,54 @@ async def _drain_extractions(cap: int) -> int:
         )
         if row is None:
             break
+        lease_id = uuid.uuid4().hex
         claimed = await db.execute(
-            "UPDATE fact_extract_queue SET status='running', started_at=? WHERE id=? AND status='pending'",
-            (bus.now_iso(), row["id"]),
+            "UPDATE fact_extract_queue SET status='running', started_at=?, lease_id=? "
+            "WHERE id=? AND status='pending'",
+            (bus.now_iso(), lease_id, row["id"]),
         )
         if not claimed:
             continue  # lost the race; try the next row
-        # every running→terminal transition below names its source state
-        # (AND status='running') per the conditional-claim hard rule: a stale
-        # sweep / operator reset that re-opened the row must win over us
+        # every running→terminal transition below names its source state AND
+        # our lease (conditional-claim hard rule + P7): a stale sweep /
+        # operator reset that re-opened the row — even one re-claimed by a
+        # new worker, which makes status 'running' again — must win over us
         try:
             text = await _source_text(row)
             if text is None:
-                await db.execute(
-                    "UPDATE fact_extract_queue SET status='failed', error=?, finished_at=? "
-                    "WHERE id=? AND status='running'",
-                    ("source text unavailable", bus.now_iso(), row["id"]),
-                )
+                await _fail_extract_row(row["id"], lease_id, "source text unavailable")
                 continue
             cards = await extract_claims(
                 row["source_kind"], row["source_ref"], text, analyst_id=row["analyst_id"],
             )
             if cards is None:
-                await db.execute(
-                    "UPDATE fact_extract_queue SET status='failed', error=?, finished_at=? "
-                    "WHERE id=? AND status='running'",
-                    ("extraction task failed", bus.now_iso(), row["id"]),
-                )
+                await _fail_extract_row(row["id"], lease_id, "extraction task failed")
             else:
                 n = await db.execute(
-                    "UPDATE fact_extract_queue SET status='done', finished_at=? "
-                    "WHERE id=? AND status='running'",
-                    (bus.now_iso(), row["id"]),
+                    "UPDATE fact_extract_queue SET status='done', finished_at=?, lease_id=NULL "
+                    "WHERE id=? AND status='running' AND lease_id=?",
+                    (bus.now_iso(), row["id"], lease_id),
                 )
                 if n:
                     done += 1
         except Exception as exc:  # noqa: BLE001 - one row must never break the drain
             log.exception("extraction failed for queue row %s", row["id"])
-            await db.execute(
-                "UPDATE fact_extract_queue SET status='failed', error=?, finished_at=? "
-                "WHERE id=? AND status='running'",
-                (str(exc)[:500], bus.now_iso(), row["id"]),
-            )
+            await _fail_extract_row(row["id"], lease_id, str(exc))
     return done
 
 
 async def tick() -> dict[str, Any]:
     """Scheduler job body (30-min interval, gated=True — it starts model
-    work). Never raises."""
+    work). Top-level failures PROPAGATE (LOOP-P10d): the
+    @metered("factcheck-tick") wrapper records them as failed firings in cron
+    health — the old self-swallow left a systemically broken tick looking
+    permanently ok=1. Per-card / per-row failures are still absorbed inside
+    verify_pending/_drain_extractions."""
     out: dict[str, Any] = {"extracted": 0, "verified": 0}
-    try:
-        await _recover_stale_running()
-        out["extracted"] = await _drain_extractions(EXTRACT_PER_TICK)
-        results = await verify_pending(VERIFY_PER_TICK)
-        out["verified"] = sum(1 for r in results if r.get("status") == "completed")
-    except Exception:  # noqa: BLE001 - scheduler-driven, must not raise
-        log.exception("factcheck tick failed")
+    await _recover_stale_running()
+    out["extracted"] = await _drain_extractions(EXTRACT_PER_TICK)
+    results = await verify_pending(VERIFY_PER_TICK)
+    out["verified"] = sum(1 for r in results if r.get("status") == "completed")
     return out
 
 
@@ -1172,7 +1977,9 @@ async def _verdict_rows(limit: int = 2000) -> list[dict[str, Any]]:
     return await db.query(
         "SELECT c.id, c.claim, c.category, vf.verdict, vf.expires_at "
         "FROM fact_cards c JOIN verified_facts vf ON vf.fact_card_id = c.id "
-        "WHERE vf.verdict IN ('VERIFIED','DISPUTED') AND vf.expires_at > ? "
+        "WHERE vf.expires_at > ? "
+        "AND ((c.status='verified' AND vf.verdict='VERIFIED') "
+        "  OR (c.status='disputed' AND vf.verdict='DISPUTED')) "
         "ORDER BY vf.verified_at DESC LIMIT ?",
         (bus.now_iso(), limit),
     )
@@ -1221,13 +2028,18 @@ async def claim_check(text: str, k: int = CLAIM_CHECK_MAX_HITS) -> dict[str, Any
             return {"mode": "keyword", "hits": kw or []} if kw is not None \
                 else {"mode": "error", "hits": []}
         vec_hits: list[dict[str, Any]] = []
+        # newest verdicts first, clamped (LOOP-P10e; same posture as the
+        # keyword leg's _verdict_rows LIMIT)
         rows = await db.query(
             "SELECT c.id, c.claim, c.category, vf.verdict, fv.embedding, fv.dim "
             "FROM fact_claim_vectors fv "
             "JOIN fact_cards c ON c.id = fv.fact_card_id "
             "JOIN verified_facts vf ON vf.fact_card_id = c.id "
-            "WHERE fv.model = ? AND vf.verdict IN ('VERIFIED','DISPUTED') AND vf.expires_at > ?",
-            (vectors.model_name(), bus.now_iso()),
+            "WHERE fv.model = ? AND vf.expires_at > ? "
+            "AND ((c.status='verified' AND vf.verdict='VERIFIED') "
+            "  OR (c.status='disputed' AND vf.verdict='DISPUTED')) "
+            "ORDER BY vf.verified_at DESC LIMIT ?",
+            (vectors.model_name(), bus.now_iso(), VECTOR_SCAN_LIMIT),
         )
         for r in rows:
             other = _unpack_vec(r["embedding"], r["dim"])

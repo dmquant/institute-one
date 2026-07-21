@@ -13,8 +13,9 @@ rest of the JSON-RPC surface:
 - Phase-8 expansion tools clamp their JSON text at 8KB.
 
 Tools for parallel-partition domains (projects / research trees) register
-defensively: absent module -> absent tool. The smoke table carries them so the
-suite stays green on any checkout state of those partitions.
+defensively: absent module -> absent tool. The smoke table carries them; their
+migrations (0020/0021) are committed, so a registered tool answering -32000
+"no such table" is a real failure now, not a mid-flight checkout state.
 """
 from __future__ import annotations
 
@@ -74,12 +75,6 @@ SMOKE: dict[str, tuple[dict[str, Any], str]] = {
     "projects_get": ({"project_id": "zz-missing"}, "validation"),
     "research_trees_list": ({"limit": 5}, "list"),
 }
-
-# tools whose backing tables belong to a parallel partition's migration: a
-# checkout where the module landed before its migration answers -32000
-# "no such table" — tolerated as "partition mid-flight", not a failure.
-PARALLEL_PARTITION_TOOLS = {"projects_list", "projects_get", "research_trees_list"}
-
 
 async def _rpc(client: AsyncClient, method: str, params: dict | None = None, msg_id: int = 1) -> dict:
     r = await client.post("/api/mcp", json={
@@ -180,9 +175,6 @@ async def test_write_surface_is_exactly_three_tools():
 # ---- every read tool answers on an empty database --------------------------------
 
 async def test_every_read_tool_smokes_on_empty_db():
-    import pytest
-
-    skipped: list[str] = []
     async with _client() as client:
         for i, name in enumerate(sorted(set(mcp_mod._TOOLS) - mcp_mod.WRITE_TOOLS), start=1):
             args, expect = SMOKE[name]
@@ -190,13 +182,6 @@ async def test_every_read_tool_smokes_on_empty_db():
 
             if "error" in payload:
                 err = payload["error"]
-                if (
-                    name in PARALLEL_PARTITION_TOOLS
-                    and err["code"] == -32000
-                    and "no such table" in err["message"]
-                ):
-                    skipped.append(name)  # partition mid-flight: module landed, migration not yet
-                    continue
                 assert expect == "validation", f"{name}: unexpected error {err}"
                 assert err["code"] == -32602, f"{name}: {err}"
                 assert err.get("data", {}).get("category") == "validation", f"{name}: {err}"
@@ -209,9 +194,6 @@ async def test_every_read_tool_smokes_on_empty_db():
             else:
                 assert isinstance(body, dict), f"{name}: expected an object, got {type(body)}"
 
-    if skipped:
-        pytest.skip(f"parallel-partition tools without their migration yet: {sorted(skipped)}")
-
 
 async def test_empty_db_shapes_of_key_aggregates():
     async with _client() as client:
@@ -221,8 +203,8 @@ async def test_empty_db_shapes_of_key_aggregates():
         cron = json.loads(_result_text(await _call_tool_raw(client, "cron_health", {})))
         assert cron["window_days"] == 30
         # S4-P0-03: empty cron_metrics still answers the full scheduler
-        # registry (21 jobs), all with zeroed metric fields
-        assert len(cron["jobs"]) == 21
+        # registry (24 jobs), all with zeroed metric fields
+        assert len(cron["jobs"]) == 24
         assert all(j["fires"] == 0 and j["last_fired_at"] is None for j in cron["jobs"].values())
 
         actions = json.loads(_result_text(await _call_tool_raw(client, "operator_actions_list", {})))

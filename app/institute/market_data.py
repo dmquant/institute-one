@@ -445,6 +445,41 @@ async def get_bars_pit(
     return [_row_out(r) for r in rows]
 
 
+async def get_last_bar_pit(
+    security_id: str,
+    as_of: str | None = None,
+    *,
+    freq: str = "1d",
+    end: str | None = None,
+) -> dict[str, Any] | None:
+    """The single newest bar known at ``as_of`` dated <= ``end`` — exactly
+    ``get_bars_pit(security_id, as_of, freq=freq, end=end)[-1]`` (or None),
+    without materializing the full history (loop-fix P8c: the paper book's
+    entry/mark reads only ever need the last bar). Same PIT rule per
+    bar_date (greatest as_known_at <= as_of); a bar whose EVERY version is
+    newer than as_of does not exist yet at that knowledge time, so the read
+    falls back to the next older bar_date — the anti-look-ahead fallback the
+    B6 entry leg depends on."""
+    _validate_enum(freq, FREQS, "freq")
+    clauses, params = ["b.security_id = ?", "b.freq = ?"], [security_id, freq]
+    if end:
+        clauses.append("b.bar_date <= ?")
+        params.append(_require_date(end, "end"))
+    inner = (
+        "SELECT MAX(v.as_known_at) FROM price_bars v WHERE v.security_id = b.security_id "
+        "AND v.freq = b.freq AND v.bar_date = b.bar_date"
+    )
+    if as_of is not None:
+        inner += " AND v.as_known_at <= ?"
+        params.append(_norm_ts(as_of, "as_of"))
+    clauses.append(f"b.as_known_at = ({inner})")
+    row = await db.query_one(
+        f"SELECT * FROM price_bars b WHERE {' AND '.join(clauses)} "
+        "ORDER BY b.bar_date DESC LIMIT 1", params
+    )
+    return _row_out(row) if row is not None else None
+
+
 # ---- benchmarks ---------------------------------------------------------------
 
 async def upsert_benchmark(fields: dict[str, Any]) -> dict[str, Any]:

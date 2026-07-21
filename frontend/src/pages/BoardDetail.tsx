@@ -41,6 +41,13 @@ export default function BoardDetail() {
     }
   };
 
+  const jumpToCard = (cardId: string) => {
+    document.getElementById(`board-card-${cardId}`)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
+
   const b = board.data;
 
   return (
@@ -72,7 +79,7 @@ export default function BoardDetail() {
               <dd>{b.question || "—"}</dd>
               <dt>卡片进度</dt>
               <dd>
-                {b.cards.length}/{b.max_cards}
+                <BoardProgress value={b.cards.length} max={b.max_cards} />
               </dd>
               <dt>工作日</dt>
               <dd>{b.work_date}</dd>
@@ -87,8 +94,27 @@ export default function BoardDetail() {
             <h2>
               卡片接力<span className="en">cards timeline</span>
             </h2>
+            {b.cards.length > 1 && (
+              <div className="feed-groups" aria-label="卡片跳转">
+                {b.cards.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    className="feed-group"
+                    onClick={() => jumpToCard(c.id)}
+                  >
+                    #{c.idx} {analystName(c.analyst_id)}
+                  </button>
+                ))}
+              </div>
+            )}
             {b.cards.map((c) => (
-              <div className={`wb-card ${c.status}`} key={c.id}>
+              <div
+                id={`board-card-${c.id}`}
+                className={`wb-card ${c.status}`}
+                key={c.id}
+                style={{ scrollMarginTop: 16 }}
+              >
                 <div className="head">
                   <span className="mono faint">#{c.idx}</span>
                   <strong>{analystName(c.analyst_id)}</strong>
@@ -129,5 +155,46 @@ export default function BoardDetail() {
         </>
       )}
     </>
+  );
+}
+
+function BoardProgress({ value, max }: { value: number; max: number }) {
+  const total = Math.max(1, max);
+  const completed = Math.min(total, Math.max(0, value));
+  const percent = (completed / total) * 100;
+
+  return (
+    <div
+      style={{ display: "flex", width: 220, maxWidth: "100%", flexDirection: "column", gap: 4 }}
+      title={`卡片进度 ${value}/${max}`}
+    >
+      <span className="mono">
+        {value}/{max}
+      </span>
+      <span
+        role="progressbar"
+        aria-label="卡片进度"
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-valuenow={completed}
+        style={{
+          display: "block",
+          height: 7,
+          overflow: "hidden",
+          border: "1px solid var(--border)",
+          borderRadius: 999,
+          background: "var(--panel-2)",
+        }}
+      >
+        <span
+          style={{
+            display: "block",
+            width: `${percent}%`,
+            height: "100%",
+            background: completed >= total ? "var(--green)" : "var(--accent)",
+          }}
+        />
+      </span>
+    </div>
   );
 }

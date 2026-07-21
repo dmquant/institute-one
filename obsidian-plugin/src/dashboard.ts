@@ -2,10 +2,16 @@ import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
 import {
 	DailyStatus,
 	EventRow,
+	ForecastRow,
 	HandStatus,
 	MetaResult,
 	NavRow,
+	OperatorAction,
+	OperatorActionsResult,
 	PaperPositionRow,
+	ResearchTreeDetail,
+	ResearchTreeNode,
+	ResearchTreeRow,
 	TaskRow,
 	TriageResult,
 	errMsg,
@@ -65,6 +71,36 @@ const DAILY_STATUS_ZH: Record<string, string> = {
 	failed: "失败",
 	pending: "待运行",
 };
+const FORECAST_DIRECTION_ZH: Record<string, string> = {
+	long: "看多",
+	short: "看空",
+	neutral: "中性",
+};
+const FORECAST_STATUS_ZH: Record<string, string> = {
+	open: "待结算",
+	settled: "已结算",
+	invalid: "无效",
+};
+const FORECAST_VERDICT_ZH: Record<string, string> = {
+	hit: "命中",
+	miss: "落空",
+	partial: "部分命中",
+	invalid: "无效",
+};
+const TREE_STATUS_ZH: Record<string, string> = {
+	pending: "待探索",
+	exploring: "探索中",
+	completed: "已完成",
+	stopped: "已停止",
+	failed: "失败",
+};
+const TREE_NODE_STATUS_ZH: Record<string, string> = {
+	pending: "待处理",
+	running: "运行中",
+	completed: "已完成",
+	failed: "失败",
+	pruned: "已剪枝",
+};
 
 export class InstituteDashboardView extends ItemView {
 	private plugin: InstituteOnePlugin;
@@ -83,6 +119,15 @@ export class InstituteDashboardView extends ItemView {
 	private runningEl!: HTMLElement;
 	private eventsEl!: HTMLElement;
 	// collapsible extras (hidden entirely when the backend lacks the endpoints)
+	private inboxWrapEl!: HTMLDetailsElement;
+	private inboxSummaryEl!: HTMLElement;
+	private inboxBodyEl!: HTMLElement;
+	private forecastsWrapEl!: HTMLDetailsElement;
+	private forecastsSummaryEl!: HTMLElement;
+	private forecastsBodyEl!: HTMLElement;
+	private treesWrapEl!: HTMLDetailsElement;
+	private treesSummaryEl!: HTMLElement;
+	private treesBodyEl!: HTMLElement;
 	private triageWrapEl!: HTMLDetailsElement;
 	private triageSummaryEl!: HTMLElement;
 	private triageBodyEl!: HTMLElement;
@@ -132,6 +177,12 @@ export class InstituteDashboardView extends ItemView {
 		this.dailyEl = this.section(root, "今日日报");
 		this.runningEl = this.section(root, "进行中");
 
+		[this.inboxWrapEl, this.inboxSummaryEl, this.inboxBodyEl] =
+			this.collapsible(root, "Operator 收件箱");
+		[this.forecastsWrapEl, this.forecastsSummaryEl, this.forecastsBodyEl] =
+			this.collapsible(root, "预测账本速览");
+		[this.treesWrapEl, this.treesSummaryEl, this.treesBodyEl] =
+			this.collapsible(root, "研究树监控");
 		[this.triageWrapEl, this.triageSummaryEl, this.triageBodyEl] =
 			this.collapsible(root, "操作台 triage");
 		[this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] =
@@ -256,7 +307,13 @@ export class InstituteDashboardView extends ItemView {
 			this.renderDaily(daily);
 			this.renderRunning(running, queued);
 
-			await Promise.all([this.refreshTriage(), this.refreshBook()]);
+			await Promise.all([
+				this.refreshOperatorInbox(),
+				this.refreshForecasts(),
+				this.refreshResearchTrees(),
+				this.refreshTriage(),
+				this.refreshBook(),
+			]);
 
 			try {
 				await this.pollEvents();
@@ -267,6 +324,202 @@ export class InstituteDashboardView extends ItemView {
 		} finally {
 			this.refreshing = false;
 		}
+	}
+
+	// ---- Operator 收件箱（裁决仍只在 SPA 中进行） ------------------------------------
+
+	private async refreshOperatorInbox(): Promise<void> {
+		let result: OperatorActionsResult;
+		try {
+			result = await this.plugin.api.operatorActions("open", 1000);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.inboxWrapEl.style.display = "none";
+			} else {
+				this.inboxWrapEl.style.display = "";
+				this.inboxSummaryEl.setText("（获取失败）");
+				this.inboxBodyEl.empty();
+				this.muted(this.inboxBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.inboxWrapEl.style.display = "";
+		this.inboxBodyEl.empty();
+
+		const count = result.count;
+		this.inboxSummaryEl.setText(`${count >= 1000 ? "1000+" : count} 待裁决`);
+		this.inboxSummaryEl.style.color =
+			count > 0 ? "var(--color-orange)" : "var(--text-muted)";
+
+		if (!result.actions.length) {
+			this.muted(this.inboxBodyEl, "没有待裁决 action。");
+			return;
+		}
+		for (const action of result.actions.slice(0, 5)) {
+			const line = this.inboxBodyEl.createDiv({
+				text: `${action.priority > 1 ? "⚠️ " : ""}${action.title}`,
+			});
+			line.style.padding = "2px 0";
+			line.style.color = "var(--text-accent)";
+			line.style.cursor = "pointer";
+			line.setAttribute("title", "在 Web 操作台中处理");
+			line.addEventListener("click", () => this.openOperatorAction(action));
+		}
+		if (count > 5) {
+			this.muted(this.inboxBodyEl, `… 还有 ${count - 5} 条，点击标题前往操作台`);
+		}
+	}
+
+	private openOperatorAction(action: OperatorAction): void {
+		new Notice(`Institute: action #${action.id} 的裁决只在 Web 操作台进行。`, 5000);
+		window.open(`${this.plugin.api.baseUrl()}/operator`);
+	}
+
+	// ---- 预测账本速览（API 无 stats；聚合近 5 条的 detail verdict） ----------------------
+
+	private async refreshForecasts(): Promise<void> {
+		let rows: ForecastRow[];
+		try {
+			const recent = await this.plugin.api.forecasts(5);
+			rows = await Promise.all(
+				recent.map((row) =>
+					row.status === "open" ? Promise.resolve(row) : this.plugin.api.forecast(row.id),
+				),
+			);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.forecastsWrapEl.style.display = "none";
+			} else {
+				this.forecastsWrapEl.style.display = "";
+				this.forecastsSummaryEl.setText("（获取失败）");
+				this.forecastsBodyEl.empty();
+				this.muted(this.forecastsBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.forecastsWrapEl.style.display = "";
+		this.forecastsBodyEl.empty();
+
+		const evaluated = rows.filter(
+			(row) => row.settlement && row.settlement.verdict !== "invalid",
+		);
+		const hits = evaluated.filter((row) => row.settlement?.verdict === "hit").length;
+		const partial = evaluated.filter((row) => row.settlement?.verdict === "partial").length;
+		const rate = evaluated.length ? `${Math.round((hits / evaluated.length) * 100)}%` : "—";
+		this.forecastsSummaryEl.setText(
+			`近 ${rows.length} 条 · 命中率 ${rate}` +
+				(evaluated.length ? `（${hits}/${evaluated.length}）` : ""),
+		);
+		this.forecastsSummaryEl.style.color = "var(--text-muted)";
+
+		if (!rows.length) {
+			this.muted(this.forecastsBodyEl, "还没有预测记录。");
+			return;
+		}
+		for (const row of rows) {
+			const verdict = row.settlement?.verdict;
+			const state = verdict
+				? (FORECAST_VERDICT_ZH[verdict] ?? verdict)
+				: (FORECAST_STATUS_ZH[row.status] ?? row.status);
+			const direction = FORECAST_DIRECTION_ZH[row.direction] ?? row.direction;
+			const date = sgtDate(row.made_at) ?? "";
+			const line = this.forecastsBodyEl.createDiv({
+				text: `${direction} · ${row.claim}${date ? ` · ${date}` : ""} · ${state}`,
+			});
+			line.style.padding = "1px 0";
+			line.setAttribute("title", row.claim);
+		}
+		const denominator = `口径：近 5 条中的命中/落空/部分命中，invalid 不计`;
+		this.muted(
+			this.forecastsBodyEl,
+			partial > 0 ? `${denominator}；部分命中 ${partial}` : denominator,
+		);
+	}
+
+	// ---- 研究树监控 ----------------------------------------------------------------
+
+	private async refreshResearchTrees(): Promise<void> {
+		let active: ResearchTreeRow[];
+		let activeTruncated = false;
+		let detail: ResearchTreeDetail | null;
+		let latest: ResearchTreeRow | null;
+		try {
+			const [pending, exploring] = await Promise.all([
+				this.plugin.api.researchTrees("pending", 200),
+				this.plugin.api.researchTrees("exploring", 200),
+			]);
+			active = [...pending, ...exploring].sort((a, b) =>
+				b.created_at.localeCompare(a.created_at),
+			);
+			activeTruncated = pending.length >= 200 || exploring.length >= 200;
+			if (active.length) {
+				latest = active[0];
+			} else {
+				const recent = await this.plugin.api.researchTrees(undefined, 1);
+				latest = recent[0] ?? null;
+			}
+			detail = latest ? await this.plugin.api.researchTree(latest.id) : null;
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.treesWrapEl.style.display = "none";
+			} else {
+				this.treesWrapEl.style.display = "";
+				this.treesSummaryEl.setText("（获取失败）");
+				this.treesBodyEl.empty();
+				this.muted(this.treesBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.treesWrapEl.style.display = "";
+		this.treesBodyEl.empty();
+
+		this.treesSummaryEl.setText(
+			`${active.length}${activeTruncated ? "+" : ""} 活跃` +
+				(detail ? ` · 最新 ${TREE_STATUS_ZH[detail.status] ?? detail.status}` : ""),
+		);
+		this.treesSummaryEl.style.color =
+			active.length > 0 ? "var(--color-green)" : "var(--text-muted)";
+
+		if (!latest || !detail) {
+			this.muted(this.treesBodyEl, "还没有研究树。");
+			return;
+		}
+		const progress = `${latest.nodes_completed ?? 0}/${latest.nodes_total ?? detail.nodes.length}`;
+		const treeLine = this.treesBodyEl.createDiv({
+			text: `${detail.root_topic} · 节点 ${progress}`,
+		});
+		treeLine.style.padding = "1px 0";
+
+		const latestNode = this.latestTreeNode(detail.nodes);
+		if (latestNode) {
+			const state = TREE_NODE_STATUS_ZH[latestNode.status] ?? latestNode.status;
+			const nodeLine = this.treesBodyEl.createDiv({
+				text: `最新节点：${latestNode.topic} · ${state}`,
+			});
+			nodeLine.style.padding = "1px 0";
+			nodeLine.style.color =
+				latestNode.status === "failed"
+					? "var(--color-red)"
+					: latestNode.status === "running"
+						? "var(--color-green)"
+						: "";
+		} else {
+			this.muted(this.treesBodyEl, "该树尚无节点。");
+		}
+	}
+
+	private latestTreeNode(nodes: ResearchTreeNode[]): ResearchTreeNode | null {
+		let latest: ResearchTreeNode | null = null;
+		let latestAt = Number.NEGATIVE_INFINITY;
+		for (const node of nodes) {
+			const at = Date.parse(node.finished_at ?? node.created_at);
+			const rank = Number.isNaN(at) ? 0 : at;
+			if (rank >= latestAt) {
+				latest = node;
+				latestAt = rank;
+			}
+		}
+		return latest;
 	}
 
 	// ---- 状态 / 队列 / 执行手 -----------------------------------------------------

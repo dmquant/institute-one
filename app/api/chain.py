@@ -15,7 +15,7 @@ async def _call(fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) ->
     unknown id -> 404."""
     try:
         return await fn(*args, **kwargs)
-    except chain.PromoteConflict as exc:
+    except (chain.PromoteConflict, chain.PropertyConflict) as exc:
         raise HTTPException(409, str(exc)) from exc
     except chain.ChainError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -53,6 +53,12 @@ class ReprojectBody(BaseModel):
     cap: int = 50            # max notes rewritten per call (clamped to 1..500)
 
 
+class ResolvePropertyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    winner_id: str
+
+
 @router.get("/nodes")
 async def list_nodes(q: str | None = None, kind: str | None = None, limit: int = 50, offset: int = 0):
     return await _call(chain.list_nodes, q=q, kind=kind, limit=limit, offset=offset)
@@ -69,6 +75,21 @@ async def get_node(node_id: str):
 @router.post("/nodes/{node_id}/aliases")
 async def add_alias(node_id: str, body: AliasBody):
     return await _call(chain.merge_aliases, node_id, body.alias)
+
+
+@router.get("/nodes/{node_id}/properties")
+async def get_properties(node_id: str):
+    return await _call(chain.get_properties, node_id)
+
+
+@router.get("/properties/conflicts")
+async def list_property_conflicts(limit: int = 100, offset: int = 0):
+    return await _call(chain.list_conflicts, limit=limit, offset=offset)
+
+
+@router.post("/properties/conflicts/{conflict_group}/resolve")
+async def resolve_property_conflict(conflict_group: str, body: ResolvePropertyBody):
+    return await _call(chain.resolve_property_conflict, conflict_group, body.winner_id)
 
 
 @router.get("/candidates")

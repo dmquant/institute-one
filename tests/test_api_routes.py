@@ -40,6 +40,9 @@ EXEMPT: dict[tuple[str, str], str] = {
 # mutating routes with no path params whose empty/default body is a safe
 # empty-database no-op: called for real, must answer 2xx.
 SAFE_EMPTY_BODY: dict[tuple[str, str], str] = {
+    ("POST", "/api/operator/observe"): "empty db -> zero-count observation snapshot, no model call",
+    ("POST", "/api/operator/proposals/generate"): "no observations -> proposes nothing (deterministic)",
+    ("POST", "/api/operator/effects/measure"): "no due effects -> no-op",
     ("POST", "/api/whiteboard/tick"): "no boards -> no-op",
     ("POST", "/api/whiteboard/kickoff"): "empty topic pool -> no board, no model call",
     ("POST", "/api/mailbox/sweep"): "no pending dispatches -> no-op",

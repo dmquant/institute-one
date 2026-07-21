@@ -13,7 +13,7 @@ import logging
 import shutil
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -29,7 +29,18 @@ log = logging.getLogger("institute.scheduler")
 _scheduler: AsyncIOScheduler | None = None
 
 RATE_LIMIT_REVIVAL_LIMIT = 3
+# Candidate-scan bound (P11g): never pull the whole rate_limited backlog into
+# memory. The window is not anchored to the head: a persisted keyset cursor
+# (R3 P1) advances it across firings and wraps at the tail, so rows the Python
+# side still has to skip (cooling hand, unresolvable hand) can never starve
+# eligible rows sorted behind them.
+RATE_LIMIT_REVIVAL_SCAN_LIMIT = 50
+RATE_LIMIT_REVIVAL_CURSOR_KEY = "rate_limit_revival_cursor"
 RATE_LIMIT_REVIVAL_MARKER = "[rate-limit-revival:claimed]"
+# R5: 0042's immutable source.revival_task_id <-> child.revived_from_task_id
+# binding is the arbitration authority. 0039 lease fields remain compatible
+# schema only; the marker is display/legacy metadata written after completion.
+RATE_LIMIT_REVIVAL_MAX_ATTEMPTS = 5
 JANITOR_DELETE_LIMIT = 5000
 RESEARCH_TREE_BOOKED_PREFIX = "research_tree_booked:"
 
@@ -226,6 +237,14 @@ async def _factcheck_tick_job() -> None:
     await factcheck.tick()
 
 
+@metered("factcheck-outbox")
+async def _factcheck_outbox_job() -> None:
+    # metered like every other job: a bare string-ref registration kept it
+    # out of the registry, so /api/cron/health under-reported by one job
+    from . import factcheck
+    await factcheck.drain_dispute_outbox()
+
+
 @metered("chain-tick", gated=True)
 async def _chain_tick_job() -> None:
     from . import chain
@@ -257,6 +276,17 @@ async def _operator_deep_route_job() -> None:
     await operator.route_actions(cap=10, proposed_by="deep_loop")
 
 
+@metered("operator-selfimprove")
+async def _operator_selfimprove_job() -> None:
+    # M8-008 daily self-improvement sweep: observe -> propose -> measure.
+    # Zero model calls (deterministic derivation), so never gated; proposals
+    # it opens still pass through the human approve gate before applying.
+    from . import operator
+    await operator.observe_operator()
+    await operator.generate_proposals()
+    await operator.measure_effects()
+
+
 @metered("operator-vault-sweep")
 async def _operator_vault_sweep_job() -> None:
     from . import operator
@@ -273,6 +303,13 @@ async def _paper_opener_job() -> None:
 async def _paper_mtm_job() -> None:
     from . import paper_book
     await paper_book.mark_to_market()
+
+
+@metered("portfolio-proposer")
+async def _portfolio_proposer_job() -> None:
+    # pure DB reads + PIT marks -> proposals; zero model calls, never gated
+    from . import portfolios
+    await portfolios.sunday_proposer_job()
 
 
 @metered("hand-scorecard")
@@ -292,77 +329,257 @@ def _revival_error(error: str | None) -> str:
     return f"{base}\n{RATE_LIMIT_REVIVAL_MARKER}" if base else RATE_LIMIT_REVIVAL_MARKER
 
 
+async def _revival_cursor() -> tuple[str, str] | None:
+    """Persisted keyset position of the candidate scan (None = head of order).
+
+    One admin_state row (no migration); missing/corrupt state degrades to a
+    head scan — the same fail-open posture as get_maintenance().
+    """
+    row = await db.query_one(
+        "SELECT value FROM admin_state WHERE key = ?", (RATE_LIMIT_REVIVAL_CURSOR_KEY,)
+    )
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["value"])
+        ts, task_id = data["ts"], data["id"]
+        if isinstance(ts, str) and isinstance(task_id, str):
+            return ts, task_id
+    except Exception:  # noqa: BLE001 - corrupt cursor means scan from the head
+        pass
+    return None
+
+
+async def _set_revival_cursor(cursor: tuple[str, str] | None) -> None:
+    if cursor is None:
+        await db.execute(
+            "DELETE FROM admin_state WHERE key = ?", (RATE_LIMIT_REVIVAL_CURSOR_KEY,)
+        )
+        return
+    await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (RATE_LIMIT_REVIVAL_CURSOR_KEY, json.dumps({"ts": cursor[0], "id": cursor[1]})),
+    )
+
+
+def _revival_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (row["finished_at"] or row["created_at"], row["id"])
+
+
+async def _mark_revival_consumed(
+    source: dict[str, Any],
+    child: dict[str, Any],
+) -> bool:
+    """Consume a source only when its reciprocal canonical child completed.
+
+    The marker is compatibility/display metadata, never arbitration. The
+    immutable 0042 binding + child status are re-checked in SQL so a stale
+    reconciliation read cannot consume the wrong source.
+    """
+    n = await db.execute(
+        "UPDATE tasks SET "
+        "error = CASE WHEN instr(COALESCE(error, ''), ?) = 0 THEN ? ELSE error END, "
+        "revival_lease_id = NULL, revival_leased_at = NULL "
+        "WHERE id = ? AND status = 'rate_limited' AND revival_task_id = ? "
+        "AND EXISTS (SELECT 1 FROM tasks canonical "
+        "            WHERE canonical.id = ? "
+        "            AND canonical.revived_from_task_id = tasks.id "
+        "            AND canonical.status = 'completed')",
+        (
+            RATE_LIMIT_REVIVAL_MARKER,
+            _revival_error(source["error"]),
+            source["id"],
+            child["id"],
+            child["id"],
+        ),
+    )
+    return n > 0
+
+
+async def _reconcile_bound_revival(
+    source_id: str,
+    executor: Any,
+    registry: Any,
+) -> bool:
+    """Reconcile/drive one immutable canonical child.
+
+    Returns True only when this firing attached a model driver, so the
+    per-firing revival cap continues to count potential model work rather than
+    cheap completion reconciliation.
+    """
+    pair = await executor.get_canonical_respawn(source_id)
+    if pair is None:
+        log.error("revival source %s has an invalid canonical binding", source_id)
+        return False
+    source, child = pair
+    status = child["status"]
+    if status == "completed":
+        await _mark_revival_consumed(source, child)
+        return False
+    if status in ("queued", "running"):
+        hand = child["requested_hand"]
+        if hand and registry.cooling_until(hand) is not None:
+            return False
+        return await executor.drive_prepared(child["id"])
+    if status in ("failed", "rate_limited", "expired", "overcommitted"):
+        requeued = await executor.requeue_prepared(
+            source["id"],
+            child["id"],
+            max_attempts=RATE_LIMIT_REVIVAL_MAX_ATTEMPTS,
+        )
+        if requeued:
+            return await executor.drive_prepared(child["id"])
+        return False
+    # Cancellation is an explicit operator terminal: retain the binding and
+    # do not call the model again. The source remains visibly unconsumed.
+    return False
+
+
 @metered("rate-limit-revival", gated=True)
 async def _rate_limit_revival_job() -> None:
     """Respawn cooled-down terminal tasks, at most three per firing.
 
-    The error marker is an atomic per-source-row claim. It is written only
-    when that lineage has no live retry; a concurrent INSERT still resolves
-    through uq_tasks_lineage_active and is treated as an idempotent skip.
+    Durable protocol (R5, migration 0042): executor.prepare_respawn_from_row()
+    conditionally binds the source and inserts one born-queued canonical child
+    in the SAME SQLite transaction. The reciprocal binding remains unique
+    after the child becomes terminal, so every crash window reconciles the
+    same id: queued/running is driven, completed consumes the source, and
+    retryable failures requeue that id under the bounded attempt counter.
+    Marker/0039 leases are compatibility metadata, not arbitration.
+
+    The candidate scan is one bounded keyset window per firing (R3 P1):
+    the position persists across firings and wraps at the tail, so a head full
+    of cooling/unresolvable rows cannot starve eligible rows behind it.
     """
     from ..hands.registry import get_registry
     from ..router import executor
 
     registry = get_registry()
     revived = 0
-    rows = await db.query(
-        "SELECT * FROM tasks WHERE status = 'rate_limited' "
-        "AND instr(COALESCE(error, ''), ?) = 0 "
-        "ORDER BY COALESCE(finished_at, created_at) ASC, id ASC",
-        (RATE_LIMIT_REVIVAL_MARKER,),
+    cursor = await _revival_cursor()
+    sql = (
+        "SELECT t.* FROM tasks t WHERE t.status = 'rate_limited' "
+        "AND t.revived_from_task_id IS NULL "
+        "AND ("
+        "  (t.revival_task_id IS NOT NULL "
+        "   AND (instr(COALESCE(t.error, ''), ?) = 0 "
+        "        OR NOT EXISTS (SELECT 1 FROM tasks done "
+        "                       WHERE done.id = t.revival_task_id "
+        "                       AND done.revived_from_task_id = t.id "
+        "                       AND done.status = 'completed'))) "
+        "  OR "
+        "  (t.revival_task_id IS NULL "
+        "   AND instr(COALESCE(t.error, ''), ?) = 0 "
+        "   AND t.revival_attempts < ? "
+        "   AND NOT EXISTS (SELECT 1 FROM tasks live "
+        "                   WHERE live.lineage_root = COALESCE(t.lineage_root, t.id) "
+        "                   AND live.status IN ('queued','running')))"
+        ")"
     )
-    for row in rows:
+    params: list[Any] = [
+        RATE_LIMIT_REVIVAL_MARKER,
+        RATE_LIMIT_REVIVAL_MARKER,
+        RATE_LIMIT_REVIVAL_MAX_ATTEMPTS,
+    ]
+    if cursor is not None:
+        sql += " AND (COALESCE(t.finished_at, t.created_at), t.id) > (?, ?)"
+        params.extend(cursor)
+    sql += " ORDER BY COALESCE(t.finished_at, t.created_at) ASC, t.id ASC LIMIT ?"
+    params.append(RATE_LIMIT_REVIVAL_SCAN_LIMIT)
+    rows = await db.query(sql, params)
+
+    # Default advance: past the full window, or wrap when the tail was reached
+    # (short window). A cap-break overrides with the last row actually
+    # processed, so the unscanned remainder of this window comes up next.
+    next_cursor = _revival_key(rows[-1]) if len(rows) == RATE_LIMIT_REVIVAL_SCAN_LIMIT else None
+    for i, row in enumerate(rows):
         if revived >= RATE_LIMIT_REVIVAL_LIMIT:
+            next_cursor = _revival_key(rows[i - 1])
             break
-        hand = row["hand"]
+        if row["revival_task_id"]:
+            try:
+                revived += int(await _reconcile_bound_revival(row["id"], executor, registry))
+            except Exception:  # noqa: BLE001 - one corrupt binding cannot block the batch
+                log.exception("rate-limit revival reconcile failed for task %s", row["id"])
+            continue
+        hand = row["hand"] or row["requested_hand"]
         if not hand or registry.cooling_until(hand) is not None:
             continue
-        lineage_root = row["lineage_root"] or row["id"]
-        live = await db.query_one(
-            "SELECT id FROM tasks WHERE lineage_root = ? "
-            "AND status IN ('queued','running') LIMIT 1",
-            (lineage_root,),
-        )
-        if live is not None:
-            continue
 
-        original_error = row["error"]
-        claimed_error = _revival_error(original_error)
-        claimed = await db.execute(
-            "UPDATE tasks SET error = ? WHERE id = ? AND status = 'rate_limited' "
-            "AND instr(COALESCE(error, ''), ?) = 0 "
-            "AND NOT EXISTS (SELECT 1 FROM tasks live "
-            "                WHERE live.lineage_root = ? "
-            "                AND live.status IN ('queued','running'))",
-            (claimed_error, row["id"], RATE_LIMIT_REVIVAL_MARKER, lineage_root),
-        )
-        if not claimed:
+        try:
+            async with db.transaction() as conn:
+                prepared = await executor.prepare_respawn_from_row(
+                    conn,
+                    row,
+                    max_attempts=RATE_LIMIT_REVIVAL_MAX_ATTEMPTS,
+                )
+        except sqlite3.IntegrityError:
+            # Do not guess which constraint fired. Only a real reciprocal
+            # canonical winner with the exact expected policy may converge.
+            winner = await executor.get_canonical_respawn(row["id"])
+            if winner is None:
+                log.exception(
+                    "rate-limit revival prepare hit IntegrityError with no "
+                    "matching canonical winner for task %s",
+                    row["id"],
+                )
+                continue
+            try:
+                revived += int(
+                    await _reconcile_bound_revival(row["id"], executor, registry)
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("rate-limit revival winner reconcile failed for %s", row["id"])
+        except Exception:  # noqa: BLE001 - one corrupt row must not block the batch
+            log.exception("rate-limit revival prepare failed for task %s", row["id"])
+            continue
+        if prepared is None:  # queue depth over cap: defer, consume nothing
             continue
         try:
-            await executor.respawn_from_row(row)
-        except sqlite3.IntegrityError:
-            # The unique index won the race for another retry. Keep the claim
-            # marker: this source row's lineage was revived by that winner.
-            log.debug("rate-limit revival lost live-lineage race for %s", row["id"])
-        except Exception:  # noqa: BLE001 - one corrupt row must not block the batch
-            # A non-idempotency failure did not create a usable retry; release
-            # only our exact marker so a later tick can try again.
-            await db.execute(
-                "UPDATE tasks SET error = ? WHERE id = ? AND status = 'rate_limited' "
-                "AND error = ?",
-                (original_error, row["id"], claimed_error),
-            )
-            log.exception("rate-limit revival failed for task %s", row["id"])
-        else:
-            revived += 1
+            revived += int(await executor.drive_prepared(prepared.task_id))
+        except Exception:  # noqa: BLE001 - durable child is retried next tick/boot
+            log.exception("could not drive prepared revival %s", prepared.task_id)
+    await _set_revival_cursor(next_cursor)
     if revived:
         log.info("rate-limit revival spawned %d task(s)", revived)
+
+
+async def _nightly_backup() -> None:
+    """Consistent nightly DB snapshot during the 03:00-05:00 SGT window, once
+    per date.
+
+    ``VACUUM INTO`` (runtime SQL — never inside a migration file) snapshots
+    through SQLite's own transaction machinery, so a concurrent auto-checkpoint
+    can no longer corrupt the copy the way it could mid-``shutil.copy2``; the
+    old pre-copy ``wal_checkpoint`` is redundant with it. The snapshot lands on
+    a temp name and is renamed into place only on success, so a crashed attempt
+    never leaves a half-written file that the ``target.exists()`` once-per-date
+    guard would mistake for a finished backup.
+    """
+    if not (3 <= now_sgt().hour < 5):
+        return
+    settings = get_settings()
+    target = settings.backups_dir / f"institute-{work_date()}.db"
+    if target.exists():
+        return
+    settings.backups_dir.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / (target.name + ".tmp")
+    tmp.unlink(missing_ok=True)  # crashed-attempt residue: VACUUM INTO refuses existing files
+    try:
+        await db.execute("VACUUM INTO ?", (str(tmp),))
+        tmp.replace(target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    log.info("janitor wrote backup %s", target.name)
 
 
 @metered("janitor")
 async def _janitor() -> None:
     settings = get_settings()
-    now_utc = datetime.now(timezone.utc)
+    # hard rule 7: the UTC clock is bus.now_iso(), never a raw local clock read
+    now_utc = datetime.fromisoformat(bus.now_iso())
 
     # 1) workflow runs stuck 'running' >6h with no live task under them
     stuck_cutoff = (now_utc - timedelta(hours=6)).isoformat(timespec="seconds")
@@ -455,14 +672,12 @@ async def _janitor() -> None:
     if n:
         log.info("janitor removed %d expired research-tree counters", n)
 
-    # 7) nightly DB backup during the 03:00-05:00 SGT window (once per date)
-    if 3 <= now_sgt().hour < 5:
-        target = settings.backups_dir / f"institute-{work_date()}.db"
-        if not target.exists():
-            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            settings.backups_dir.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(shutil.copy2, settings.db_path, target)
-            log.info("janitor wrote backup %s", target.name)
+    # 7) nightly DB backup — isolated so a backup failure can never poison the
+    # janitor's other steps or flip its cron metric to failed (P9)
+    try:
+        await _nightly_backup()
+    except Exception:  # noqa: BLE001 - backup is best-effort, the rest must run
+        log.exception("janitor backup failed")
 
 
 # ---- lifecycle --------------------------------------------------------------
@@ -502,15 +717,17 @@ def start() -> None:
     cron(_analyst_dailies_job, "analyst-dailies", settings.analyst_daily_time)
     cron(_memory_compact_job, "memory-compact", settings.memory_compact_time)
     cron(_scorecard_job, "hand-scorecard", "00:05")
+    cron(_operator_selfimprove_job, "operator-selfimprove", "00:15")  # after scorecard, before market open
     cron(_committee_job, "committee", settings.committee_time, day_of_week="fri")
     cron(_paper_mtm_job, "paper-mtm", "00:00")   # 00:00 SGT，ROADMAP 原文
+    cron(_portfolio_proposer_job, "portfolio-proposer", "22:00", day_of_week="sun")  # ROADMAP Phase 5
     every(_whiteboard_kickoff_job, "whiteboard-kickoff", minutes=settings.whiteboard_kickoff_minutes)
     every(_whiteboard_tick_job, "whiteboard-tick", seconds=settings.whiteboard_tick_seconds)
     every(_mailbox_sweep_job, "mailbox-sweep", seconds=settings.mailbox_sweep_seconds)
     every(_research_tick_job, "research-tick", minutes=settings.research_tick_minutes)
     every(_research_tree_tick_job, "research-tree-tick", minutes=5)
     every(_factcheck_tick_job, "factcheck-tick", minutes=settings.factcheck_tick_minutes)
-    every("app.institute.factcheck:drain_dispute_outbox", "factcheck-outbox", minutes=1)
+    every(_factcheck_outbox_job, "factcheck-outbox", minutes=1)
     every(_chain_tick_job, "chain-tick", minutes=60)
     every(_operator_fast_route_job, "operator-fast-route", minutes=15)
     every(_operator_deep_route_job, "operator-deep-route", minutes=60)

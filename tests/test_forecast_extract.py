@@ -417,23 +417,25 @@ async def test_crash_between_candidates_resumes_exactly_the_missing_rest(monkeyp
     assert [e.ref_id for e in events] == ["research:crash1"]  # emitted exactly once
 
 
-async def test_crash_inside_create_never_duplicates(monkeypatch):
-    """The one-statement doubt window: create_forecast COMMITS, then the
-    process dies before the item back-fill. Resume must NOT re-create that
-    candidate (fails closed, reported in detail) while still completing the
-    untouched rest — the old DELETE-and-re-extract path would have copied it."""
+async def test_crash_after_create_replays_without_duplicates_or_doubt(monkeypatch):
+    """The old doubt window (create COMMITs, process dies before bookkeeping):
+    the item row now carries a PRE-GENERATED deterministic forecast id, so a
+    resume finds the forecast under that id and simply counts it — no 'in
+    doubt' skip, no duplicate, no operator surgery. The completed claim's
+    forecast_ids are aggregated from the item table, so the orphan is fully
+    accounted for."""
     await _seed_universe()
     text = "看多贵州茅台。看空平安银行。看多腾讯控股。"
 
     real_create = forecasts.create_forecast
     calls = 0
 
-    async def create_then_die(fields):
+    async def create_then_die(fields, **kwargs):
         nonlocal calls
         calls += 1
-        fc = await real_create(fields)
+        fc = await real_create(fields, **kwargs)
         if calls == 2:
-            raise RuntimeError("simulated crash after commit, before back-fill")
+            raise RuntimeError("simulated crash after commit")
         return fc
 
     monkeypatch.setattr(fx.forecasts, "create_forecast", create_then_die)
@@ -448,17 +450,20 @@ async def test_crash_inside_create_never_duplicates(monkeypatch):
     rows = await forecasts.list_forecasts()
     assert len(rows) == 3                                   # #3 created, #2 NOT copied
     assert sum(1 for f in rows if f["security_id"] == "000001.SZ") == 1
-    assert len(out["created"]) == 2                         # the in-doubt one excluded
-    assert any("in doubt" in p for p in out["problems"])
+    assert len(out["created"]) == 3                         # the orphan now COUNTS
+    assert not any("in doubt" in p for p in out["problems"])
 
     row = await db.query_one(
         "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:crash2",))
     assert row["status"] == "complete"                      # decided; replay = duplicate
-    assert "in doubt" in row["detail"]
-    item = await db.query_one(
-        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ? AND security_id = ?",
-        (row["id"], "000001.SZ"))
-    assert item["forecast_id"] is None                      # the surgical marker
+    assert set(json.loads(row["forecast_ids"])) == {f["id"] for f in rows}
+    assert row["n_forecasts"] == 3
+    # every item's pre-generated id IS the id its forecast was created under
+    items = await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row["id"],))
+    assert {i["forecast_id"] for i in items} == {f["id"] for f in rows}
+    for i in items:
+        assert i["forecast_id"] == fx._deterministic_forecast_id(row["id"], i["security_id"])
 
     # ForecastError candidates release their claim (refusal, not doubt)
     await db.execute("DELETE FROM securities WHERE id = ?", ("0700.HK",))
@@ -469,6 +474,234 @@ async def test_crash_inside_create_never_duplicates(monkeypatch):
     items = await db.query(
         "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row["id"],))
     assert items == []                                       # claim released, no doubt row
+
+
+async def test_crash_between_claim_and_create_retries_the_same_id(monkeypatch):
+    """The OTHER half of the old doubt window: the item claim committed but
+    create never ran. The deterministic id makes the resume retry the create
+    under the SAME id instead of skipping the candidate forever."""
+    await _seed_universe()
+    text = "看多贵州茅台。"
+
+    async def create_boom(fields, **kwargs):
+        raise RuntimeError("simulated crash before create")
+
+    monkeypatch.setattr(fx.forecasts, "create_forecast", create_boom)
+    with pytest.raises(RuntimeError):
+        await fx.process_source("research:crash3", "research", text)
+    monkeypatch.undo()
+
+    row = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:crash3",))
+    assert row["status"] == "pending"
+    items = await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row["id"],))
+    assert len(items) == 1
+    claimed_id = items[0]["forecast_id"]
+    assert claimed_id == fx._deterministic_forecast_id(row["id"], "600519.SH")
+    assert await forecasts.list_forecasts() == []            # claimed, nothing created
+
+    # a resume with TAMPERED content is refused before it can touch anything
+    with pytest.raises(ValueError, match="different content"):
+        await fx.process_source("research:crash3", "research", "看空贵州茅台。")
+    assert await forecasts.list_forecasts() == []
+
+    out = await fx.process_source("research:crash3", "research", text)
+    assert out["status"] == "processed"
+    assert out["created"] == [claimed_id]                    # the SAME pre-generated id
+    rows = await forecasts.list_forecasts()
+    assert [f["id"] for f in rows] == [claimed_id]
+    assert not out["problems"]
+
+
+async def test_seal_is_conditional_on_every_item_reaching_terminal_state(monkeypatch):
+    """R2 P1-2: extractor A claims a candidate then crashes before create;
+    extractor B — which lost the item-claim race on a stale read — must NOT
+    seal the source 'complete' over A's claimed-but-missing forecast. The
+    seal defers (status stays 'pending'), and the next replay creates the
+    missing candidate and seals; nothing is entombed, nothing is lost."""
+    await _seed_universe()
+    text = "看多贵州茅台。看空平安银行。"
+
+    # A: claims item #1 (creates it) and item #2, dies before creating #2
+    real_create = forecasts.create_forecast
+    calls = 0
+
+    async def create_then_die(fields, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("A crashed after claiming, before create")
+        return await real_create(fields, **kwargs)
+
+    monkeypatch.setattr(fx.forecasts, "create_forecast", create_then_die)
+    with pytest.raises(RuntimeError):
+        await fx.process_source("research:seal", "research", text)
+    monkeypatch.undo()
+
+    # B: resumes concurrently; its ITEM LOOKUP for 000001.SZ is a stale read
+    # (raced A's claim) so its own claim INSERT loses and it skips the
+    # candidate — exactly the interleaving the old finalize sealed over
+    real_query_one = db.query_one
+
+    async def stale_item_lookup(sql, params=()):
+        if "SELECT forecast_id FROM forecast_extraction_items" in sql \
+                and len(params) == 2 and params[1] == "000001.SZ":
+            return None
+        return await real_query_one(sql, params)
+
+    monkeypatch.setattr(fx.db, "query_one", stale_item_lookup)
+    out_b = await fx.process_source("research:seal", "research", text)
+    monkeypatch.undo()
+
+    assert out_b["status"] == "pending"                     # seal DEFERRED, not complete
+    assert any("in flight" in p for p in out_b["problems"])
+    row = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:seal",))
+    assert row["status"] == "pending"                       # replay will NOT be 'duplicate'
+    assert len(await forecasts.list_forecasts()) == 1       # #2 still missing
+
+    # the replay resumes (A's owner never came back), creates #2, seals
+    out = await fx.process_source("research:seal", "research", text)
+    assert out["status"] == "processed"
+    rows = await forecasts.list_forecasts()
+    assert {f["security_id"] for f in rows} == {"600519.SH", "000001.SZ"}
+    row = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:seal",))
+    assert row["status"] == "complete"
+    assert set(json.loads(row["forecast_ids"])) == {f["id"] for f in rows}
+    assert row["n_forecasts"] == 2
+
+    # only the run that actually sealed emitted the event
+    events = await bus.replay(0, types=["forecast.extracted"])
+    assert [e.ref_id for e in events] == ["research:seal"]
+    assert events[0].payload["n_forecasts"] == 2
+
+
+async def test_id_collision_with_unrelated_forecast_fails_loud(monkeypatch):
+    """R2 P1-3: a 48-bit deterministic-id collision with an UNRELATED forecast
+    must never read as 'a concurrent replayer created it first'. All three
+    entry points fail loud: PK conflict at create, a poisoned item on resume,
+    and the cross-extraction item-claim unique-index hit — and none of them
+    leaves an item row misattributing the foreign forecast."""
+    await _seed_universe()
+    await _mk_thesis()
+    foreign = await forecasts.create_forecast({
+        "thesis_id": "t-macro", "security_id": "NVDA.US", "claim": "无关的人工预测",
+        "direction": "short", "horizon_days": 365,
+        "settlement_rule": {"type": "absolute_move", "threshold": 0.05},
+    }, forecast_id="c011ide0c0de")
+
+    # (1) create-path collision: the derived id lands on the foreign forecast
+    monkeypatch.setattr(fx, "_deterministic_forecast_id", lambda eid, sid: "c011ide0c0de")
+    with pytest.raises(ValueError, match="collision"):
+        await fx.process_source("research:coll", "research", "看多贵州茅台")
+    monkeypatch.undo()
+    row = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:coll",))
+    assert row["status"] == "pending"                       # never sealed over the collision
+    items = await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row["id"],))
+    assert items == []                                      # claim released: no misattribution
+    fresh = await forecasts.get_forecast("c011ide0c0de")
+    assert fresh["claim"] == "无关的人工预测"                # the foreign row is untouched
+
+    # (2) resume-path collision: a poisoned item already points at the foreign
+    # forecast — counting it would misattribute; must release + fail loud
+    now = bus.now_iso()
+    await db.execute(
+        "INSERT INTO forecast_extraction_items (extraction_id, security_id, forecast_id, "
+        "created_at, updated_at) VALUES (?,?,?,?,?)",
+        (row["id"], "600519.SH", "c011ide0c0de", now, now))
+    with pytest.raises(ValueError, match="collision"):
+        await fx.process_source("research:coll", "research", "看多贵州茅台")
+    items = await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row["id"],))
+    assert items == []                                      # poisoned item released
+
+    # (3) cross-extraction collision: the id is already owned by ANOTHER
+    # extraction's item — the claim INSERT hits the partial unique index
+    ok = await fx.process_source("research:coll-src1", "research", "看空平安银行")
+    assert ok["status"] == "processed" and len(ok["created"]) == 1
+    monkeypatch.setattr(fx, "_deterministic_forecast_id", lambda eid, sid: ok["created"][0])
+    with pytest.raises(ValueError, match="collision"):
+        await fx.process_source("research:coll-src2", "research", "看多贵州茅台")
+    monkeypatch.undo()
+    row2 = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:coll-src2",))
+    assert row2["status"] == "pending"
+    assert await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (row2["id"],)) == []
+
+    # the LEGITIMATE concurrent-win path still counts: a forecast under the
+    # derived id that carries this claim's frozen made_at + security is ours
+    out = await fx.process_source("research:coll-legit", "research", "看多腾讯控股")
+    assert out["status"] == "processed" and len(out["created"]) == 1
+    again_row = await db.query_one(
+        "SELECT * FROM forecast_extractions WHERE source_ref = ?", ("research:coll-legit",))
+    item = (await db.query(
+        "SELECT * FROM forecast_extraction_items WHERE extraction_id = ?", (again_row["id"],)))[0]
+    fc_row = await db.query_one("SELECT * FROM forecasts WHERE id = ?", (item["forecast_id"],))
+    assert fx._owns_forecast(fc_row, "0700.HK", again_row["made_at"]) is True
+
+
+async def test_source_ref_binds_content_hash():
+    """The idempotency key is (source_ref, content): a same-text replay is a
+    plain duplicate, a different-text replay under the same ref is a readable
+    refusal — never a silent resume into a mixed extraction."""
+    import hashlib
+
+    await _seed_universe()
+    text = "强烈看多贵州茅台"
+    out = await fx.process_source("research:hash1", "research", text)
+    assert out["status"] == "processed" and len(out["created"]) == 1
+    row = await db.query_one(
+        "SELECT text_sha256 FROM forecast_extractions WHERE source_ref = ?",
+        ("research:hash1",))
+    assert row["text_sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    again = await fx.process_source("research:hash1", "research", text)
+    assert again["status"] == "duplicate"
+
+    with pytest.raises(ValueError, match="different content"):
+        await fx.process_source("research:hash1", "research", "完全不同的报告文本，看空平安银行")
+    assert len(await forecasts.list_forecasts()) == 1        # the refusal wrote nothing
+
+
+async def test_made_at_frozen_on_claim_governs_resume(monkeypatch):
+    """One source = one knowledge time: made_at is stamped on the claim row
+    and every candidate — including those created by a resume that was passed
+    a different made_at — records exactly the frozen value."""
+    await _seed_universe()
+    text = "看多贵州茅台。看空平安银行。"
+    made = "2026-06-01T23:00:00+00:00"
+
+    real_execute = db.execute
+    item_inserts = 0
+
+    async def crashing_execute(sql, params=()):
+        nonlocal item_inserts
+        if "INSERT INTO forecast_extraction_items" in sql:
+            item_inserts += 1
+            if item_inserts == 2:
+                raise RuntimeError("simulated crash at a candidate boundary")
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(fx.db, "execute", crashing_execute)
+    with pytest.raises(RuntimeError):
+        await fx.process_source("research:frozen", "research", text, made_at=made)
+    monkeypatch.undo()
+
+    row = await db.query_one(
+        "SELECT made_at, status FROM forecast_extractions WHERE source_ref = ?",
+        ("research:frozen",))
+    assert (row["made_at"], row["status"]) == (made, "pending")
+
+    # the resume lies about made_at: the frozen claim value wins
+    out = await fx.process_source(
+        "research:frozen", "research", text, made_at="2026-06-05T00:00:00+00:00")
+    assert out["status"] == "processed" and len(out["created"]) == 2
+    assert {f["made_at"] for f in await forecasts.list_forecasts()} == {made}
 
 
 # ==== REVIEW-C3 M5: analyst attribution on the claim row ========================

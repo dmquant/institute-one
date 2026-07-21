@@ -480,6 +480,62 @@ async def test_retry_failed_child_reopens_tree_without_parent_surgery(explorer_o
     assert [e.payload["status"] for e in snapshots] == ["completed", "completed"]
 
 
+async def test_finish_flip_blocked_by_concurrent_retry_race(explorer_output, monkeypatch):
+    """LOOP-P5a reproduction: retry_node lands between _maybe_finish_tree's
+    advisory reads and its flip UPDATE. Without a NOT EXISTS guard on the
+    flip (the _announce_if_drained idiom) the tree goes terminal OVER the
+    fresh pending row, and the next sweep silently prunes the operator's
+    retry; with the guard the flip loses, the tree stays exploring and the
+    retried node drains normally."""
+    await _set_limits()
+    explorer_output.scripts = {"竞态重试": "CONCLUSION: 重试后完成。"}
+    tree = await research_tree.create_tree("竞态重试")
+    root = (await _nodes(tree["id"]))[0]
+    await db.execute(
+        "UPDATE research_tree_nodes SET status='failed', finished_at=? WHERE id = ?",
+        (bus.now_iso(), root["id"]),
+    )
+    await db.execute(
+        "UPDATE research_trees SET status='exploring' WHERE id = ?", (tree["id"],)
+    )
+
+    orig_query_one = db.query_one
+    state = {"injected": False}
+
+    async def query_one_with_retry_race(sql, params=()):
+        row = await orig_query_one(sql, params)
+        # inject the operator's retry right after the completed-count read,
+        # i.e. between _maybe_finish_tree's advisory reads and its flip UPDATE
+        if (not state["injected"] and "research_tree_nodes" in sql
+                and "status = 'completed'" in sql):
+            state["injected"] = True
+            await research_tree.retry_node(tree["id"], root["id"])
+        return row
+
+    monkeypatch.setattr(db, "query_one", query_one_with_retry_race)
+    flipped = await research_tree._maybe_finish_tree(tree["id"])
+    monkeypatch.setattr(db, "query_one", orig_query_one)
+
+    assert state["injected"]
+    assert not flipped                                  # the guarded flip lost to the retry
+    row = await db.query_one("SELECT status FROM research_trees WHERE id = ?", (tree["id"],))
+    assert row["status"] == "exploring"                 # never terminal over a pending row
+    root_row = await db.query_one(
+        "SELECT status FROM research_tree_nodes WHERE id = ?", (root["id"],)
+    )
+    assert root_row["status"] == "pending"              # the retry survived the race
+
+    # end to end: the retried node is explored, never silently pruned
+    assert await _run_until_terminal(tree["id"]) == "completed"
+    assert explorer_output.calls.count("竞态重试") == 1
+    final_root = await db.query_one(
+        "SELECT status FROM research_tree_nodes WHERE id = ?", (root["id"],)
+    )
+    assert final_root["status"] == "completed"
+    done = await _done_events(tree["id"])
+    assert len(done) == 1 and done[0].payload["status"] == "completed"
+
+
 async def test_retry_node_is_single_claim_and_stopped_tree_stays_final():
     await _set_limits()
     tree = await research_tree.create_tree("并发重试")
@@ -608,6 +664,52 @@ async def test_tick_finalizes_stalled_exploring_tree():
     )
     assert row["status"] == "completed" and row["finished_at"] and row["announced_at"]
     assert len(await _done_events(tree["id"])) == 1
+
+
+async def test_announce_crash_before_emit_never_loses_the_event(monkeypatch):
+    """LOOP-P5b reproduction: the process dies mid-announce (simulated by the
+    emit raising). The old order set announced_at BEFORE emitting, so a crash
+    in the window swallowed the tree.completed snapshot forever (marker set,
+    event never written, sweep never retries). The fix marks announced only
+    AFTER the emit succeeds, so the next tick's sweep re-announces."""
+    await _set_limits()
+    tree = await research_tree.create_tree("崩溃窗口")
+    root = (await _nodes(tree["id"]))[0]
+    now = bus.now_iso()
+    await db.execute(
+        "UPDATE research_tree_nodes SET status='completed', summary='done', finished_at=? "
+        "WHERE id = ?", (now, root["id"]),
+    )
+    await db.execute("UPDATE research_trees SET status='exploring' WHERE id = ?", (tree["id"],))
+
+    orig_emit = bus.emit
+    state = {"died": False}
+
+    async def dying_emit(type, *args, **kwargs):
+        if type == research_tree.TREE_COMPLETED_EVENT and not state["died"]:
+            state["died"] = True
+            raise RuntimeError("simulated crash before the event landed")
+        return await orig_emit(type, *args, **kwargs)
+
+    monkeypatch.setattr(bus, "emit", dying_emit)
+    await research_tree.tick()                          # flip lands; the announce "crashes"
+    assert state["died"]
+    row = await db.query_one(
+        "SELECT status, announced_at FROM research_trees WHERE id = ?", (tree["id"],)
+    )
+    assert row["status"] == "completed"                 # the flip is durable
+    assert row["announced_at"] is None                  # marker must NOT precede the emit
+    assert await _done_events(tree["id"]) == []         # nothing emitted yet
+
+    out = await research_tree.tick()                    # recovery: the sweep re-announces
+    assert out["finalized"] == 1
+    row = await db.query_one(
+        "SELECT announced_at FROM research_trees WHERE id = ?", (tree["id"],)
+    )
+    assert row["announced_at"]
+    done = await _done_events(tree["id"])
+    assert len(done) == 1 and done[0].payload["status"] == "completed"
+    assert done[0].payload["nodes"] == {"completed": 1}
 
 
 async def test_sweep_prunes_stranded_pending_under_terminal_tree():
@@ -794,6 +896,30 @@ async def test_concurrent_ticks_claim_each_node_exactly_once(explorer_output):
 
     row = await db.query_one("SELECT status FROM research_trees WHERE id = ?", (tree["id"],))
     assert row["status"] == "completed"
+
+
+async def test_concurrent_settles_emit_exactly_one_snapshot():
+    """Regression guard for the LOOP-P5b reorder: emit-before-mark must not
+    let overlapping settles double-emit — the in-process announce section
+    serializes and the announced_at claim stays the generation arbiter."""
+    await _set_limits()
+    tree = await research_tree.create_tree("并发宣告")
+    root = (await _nodes(tree["id"]))[0]
+    now = bus.now_iso()
+    await db.execute(
+        "UPDATE research_tree_nodes SET status='completed', summary='done', finished_at=? "
+        "WHERE id = ?", (now, root["id"]),
+    )
+    await db.execute("UPDATE research_trees SET status='exploring' WHERE id = ?", (tree["id"],))
+
+    results = await asyncio.gather(*(research_tree._settle_tree(tree["id"]) for _ in range(6)))
+    assert any(results)
+    done = await _done_events(tree["id"])
+    assert len(done) == 1                               # exactly one snapshot, no double emit
+    row = await db.query_one(
+        "SELECT status, announced_at FROM research_trees WHERE id = ?", (tree["id"],)
+    )
+    assert row["status"] == "completed" and row["announced_at"]
 
 
 async def test_node_concurrency_cap_bounds_inflight_explores(explorer_output):

@@ -31,11 +31,17 @@ class Settings(BaseSettings):
 
     # Execution
     max_concurrent: int = 3
+    # Per-hand queued-depth cap (ROADMAP Phase 2 executor depth): a submit/spawn
+    # finding MORE THAN this many queued rows on its hand fast-fails as the
+    # terminal status 'overcommitted' instead of queueing without bound (a
+    # backlog of exactly the cap is still admitted — normal fan-out bursts,
+    # e.g. the analyst-daily sweep, park roster-sized backlogs briefly).
+    # <=0 disables the check.
+    hand_queue_depth: int = 8           # INSTITUTE_HAND_QUEUE_DEPTH
     default_hand: str = "claude"
     research_hands: str = "codex,agy"
     default_timeout_s: int = 1800
     output_cap_bytes: int = 200_000  # tasks.output column cap
-    paper_book_enforce_caps: bool = True
 
     # Hand enable flags (CLI hands are additionally gated on the binary existing)
     enable_claude: bool = True

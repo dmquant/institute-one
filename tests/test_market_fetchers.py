@@ -63,7 +63,7 @@ def _sina_a_share_payload(
     cells[0], cells[1], cells[2], cells[3] = "贵州茅台", str(open_), str(prev_close), str(price)
     cells[4], cells[5], cells[8] = str(high), str(low), str(volume)
     cells[30], cells[31] = day, "15:00:03"
-    return f'var hq_str_sh600519="{",".join(cells)}";\n'.encode("gbk")
+    return f'var hq_str_sh600519="{",".join(cells)}";\n'.encode("gb18030")
 
 
 def _sina_hk_payload(*, price=505.0, prev_close=500.0, day="2026/07/17") -> bytes:
@@ -71,7 +71,7 @@ def _sina_hk_payload(*, price=505.0, prev_close=500.0, day="2026/07/17") -> byte
     cells[0], cells[1] = "TENCENT", "腾讯控股"
     cells[2], cells[3], cells[4], cells[5], cells[6] = "501.0", str(prev_close), "508.0", "498.0", str(price)
     cells[12], cells[17], cells[18] = "12000000", day, "16:08:11"
-    return f'var hq_str_hk00700="{",".join(cells)}";\n'.encode("gbk")
+    return f'var hq_str_hk00700="{",".join(cells)}";\n'.encode("gb18030")
 
 
 def _stooq_quote_csv(*, close=180.5, date="2026-07-17") -> str:

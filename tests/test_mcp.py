@@ -4,19 +4,18 @@ research_queue_add honours research.enqueue()'s cooldown gate (structured
 refusal, not a JSON-RPC error); topic_pool_add defers entirely to
 whiteboard.add_topic() — same content hash, and "did this call insert" comes
 from the domain INSERT OR IGNORE result, never from an MCP-side pre-check
-(REVIEW-A2 M1/M2). Two tests skip until PATCH-NOTES-A2.md lands the
-``inserted`` key in add_topic().
+(REVIEW-A2 M1/M2; PATCH-NOTES-A2.md landed the ``inserted`` key, so the
+tests assert it unconditionally).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 
-import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app import bus, db
-from app.institute import whiteboard
+from app.institute import projects, whiteboard
 
 
 async def _call_tool(client: AsyncClient, name: str, arguments: dict, msg_id: int = 1) -> dict:
@@ -38,12 +37,6 @@ async def _call_tool(client: AsyncClient, name: str, arguments: dict, msg_id: in
 async def _added_events() -> list[str]:
     events = await bus.replay(0, types=["topic_pool.added"])
     return [e.payload["topic"] for e in events]
-
-
-async def _domain_reports_inserted() -> bool:
-    """Capability probe: PATCH-NOTES-A2.md adds an 'inserted' key to add_topic()."""
-    probe = await whiteboard.add_topic("__a2-probe__", question="", source="test")
-    return "inserted" in probe
 
 
 # ---- research_queue_add ------------------------------------------------------
@@ -89,6 +82,56 @@ async def test_research_queue_add_refused_by_cooldown():
         forced = await _call_tool(client, "research_queue_add", {"topic": "AAPL", "priority": 1}, msg_id=2)
         assert forced["duplicate"] is False
         assert forced["status"] == "pending"
+
+
+async def test_research_queue_add_accepts_project_id_without_new_write_tool():
+    from app import mcp as mcp_mod
+    from app.main import create_app
+
+    tool = mcp_mod._TOOLS["research_queue_add"]
+    assert tool["inputSchema"]["properties"]["project_id"]["type"] == "string"
+    assert "project_id" not in tool["inputSchema"]["required"]
+    assert mcp_mod.WRITE_TOOLS == {"research_queue_add", "topic_pool_add", "institute_ask"}
+
+    project = await projects.create("MCP 项目")
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        result = await _call_tool(
+            client,
+            "research_queue_add",
+            {"topic": "MCP 项目研究", "project_id": project["id"]},
+        )
+
+    assert result["project_id"] == project["id"]
+    row = await db.query_one("SELECT project_id FROM research_queue WHERE id = ?", (result["id"],))
+    assert row["project_id"] == project["id"]
+    linked = await projects.get(project["id"])
+    assert [item["ref_id"] for item in linked["links"]["research"]] == [result["id"]]
+
+
+async def test_research_queue_add_maps_archived_project_to_validation_error():
+    from app.main import create_app
+
+    project = await projects.create("已归档 MCP 项目")
+    await projects.archive(project["id"])
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "research_queue_add",
+                "arguments": {"topic": "不应入队", "project_id": project["id"]},
+            },
+        })
+
+    assert response.status_code == 200
+    error = response.json()["error"]
+    assert error["code"] == -32602
+    assert error["data"]["category"] == "validation"
+    assert "archived" in error["message"]
+    assert await db.query("SELECT * FROM research_queue WHERE topic = ?", ("不应入队",)) == []
 
 
 # ---- topic_pool_add ----------------------------------------------------------
@@ -148,8 +191,9 @@ async def test_topic_pool_add_lands_on_domain_hash():
 async def test_topic_pool_add_reports_genuine_insert():
     from app.main import create_app
 
-    if not await _domain_reports_inserted():
-        pytest.skip("whiteboard.add_topic() lacks 'inserted' — apply PATCH-NOTES-A2.md")
+    # PATCH-NOTES-A2 contract: 'added' comes from the domain INSERT result
+    probe = await whiteboard.add_topic("__a2-probe__", question="", source="test")
+    assert "inserted" in probe
 
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -169,9 +213,6 @@ async def test_topic_pool_add_concurrent_calls_single_added():
     """REVIEW-A2 M2: two concurrent identical calls -> one row, one added=true,
     one topic_pool.added event."""
     from app.main import create_app
-
-    if not await _domain_reports_inserted():
-        pytest.skip("whiteboard.add_topic() lacks 'inserted' — apply PATCH-NOTES-A2.md")
 
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

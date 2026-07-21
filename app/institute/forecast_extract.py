@@ -48,15 +48,31 @@ Matching rules (the ROADMAP's "regex extractor + ticker stoplist + CJK guard"):
                 wins (REVIEW-C3 M4 — the tightest deadline governs);
                 default 30 days.
 
-Idempotency (REVIEW-C3 M2 state machine): ``process_source`` claims its
-``source_ref`` in ``forecast_extractions`` (INSERT ON CONFLICT DO NOTHING —
-the database is the arbiter) with status='pending', claims each candidate in
-``forecast_extraction_items`` (0019), back-fills each forecast_id as it is
-created, and flips the source to 'complete' at the end. Replays of a complete
-source are duplicates; replays of a pending source RESUME: already-created
-candidates are skipped through their item rows, only the missing rest is
-created — a crash between claim and creation no longer bricks the source nor
-forces a duplicate-happy full re-extract.
+Idempotency (REVIEW-C3 M2 state machine, hardened by the 0033 evidence
+audit): ``process_source`` claims its ``source_ref`` in
+``forecast_extractions`` (INSERT ON CONFLICT DO NOTHING — the database is the
+arbiter) with status='pending'. The claim row persists ``text_sha256`` (the
+idempotency key is bound to the CONTENT — a replay carrying different text
+under the same source_ref is refused with a readable error, never silently
+resumed) and a frozen ``made_at`` (stamped once at claim; every candidate of
+the source, including crash-resumed ones, gets exactly that knowledge time).
+Each candidate claims a row in ``forecast_extraction_items`` (0019) carrying
+a PRE-GENERATED deterministic forecast id (sha256 of extraction_id|security_id);
+``create_forecast`` is then called WITH that id, so the create is safely
+replayable: a resume that finds an item whose forecast row is missing simply
+retries the create with the same id (the forecasts PK is the arbiter — the
+old "claimed-but-NULL = in doubt, skip" window is gone; NULL items can only
+be pre-0033 legacy rows, which still fail closed). A PK hit on an UNRELATED
+forecast (48-bit id collision, R2 P1-3) is never counted as a concurrent win:
+ownership is verified against the claim row's frozen made_at + the
+candidate's security, and a mismatch releases the item claim and fails loud.
+The pending → complete seal is a CONDITIONAL CLAIM (R2 P1-2): it fires only
+while every claimed item's forecast actually exists, so a candidate in flight
+under a concurrent processor can never be entombed in a 'complete' claim;
+``forecast_ids``/``n_forecasts`` are aggregated FROM the item table joined to
+actually-existing forecasts inside the same transaction — never from a
+caller's local list. Replays of a complete source are duplicates; replays of
+a pending source RESUME and create exactly the missing rest.
 
 Attribution (REVIEW-C3 M5): the claim row records ``analyst_id`` — the author
 of the source artifact, resolved as the analyst of the last non-ops step of
@@ -76,9 +92,11 @@ app lifespan calls ``register()``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
@@ -508,6 +526,38 @@ async def _resolve_analyst(run_id: str | None) -> str | None:
 
 # ---- source processing (idempotent) ------------------------------------------------
 
+def _deterministic_forecast_id(extraction_id: str, security_id: str) -> str:
+    """Pre-generated forecast id for one candidate slot: a pure function of
+    the item's identity, so every claim/retry of the same slot produces the
+    SAME id and create_forecast becomes safely replayable (the forecasts
+    primary key is the replay arbiter). 12 hex chars, the _new_id() shape."""
+    return hashlib.sha256(f"{extraction_id}|{security_id}".encode("utf-8")).hexdigest()[:12]
+
+
+def _owns_forecast(row: dict[str, Any], sid: str, frozen_made_at: str) -> bool:
+    """Does the forecasts row sitting under our deterministic id belong to
+    THIS extraction slot? A genuine concurrent-replayer creation of the same
+    slot carries exactly the claim row's frozen made_at and this candidate's
+    security (NULL only after a security delete). Anything else means the
+    48-bit id collided with an UNRELATED forecast — counting that as "ours"
+    would misattribute somebody else's call (R2 P1-3)."""
+    return row["made_at"] == frozen_made_at and row["security_id"] in (sid, None)
+
+
+def _collision_error(fid: str, extraction_id: str, sid: str,
+                     existing: dict[str, Any] | None = None) -> ValueError:
+    detail = ""
+    if existing is not None:
+        detail = (f" (colliding forecast: security {existing['security_id']!r}, "
+                  f"made_at {existing['made_at']})")
+    return ValueError(
+        f"deterministic forecast id collision: {fid} for extraction {extraction_id} "
+        f"candidate {sid} already belongs to an unrelated forecast{detail}; "
+        "failing loud by design (48-bit ids make true collisions vanishingly rare) — "
+        "inspect the colliding rows before replaying this source"
+    )
+
+
 async def process_source(
     source_ref: str,
     source_kind: str,
@@ -518,78 +568,121 @@ async def process_source(
     analyst_id: str | None = None,
 ) -> dict[str, Any]:
     """Extract + record forecasts from one source text, exactly once —
-    restart-safe (REVIEW-C3 M2 state machine).
+    restart-safe (REVIEW-C3 M2 state machine, hardened by the 0033 audit).
 
     The claim INSERT on forecast_extractions.source_ref is still the
-    source-level idempotency arbiter, but the claim now carries a state:
-    it is born 'pending' and flipped to 'complete' only after every candidate
-    has been decided. A replay of a 'complete' source is a duplicate (skips);
-    a replay of a 'pending' source RESUMES it — each candidate is claimed
-    per-security in forecast_extraction_items (the INSERT on the primary key
-    is the per-candidate arbiter), its forecast_id back-filled right after
-    create_forecast() succeeds, so the resume skips what already exists and
-    creates exactly the missing rest. A crash landing in the one-statement
-    window between create and back-fill leaves the item claimed-but-NULL:
-    resume then SKIPS it (in doubt — never risks a duplicate) and reports it
-    in ``detail``; the surgical operator path is to check the forecasts
-    table, DELETE that one item row, set the claim back to 'pending' and
-    replay. Empty text does NOT claim — the source stays retryable once its
-    report exists. made_at defaults inside create_forecast to now: extraction
-    time IS knowledge time. ``analyst_id`` records the source artifact's
-    author for outcome attribution (M5); None = unknown, nothing flows back.
+    source-level idempotency arbiter, and the claim row now binds the key to
+    its CONTENT and its KNOWLEDGE TIME: ``text_sha256`` is persisted at claim
+    (a replay carrying different text under the same source_ref raises a
+    readable error instead of resuming into a mixed extraction) and
+    ``made_at`` is frozen at claim (explicit param or claim-time now) so
+    every candidate — first run or crash-resume — records the same knowledge
+    time. Candidates are claimed per-security in forecast_extraction_items
+    WITH a pre-generated deterministic forecast id; create_forecast() is
+    called with that id, so the crash window between claim and create is
+    replayable: a resume that finds the item but no forecast row retries the
+    create with the same id, and one that finds both counts it AFTER
+    verifying ownership (frozen made_at + security) — an id that turns out to
+    belong to an unrelated forecast (48-bit collision) releases the claim and
+    raises instead of misattributing (R2 P1-3). Items with a NULL forecast_id
+    can only be pre-0033 legacy claims — those still fail closed (skipped,
+    reported in ``detail``). Validation-refused candidates release their
+    claim row (a refusal is not doubt). The finalize seal is conditional
+    (R2 P1-2): pending → complete only when every claimed item's forecast
+    exists, with ``forecast_ids``/``n_forecasts`` aggregated from the item
+    table in the same transaction; while a concurrent processor still owns an
+    in-flight candidate this run returns status='pending' and the owner (or
+    the next replay) seals. Empty text does NOT claim — the source stays
+    retryable once its report exists. ``analyst_id`` records the source
+    artifact's author for outcome attribution (M5); None = unknown, nothing
+    flows back.
     """
     source_ref = (source_ref or "").strip()
     if not source_ref:
         raise ValueError("process_source needs a source_ref")
     if not (text or "").strip():
         return {"source_ref": source_ref, "status": "empty", "created": []}
+    text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    frozen_made_at = forecasts._norm_ts(made_at, "made_at") if made_at else bus.now_iso()
 
     now = bus.now_iso()
     claimed = await db.execute(
         "INSERT INTO forecast_extractions (id, source_ref, source_kind, status, analyst_id, "
-        "created_at, updated_at) VALUES (?,?,?,'pending',?,?,?) "
+        "text_sha256, made_at, created_at, updated_at) VALUES (?,?,?,'pending',?,?,?,?,?) "
         "ON CONFLICT(source_ref) DO NOTHING",
-        (_new_id(), source_ref, source_kind, analyst_id, now, now),
+        (_new_id(), source_ref, source_kind, analyst_id, text_sha256, frozen_made_at, now, now),
     )
     row = await db.query_one(
-        "SELECT id, status FROM forecast_extractions WHERE source_ref = ?", (source_ref,))
+        "SELECT id, status, text_sha256, made_at FROM forecast_extractions "
+        "WHERE source_ref = ?", (source_ref,))
     if not claimed:
+        if row is not None and row["text_sha256"] and row["text_sha256"] != text_sha256:
+            raise ValueError(
+                f"source_ref {source_ref!r} is already claimed for different content "
+                f"(text_sha256 {row['text_sha256'][:12]}… != {text_sha256[:12]}…); "
+                "one source_ref binds one text — use a new source_ref for new content"
+            )
         if row is None or row["status"] != "pending":
             return {"source_ref": source_ref, "status": "duplicate", "created": []}
         log.info("resuming unfinished extraction for %s", source_ref)
+        # the FROZEN knowledge time wins over whatever this resume was passed
+        if row["made_at"]:
+            frozen_made_at = row["made_at"]
     extraction_id = row["id"]
 
     stats: dict[str, Any] = {}
     candidates = await extract_candidates(text, stats=stats)
-    created: list[str] = []
     problems: list[str] = []
     if candidates:
         anchor = await _resolve_thesis(thesis_id)
         for cand in candidates:
             sid = cand["security_id"]
+            fid = _deterministic_forecast_id(extraction_id, sid)
             item = await db.query_one(
                 "SELECT forecast_id FROM forecast_extraction_items "
                 "WHERE extraction_id = ? AND security_id = ?", (extraction_id, sid))
             if item is not None:
-                if item["forecast_id"]:
-                    created.append(item["forecast_id"])  # done before the crash
-                else:
+                if not item["forecast_id"]:
+                    # pre-0033 legacy claim (new claims always carry an id):
+                    # unknowable whether it was created — keep failing closed
                     problems.append(
-                        f"{sid}: in doubt (claimed before a crash; check forecasts, "
-                        "DELETE the item row and re-flip to pending to retry)")
+                        f"{sid}: in doubt (legacy pre-0033 claim without an id; check "
+                        "forecasts, DELETE the item row and re-flip to pending to retry)")
                     log.warning("extract %s: candidate %s in doubt, skipped", source_ref, sid)
-                continue
-            item_now = bus.now_iso()
-            item_claimed = await db.execute(
-                "INSERT INTO forecast_extraction_items (extraction_id, security_id, "
-                "created_at, updated_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(extraction_id, security_id) DO NOTHING",
-                (extraction_id, sid, item_now, item_now),
-            )
-            if not item_claimed:
-                continue  # a concurrent processor owns this candidate
+                    continue
+                fid = item["forecast_id"]
+                existing = await db.query_one("SELECT * FROM forecasts WHERE id = ?", (fid,))
+                if existing is not None:
+                    if not _owns_forecast(existing, sid, frozen_made_at):
+                        # poisoned item: it points at an unrelated forecast —
+                        # release it so nothing misattributes, then fail loud
+                        await db.execute(
+                            "DELETE FROM forecast_extraction_items "
+                            "WHERE extraction_id = ? AND security_id = ?",
+                            (extraction_id, sid))
+                        raise _collision_error(fid, extraction_id, sid, existing)
+                    continue  # created before a crash — finalize counts it from the items
+                # claimed but never created: the deterministic id makes the
+                # retry safe (the forecasts PK arbitrates a concurrent winner)
+            else:
+                item_now = bus.now_iso()
+                try:
+                    item_claimed = await db.execute(
+                        "INSERT INTO forecast_extraction_items (extraction_id, security_id, "
+                        "forecast_id, created_at, updated_at) VALUES (?,?,?,?,?) "
+                        "ON CONFLICT(extraction_id, security_id) DO NOTHING",
+                        (extraction_id, sid, fid, item_now, item_now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # ON CONFLICT covers only (extraction_id, security_id); a hit
+                    # on idx_extraction_items_forecast means our deterministic id
+                    # is already owned by ANOTHER extraction's item (cross-
+                    # extraction 48-bit collision) — fail loud, claim nothing
+                    raise _collision_error(fid, extraction_id, sid) from exc
+                if not item_claimed:
+                    continue  # a concurrent processor owns this candidate
             try:
-                fc = await forecasts.create_forecast({
+                await forecasts.create_forecast({
                     "thesis_id": anchor,
                     "security_id": sid,
                     "claim": cand["claim"],
@@ -597,40 +690,105 @@ async def process_source(
                     "conviction": cand["conviction"],
                     "horizon_days": cand["horizon_days"],
                     "settlement_rule": dict(DEFAULT_RULE),
-                    **({"made_at": made_at} if made_at else {}),
-                })
-            except forecasts.ForecastError as exc:  # one bad candidate must not stop the rest
+                    "made_at": frozen_made_at,
+                }, forecast_id=fid)
+            except forecasts.ForecastError as exc:
+                existing = await db.query_one("SELECT * FROM forecasts WHERE id = ?", (fid,))
+                if existing is not None:
+                    if _owns_forecast(existing, sid, frozen_made_at):
+                        continue  # a concurrent replayer created it first — that IS success
+                    # the create hit the forecasts PK on an UNRELATED row: a
+                    # 48-bit collision, not a concurrent win. Release our item
+                    # claim (it must never misattribute the foreign forecast)
+                    # and fail loud (R2 P1-3).
+                    await db.execute(
+                        "DELETE FROM forecast_extraction_items "
+                        "WHERE extraction_id = ? AND security_id = ?",
+                        (extraction_id, sid))
+                    raise _collision_error(fid, extraction_id, sid, existing) from exc
+                # one bad candidate must not stop the rest; release the claim:
+                # a deterministic refusal is not doubt, and a later resume may
+                # legitimately re-evaluate it
                 problems.append(f"{sid}: {exc}")
                 log.warning("extract %s: candidate %s refused: %s", source_ref, sid, exc)
-                # release the claim: a deterministic refusal is not doubt, and a
-                # later resume may legitimately re-evaluate it
                 await db.execute(
                     "DELETE FROM forecast_extraction_items WHERE extraction_id = ? "
-                    "AND security_id = ? AND forecast_id IS NULL", (extraction_id, sid))
-                continue
-            await db.execute(
-                "UPDATE forecast_extraction_items SET forecast_id = ?, updated_at = ? "
-                "WHERE extraction_id = ? AND security_id = ?",
-                (fc["id"], bus.now_iso(), extraction_id, sid),
-            )
-            created.append(fc["id"])
+                    "AND security_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM forecasts f WHERE f.id = forecast_extraction_items.forecast_id)",
+                    (extraction_id, sid))
 
     for name in stats.get("ambiguous_names", []):
         problems.append(f"ambiguous name refused: {name}")
-    await db.execute(
-        "UPDATE forecast_extractions SET n_candidates = ?, n_forecasts = ?, forecast_ids = ?, "
-        "detail = ?, status = 'complete', updated_at = ? WHERE source_ref = ?",
-        (len(candidates), len(created), json.dumps(created), "; ".join(problems)[:1000],
-         bus.now_iso(), source_ref),
-    )
-    if created:
-        await bus.emit("forecast.extracted", "extraction", source_ref, {
-            "source_kind": source_kind, "n_candidates": len(candidates),
-            "n_forecasts": len(created), "forecast_ids": created,
-        })
+    # finalize from the DATABASE: what this source produced = its item rows
+    # whose forecasts actually exist (includes work done by concurrent or
+    # crashed-then-resumed processors, never a caller-local view). The seal is
+    # a CONDITIONAL CLAIM (R2 P1-2): pending → complete fires only while every
+    # claimed item's forecast actually exists — a candidate still in flight
+    # under a concurrent processor (its item claimed, its forecast not yet
+    # created) blocks the seal, so a crash of that processor can never be
+    # entombed inside a 'complete' claim that replays as 'duplicate'. The
+    # aggregate and the seal share one transaction, so the stored forecast_ids
+    # are exactly the state the seal condition certified. Legacy NULL items
+    # (pre-0033 in-doubt) do not block — they are reported in detail, as
+    # before.
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            "SELECT i.forecast_id FROM forecast_extraction_items i "
+            "JOIN forecasts f ON f.id = i.forecast_id "
+            "WHERE i.extraction_id = ? ORDER BY i.created_at, i.security_id",
+            (extraction_id,),
+        )
+        created = [r["forecast_id"] for r in await cur.fetchall()]
+        await cur.close()
+        cur = await conn.execute(
+            "UPDATE forecast_extractions SET n_candidates = ?, n_forecasts = ?, "
+            "forecast_ids = ?, detail = ?, text_sha256 = COALESCE(text_sha256, ?), "
+            "status = 'complete', updated_at = ? "
+            "WHERE source_ref = ? AND status = 'pending' AND NOT EXISTS ("
+            "SELECT 1 FROM forecast_extraction_items i WHERE i.extraction_id = ? "
+            "AND i.forecast_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM forecasts f WHERE f.id = i.forecast_id))",
+            (len(candidates), len(created), json.dumps(created), "; ".join(problems)[:1000],
+             text_sha256, bus.now_iso(), source_ref, extraction_id),
+        )
+        sealed = cur.rowcount
+        await cur.close()
+    if sealed:
+        if created:
+            await bus.emit("forecast.extracted", "extraction", source_ref, {
+                "source_kind": source_kind, "n_candidates": len(candidates),
+                "n_forecasts": len(created), "forecast_ids": created,
+            })
+        return {
+            "source_ref": source_ref, "status": "processed",
+            "n_candidates": len(candidates), "created": created, "problems": problems,
+        }
+    latest = await db.query_one(
+        "SELECT status FROM forecast_extractions WHERE source_ref = ?", (source_ref,))
+    if latest is not None and latest["status"] == "complete":
+        # a concurrent processor sealed (and emitted for) this source first
+        return {
+            "source_ref": source_ref, "status": "processed",
+            "n_candidates": len(candidates), "created": created, "problems": problems,
+        }
+    # candidates claimed by a concurrent processor are still in flight: the
+    # source stays 'pending' — its owner (or the next replay) finishes and
+    # seals it; nothing is lost, nothing is entombed
+    unfinished = [
+        r["security_id"] for r in await db.query(
+            "SELECT security_id FROM forecast_extraction_items i "
+            "WHERE i.extraction_id = ? AND i.forecast_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM forecasts f WHERE f.id = i.forecast_id) "
+            "ORDER BY security_id",
+            (extraction_id,),
+        )
+    ]
+    log.info("extract %s: seal deferred, in-flight candidates %s", source_ref, unfinished)
     return {
-        "source_ref": source_ref, "status": "processed",
-        "n_candidates": len(candidates), "created": created, "problems": problems,
+        "source_ref": source_ref, "status": "pending",
+        "n_candidates": len(candidates), "created": created,
+        "problems": problems + [f"in flight under a concurrent processor: {s}"
+                                for s in unfinished],
     }
 
 

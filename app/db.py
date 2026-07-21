@@ -388,6 +388,99 @@ async def _skip_add_column(c: aiosqlite.Connection, stmt: str) -> bool:
     return True
 
 
+async def _recover_completed_tasks_rebuild(
+    c: aiosqlite.Connection,
+    migration_name: str,
+    statements: list[str],
+) -> bool:
+    """Recover a lost ledger row for the historical 0028 table rebuild.
+
+    0028 is the one intentionally non-additive migration in the chain: SQLite
+    required rebuilding ``tasks`` to widen its status CHECK. Re-running that
+    rebuild against a later schema would silently discard columns added by
+    0039--0043 (and their data). When the current table already proves that
+    0028's complete base definition is present, replay only its idempotent
+    indexes and let ``migrate`` restore the ledger row. A partial/drifted
+    overcommitted schema fails closed instead of falling through to DROP.
+    """
+    if migration_name != "0028_task_overcommitted.sql":
+        return False
+
+    expected_defs: dict[str, str] | None = None
+    for stmt in statements:
+        body = _strip_leading_comments(stmt)
+        if re.match(
+            r"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?tasks_rebuild_0028\b",
+            body,
+            re.IGNORECASE,
+        ):
+            expected_defs = _table_column_defs(body)
+            break
+    if expected_defs is None:
+        raise MigrationRecoveryError(
+            "0028_task_overcommitted.sql no longer contains its expected rebuild table"
+        )
+
+    cur = await c.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if row is None or not row[0]:
+        return False
+    current_defs = _table_column_defs(str(row[0]))
+    if current_defs is None:
+        return False
+
+    expected_status = expected_defs.get("status")
+    current_status = current_defs.get("status")
+    if expected_status is None or current_status is None:
+        return False
+    expected_values = set(re.findall(r"'((?:[^']|'')*)'", expected_status))
+    current_values = set(re.findall(r"'((?:[^']|'')*)'", current_status))
+    if not expected_values.issubset(current_values):
+        if "overcommitted" in current_values:
+            raise MigrationRecoveryError(
+                "tasks.status contains overcommitted but does not preserve the full "
+                "0028 status contract; refusing the destructive rebuild replay"
+            )
+        return False  # normal first application: 0001's CHECK lacks overcommitted
+    if _decl_parts(expected_status) != _decl_parts(current_status):
+        raise MigrationRecoveryError(
+            "tasks.status type/null/default drifted from 0028; refusing the "
+            "destructive rebuild replay"
+        )
+
+    mismatched = [
+        name
+        for name, expected in expected_defs.items()
+        if name != "status"
+        and (
+            name not in current_defs
+            or _norm_def(current_defs[name]) != _norm_def(expected)
+        )
+    ]
+    if mismatched:
+        raise MigrationRecoveryError(
+            "tasks already carries the 0028 status contract but its base columns "
+            f"drifted ({', '.join(sorted(mismatched))}); refusing the destructive "
+            "rebuild replay"
+        )
+
+    # A pre-atomic crash could have landed the table rename but missed one of
+    # the trailing indexes. Re-run only those naturally idempotent statements.
+    for stmt in statements:
+        body = _strip_leading_comments(stmt)
+        if re.match(r"^CREATE\s+(?:UNIQUE\s+)?INDEX\b", body, re.IGNORECASE):
+            await c.execute(stmt)
+    log.warning(
+        "migration %s: tasks already proves the completed rebuild; preserving "
+        "later columns and restoring only indexes + ledger",
+        migration_name,
+    )
+    return True
+
+
 def _migrations_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "migrations"
 
@@ -408,7 +501,11 @@ async def migrate(c: aiosqlite.Connection) -> None:
         # on "cannot start a transaction within a transaction" (REVIEW-B1 H1)
         await c.execute("BEGIN")
         try:
-            for stmt in _split_statements(path.read_text(encoding="utf-8")):
+            statements = _split_statements(path.read_text(encoding="utf-8"))
+            recovered_rebuild = await _recover_completed_tasks_rebuild(
+                c, path.name, statements,
+            )
+            for stmt in [] if recovered_rebuild else statements:
                 if await _skip_add_column(c, stmt):
                     log.warning(
                         "migration %s: column already exists, skipping %r "

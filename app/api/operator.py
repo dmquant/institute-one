@@ -403,3 +403,141 @@ async def retire_recipe(recipe_id: int):
     if row is None:
         raise HTTPException(404, f"unknown recipe {recipe_id}")
     raise HTTPException(409, f"recipe {recipe_id} is {row['status']!r}; only active recipes retire")
+
+
+# ---- self-improvement chain (M8-008) ----------------------------------------
+# observations → proposals → human decision → effect measurement + parameter
+# history (migrations/0026; domain logic in app/institute/operator.py).
+# Proposals APPLY only through the approve endpoint below — the same §8.2
+# invariant as dispositions: web UI only, never vault frontmatter, never MCP
+# (app/mcp.py exposes no operator write tools). The observe / generate /
+# measure sweeps are POST endpoints; scheduler mounting is a follow-up card
+# (scheduler.py is outside M8-008's file boundary).
+
+@router.get("/observations")
+async def list_observations(
+    kind: Literal["action_recurrence", "recipe_performance", "router_quality"] | None = None,
+    subject: str | None = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    rows = await operator.list_observations(kind, subject, limit)
+    return {"observations": rows, "count": len(rows)}
+
+
+@router.post("/observe")
+async def run_observe(window_days: int = Query(operator.OBSERVE_WINDOW_DAYS, ge=1, le=90)):
+    """Run the observation sweep now (durable daily snapshots; same-day
+    re-runs refresh in place)."""
+    return await operator.observe_operator(window_days)
+
+
+class ProposalDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str = Field("", max_length=1000)
+
+
+@router.get("/proposals")
+async def list_proposals(
+    status: Literal["proposed", "approved", "rejected"] | None = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    rows = await operator.list_proposals(status, limit)
+    return {"proposals": rows, "count": len(rows)}
+
+
+@router.post("/proposals/generate")
+async def generate_proposals(
+    window_days: int = Query(operator.OBSERVE_WINDOW_DAYS, ge=1, le=90),
+):
+    """Derive improvement proposals from the latest observations (zero model
+    calls, nothing applied; each proposal opens an inbox card)."""
+    return await operator.generate_proposals(window_days)
+
+
+@router.post("/proposals/{proposal_id}/approve")
+async def approve_proposal(proposal_id: int, body: ProposalDecision | None = None):
+    """THE human gate for the self-improvement chain (proposal §8.2): a
+    proposal applies ONLY here — an explicit human click in the web UI. The
+    claim is conditional (double-decide loses), the apply runs through the
+    same idempotent/conditional primitives a human would use, and the effect
+    baseline freezes for later measurement."""
+    try:
+        return await operator.approve_proposal(proposal_id, (body.note if body else "") or "")
+    except ValueError as exc:
+        detail = str(exc)
+        raise HTTPException(404 if "unknown proposal" in detail else 409, detail)
+
+
+@router.post("/proposals/{proposal_id}/reject")
+async def reject_proposal(proposal_id: int, body: ProposalDecision | None = None):
+    """Human rejection: nothing applies, the inbox card is dismissed; the
+    change may be re-proposed by a later sweep (live-only dedupe)."""
+    try:
+        return await operator.reject_proposal(proposal_id, (body.note if body else "") or "")
+    except ValueError as exc:
+        detail = str(exc)
+        raise HTTPException(404 if "unknown proposal" in detail else 409, detail)
+
+
+@router.get("/effects")
+async def list_effects(
+    subject_kind: Literal["recipe", "parameter"] | None = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    rows = await operator.list_effects(subject_kind, limit)
+    return {"effects": rows, "count": len(rows)}
+
+
+@router.post("/effects/measure")
+async def measure_effects():
+    """Complete due effect rows (outcome + deltas); each row measures once
+    (conditional claim on outcome IS NULL)."""
+    return await operator.measure_effects()
+
+
+class ParameterPut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: Any
+
+
+@router.get("/parameters")
+async def get_parameters():
+    return {"parameters": await operator.get_parameters()}
+
+
+@router.put("/parameters/{key}")
+async def put_parameter(key: str, body: ParameterPut):
+    """Direct human parameter change (whitelisted keys only). Appends the
+    parameter_history row and freezes an effect baseline; the admin_state
+    write is a byte-CAS, so a concurrent change is a 409, not a lost update."""
+    try:
+        return await operator.set_parameter(key, body.value, changed_by="api")
+    except ValueError as exc:
+        detail = str(exc)
+        if "unknown parameter" in detail:
+            raise HTTPException(404, detail)
+        if "concurrently" in detail:
+            raise HTTPException(409, detail)
+        raise HTTPException(422, detail)
+
+
+@router.get("/parameter-history")
+async def parameter_history(
+    key: str | None = None, limit: int = Query(200, ge=1, le=1000),
+):
+    rows = await operator.list_parameter_history(key, limit)
+    return {"history": rows, "count": len(rows)}
+
+
+@router.post("/parameter-history/{history_id}/rollback")
+async def rollback_parameter(history_id: int):
+    """Revert one parameter change: conditional claims on the history row and
+    a byte-CAS on the live value (a superseded change refuses — roll back the
+    newer one first). The revert is itself a new history row."""
+    try:
+        return await operator.rollback_parameter(history_id)
+    except ValueError as exc:
+        detail = str(exc)
+        raise HTTPException(404 if "unknown parameter history" in detail else 409, detail)

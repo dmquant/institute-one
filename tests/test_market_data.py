@@ -161,6 +161,54 @@ async def test_pit_bare_date_as_of_and_date_range():
     assert [b["close"] for b in bars] == [2.0, 3.0]
 
 
+async def test_get_last_bar_pit_is_the_full_scan_tail_without_the_scan():
+    """loop-fix P8c: the single-row read must answer EXACTLY like
+    ``get_bars_pit(...)[-1]`` under every PIT rule — latest knowledge,
+    historical as_of, the anti-look-ahead fallback to an older bar_date when
+    every version of the newest bar is younger than as_of, and the end
+    clamp — while fetching one row instead of the whole history."""
+    await _mk_security("NVDA.US", market="US", name_en="NVIDIA")
+    await market_data.upsert_bar({
+        "security_id": "NVDA.US", "bar_date": "2026-06-28",
+        "open": 9.0, "high": 9.0, "low": 9.0, "close": 9.0,
+        "as_known_at": "2026-06-28T21:00:00+00:00",
+    })
+    await market_data.upsert_bar({
+        "security_id": "NVDA.US", "bar_date": "2026-06-30",
+        "open": 10.5, "high": 10.5, "low": 10.5, "close": 10.5,
+        "as_known_at": "2026-07-01T08:00:00+00:00",
+    })
+    await market_data.upsert_bar({  # correction, later knowledge
+        "security_id": "NVDA.US", "bar_date": "2026-06-30",
+        "open": 10.8, "high": 10.8, "low": 10.8, "close": 10.8,
+        "as_known_at": "2026-07-03T08:00:00+00:00",
+    })
+
+    cases = [
+        {},                                                # latest knowledge
+        {"as_of": "2026-07-02T00:00:00+00:00"},            # between publish and correction
+        {"as_of": "2026-06-30T23:59:59+00:00"},            # newest bar not yet known ->
+                                                           # falls back to 06-28 (no look-ahead)
+        {"end": "2026-06-29"},                             # end clamp
+        {"as_of": "2026-06-27T00:00:00+00:00"},            # nothing known at all
+    ]
+    for kw in cases:
+        as_of = kw.get("as_of")
+        full = await market_data.get_bars_pit("NVDA.US", as_of, end=kw.get("end"))
+        last = await market_data.get_last_bar_pit("NVDA.US", as_of, end=kw.get("end"))
+        assert last == (full[-1] if full else None), kw
+
+    # spot-check the two semantic pillars explicitly
+    assert (await market_data.get_last_bar_pit("NVDA.US"))["close"] == 10.8
+    fallback = await market_data.get_last_bar_pit(
+        "NVDA.US", "2026-06-30T23:59:59+00:00")
+    assert (fallback["bar_date"], fallback["close"]) == ("2026-06-28", 9.0)
+    assert await market_data.get_last_bar_pit("NVDA.US", "2026-06-27T00:00:00+00:00") is None
+    assert await market_data.get_last_bar_pit("GHOST.US") is None
+    with pytest.raises(market_data.MarketDataError, match="freq"):
+        await market_data.get_last_bar_pit("NVDA.US", freq="7m")
+
+
 async def test_exact_replay_is_noop_and_same_key_different_facts_rejected():
     # version rows are IMMUTABLE: an exact-payload replay is a legal idempotent
     # no-op; the same version key with different facts is a conflict and the

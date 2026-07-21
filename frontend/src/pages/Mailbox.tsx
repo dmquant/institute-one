@@ -1,15 +1,36 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { createThread, listAnalysts, listThreads } from "../api";
+import { MailThreadDetail, createThread, getThread, listAnalysts, listThreads } from "../api";
 import { useSSE } from "../useSSE";
 import { Empty, ErrorNote, Loading, PageHead, StatusBadge, ago, useLoad } from "../ui";
+
+type ThreadRow = Awaited<ReturnType<typeof listThreads>>[number] & {
+  unanswered: boolean;
+};
+
+function hasUnansweredOperatorMessage(thread: MailThreadDetail): boolean {
+  for (let i = thread.messages.length - 1; i >= 0; i -= 1) {
+    const message = thread.messages[i];
+    if (message.kind !== "dispatch") return message.author === "operator";
+  }
+  return false;
+}
+
+async function listThreadRows(status?: string): Promise<ThreadRow[]> {
+  const rows = await listThreads(status, 100);
+  const details = await Promise.all(rows.map((row) => getThread(row.id)));
+  return rows.map((row, i) => ({
+    ...row,
+    unanswered: hasUnansweredOperatorMessage(details[i]),
+  }));
+}
 
 export default function Mailbox() {
   const navigate = useNavigate();
   const { lastEvent } = useSSE({ types: ["mailbox"], max: 1 });
   const [statusFilter, setStatusFilter] = useState("");
   const threads = useLoad(
-    () => listThreads(statusFilter || undefined, 100),
+    () => listThreadRows(statusFilter || undefined),
     [statusFilter, lastEvent?.id ?? 0],
     20000,
   );
@@ -105,7 +126,14 @@ export default function Mailbox() {
             {(threads.data ?? []).map((t) => (
               <tr key={t.id}>
                 <td>
-                  <Link to={`/mailbox/${t.id}`}>{t.subject}</Link>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <Link to={`/mailbox/${t.id}`}>{t.subject}</Link>
+                    {t.unanswered && (
+                      <span className="badge st-pending" title="最后一条对话消息来自操作员">
+                        未回复
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td>{analystName(t.analyst_id)}</td>
                 <td>

@@ -25,6 +25,10 @@ for _flag in ("CLAUDE", "CODEX", "GEMINI", "OPENCODE", "OLLAMA", "AGY"):
 os.environ["INSTITUTE_ENABLE_ECHO"] = "true"
 os.environ["INSTITUTE_DEFAULT_HAND"] = "echo"
 os.environ["INSTITUTE_RESEARCH_HANDS"] = "echo"
+# pin explicitly: pydantic-settings also reads the repo .env, so an operator
+# flipping INSTITUTE_ENABLE_VECTORS=true there must not leak into tests
+# (vector suites opt in per-test via monkeypatch)
+os.environ["INSTITUTE_ENABLE_VECTORS"] = "false"
 
 from app import config  # noqa: E402
 
@@ -42,6 +46,7 @@ from app.institute import archive as archive_mod  # noqa: E402
 from app.institute import bilingual as bilingual_mod  # noqa: E402
 from app.institute import mailbox as mailbox_mod  # noqa: E402
 from app.institute import research as research_mod  # noqa: E402
+from app.institute import research_tree as research_tree_mod  # noqa: E402
 from app.institute import whiteboard as whiteboard_mod  # noqa: E402
 from app.institute import workflows as workflows_mod  # noqa: E402
 from app.router import executor  # noqa: E402
@@ -71,6 +76,7 @@ async def app_runtime():
     executor._hand_locks.clear()
     executor._running.clear()
     research_mod._claim_lock = asyncio.Lock()
+    research_tree_mod._announce_lock = asyncio.Lock()
     whiteboard_mod._active_cards.clear()
     mailbox_mod._inflight.clear()
     vault_writer_mod.reset_writer()

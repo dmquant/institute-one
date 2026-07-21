@@ -1,9 +1,12 @@
-"""Executor core: submit, artifacts, cancel, orphan recovery, fallback chain."""
+"""Executor core: submit, artifacts, cancel, orphan recovery, fallback chain,
+per-hand queue-depth cap, lock-order starvation."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 from app import bus, db
+from app.config import get_settings
 from app.hands import registry as registry_mod
 from app.hands.base import Hand, HandResult, RateLimitInfo
 from app.hands.registry import get_registry
@@ -59,6 +62,75 @@ async def test_recover_orphans_marks_running_row_failed():
     task = await executor.get_task("orphan0000001")
     assert task.status == "failed"
     assert task.error == "orphaned by restart"
+
+
+async def test_prepare_respawn_atomically_binds_exactly_one_canonical_child(tmp_path):
+    """R5: the executor owns retry row construction. Source claim, reciprocal
+    immutable binding, and born-queued child insert commit in one transaction;
+    a second prepare converges on the same child across terminal status."""
+    now = bus.now_iso()
+    await db.execute(
+        "INSERT INTO tasks "
+        "(id, requested_hand, prompt, status, source, workspace_dir, timeout_s, "
+        " fallback_chain, error, created_at, finished_at) "
+        "VALUES ('prepare-src','echo','retry me','rate_limited','test',?,60,"
+        " '[\"echo\"]','quota',?,?)",
+        (str(tmp_path), now, now),
+    )
+    source = await db.query_one("SELECT * FROM tasks WHERE id='prepare-src'")
+
+    async with db.transaction() as conn:
+        first = await executor.prepare_respawn_from_row(conn, source, max_attempts=5)
+    source = await db.query_one("SELECT * FROM tasks WHERE id='prepare-src'")
+    async with db.transaction() as conn:
+        second = await executor.prepare_respawn_from_row(conn, source, max_attempts=5)
+
+    assert first.created is True
+    assert second.created is False
+    assert second.task_id == first.task_id
+    source = await db.query_one("SELECT * FROM tasks WHERE id='prepare-src'")
+    child = await db.query_one("SELECT * FROM tasks WHERE id=?", (first.task_id,))
+    assert source["revival_task_id"] == child["id"]
+    assert child["revived_from_task_id"] == source["id"]
+    assert child["status"] == "queued"
+    assert source["revival_attempts"] == 1
+    assert len(await db.query(
+        "SELECT id FROM tasks WHERE revived_from_task_id='prepare-src'"
+    )) == 1
+
+
+async def test_recover_orphans_requeues_and_drives_prepared_running_child(tmp_path):
+    """R5: generic running tasks still fail at boot, but a canonical revival
+    child is durable prepared work: running orphan -> queued -> same-id drive."""
+    now = bus.now_iso()
+    await db.execute(
+        "INSERT INTO tasks "
+        "(id, requested_hand, prompt, status, source, workspace_dir, timeout_s, "
+        " fallback_chain, error, created_at, finished_at) "
+        "VALUES ('recover-src','echo','retry me','rate_limited','test',?,60,"
+        " '[\"echo\"]','quota',?,?)",
+        (str(tmp_path), now, now),
+    )
+    source = await db.query_one("SELECT * FROM tasks WHERE id='recover-src'")
+    async with db.transaction() as conn:
+        prepared = await executor.prepare_respawn_from_row(conn, source, max_attempts=5)
+    await db.execute(
+        "UPDATE tasks SET status='running', hand='echo', started_at=? "
+        "WHERE id=? AND status='queued'",
+        (bus.now_iso(), prepared.task_id),
+    )
+
+    assert await executor.recover_orphans() == 1
+    running = list(executor._running.values())
+    if running:
+        await asyncio.gather(*running)
+
+    child = await db.query_one("SELECT * FROM tasks WHERE id=?", (prepared.task_id,))
+    assert child["status"] == "completed"
+    assert child["revived_from_task_id"] == "recover-src"
+    assert len(await db.query(
+        "SELECT id FROM tasks WHERE revived_from_task_id='recover-src'"
+    )) == 1
 
 
 class AlwaysRateLimitedHand(Hand):
@@ -144,3 +216,149 @@ async def test_spawn_persists_fallback_chain_and_lineage_root(tmp_path):
     assert row["status"] == "completed"
     assert json.loads(row["fallback_chain"]) == ["echo"]
     assert row["lineage_root"] == "rootspawn0001"
+
+
+# ---- ROADMAP Phase 2: per-hand queue-depth cap ('overcommitted', 0028) -------
+
+async def _queue_backlog(hand: str, n: int) -> None:
+    """Insert n inert queued rows for the hand — a backlog nobody executes."""
+    for i in range(n):
+        await db.execute(
+            "INSERT INTO tasks (id, requested_hand, prompt, status, source, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (f"backlog-{hand}-{i}", hand, "parked", "queued", "test", bus.now_iso()),
+        )
+
+
+async def test_submit_over_depth_cap_fast_fails_overcommitted(tmp_path, monkeypatch):
+    """Beyond the cap, submit() sheds the task as a born-terminal
+    'overcommitted' row: no hand assignment, no queued/running events,
+    cancel refuses it."""
+    assert get_settings().hand_queue_depth == 8  # documented default
+    monkeypatch.setattr(get_settings(), "hand_queue_depth", 2)
+    await _queue_backlog("echo", 3)              # 3 > 2: over the cap
+
+    task = await executor.submit("echo", "shed me", source="test", workspace=tmp_path)
+    assert task.status == "overcommitted"
+    assert task.hand is None                     # never ran on any hand
+    assert "3 queued" in (task.error or "") and "cap 2" in (task.error or "")
+    row = await db.query_one(
+        "SELECT created_at, finished_at FROM tasks WHERE id = ?", (task.id,)
+    )
+    assert row["finished_at"] == row["created_at"]  # born terminal
+
+    events = await bus.replay(0, types=["task."])
+    types = [e.type for e in events if e.ref_id == task.id]
+    assert types == ["task.overcommitted"]       # never queued, never ran
+
+    # terminal semantics: cancel is a no-op, exactly like other terminal rows
+    assert await executor.cancel(task.id) is False
+
+
+async def test_spawn_over_depth_cap_fast_fails_overcommitted(tmp_path, monkeypatch):
+    """spawn() (fire-and-forget) applies the same admission check and never
+    schedules an asyncio task for a shed row."""
+    monkeypatch.setattr(get_settings(), "hand_queue_depth", 1)
+    await _queue_backlog("echo", 2)              # 2 > 1: over the cap
+
+    task_id = await executor.spawn("echo", "shed me too", source="test", workspace=tmp_path)
+    assert task_id not in executor._running
+    row = await db.query_one("SELECT status, hand, error FROM tasks WHERE id = ?", (task_id,))
+    assert row["status"] == "overcommitted"
+    assert row["hand"] is None
+    assert "cap 1" in row["error"]
+
+
+async def test_submit_at_or_under_depth_cap_runs_normally(tmp_path, monkeypatch):
+    """A backlog of EXACTLY the cap is still admitted (the cap bounds runaway
+    pileups, not normal fan-out bursts), and the count is per-hand — another
+    hand's backlog never sheds this one."""
+    monkeypatch.setattr(get_settings(), "hand_queue_depth", 3)
+    await _queue_backlog("echo", 3)        # 3 > 3 is false: admitted
+    await _queue_backlog("otherhand", 9)   # other hand's backlog is irrelevant
+
+    task = await executor.submit("echo", "still admitted", source="test", workspace=tmp_path)
+    assert task.status == "completed"
+    assert task.hand == "echo"
+
+
+async def test_recover_orphans_ignores_overcommitted_rows(tmp_path, monkeypatch):
+    """'overcommitted' is terminal: the boot orphan sweep (queued/running only)
+    must leave it untouched while the queued backlog rows ARE swept."""
+    monkeypatch.setattr(get_settings(), "hand_queue_depth", 1)
+    await _queue_backlog("echo", 2)
+    task = await executor.submit("echo", "shed", source="test", workspace=tmp_path)
+    assert task.status == "overcommitted"
+
+    n = await executor.recover_orphans()
+    assert n == 2  # only the queued backlog rows were orphan-marked
+
+    after = await executor.get_task(task.id)
+    assert after.status == "overcommitted"
+    assert "orphaned" not in (after.error or "")
+
+
+# ---- LOOP-P1: lock order — hand mutex FIRST, then the global semaphore -------
+
+class BlockingHand(Hand):
+    """Holds its per-hand mutex until released — a stand-in for a long CLI run."""
+
+    name = "slowhand"
+    hand_type = "cli"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None):
+        self.started.set()
+        await self.release.wait()
+        return HandResult(output="slow done", exit_code=0)
+
+
+async def test_backlog_on_busy_hand_does_not_starve_idle_hand(tmp_path, monkeypatch):
+    """Waiters parked behind a busy hand must NOT pin global semaphore slots.
+
+    Regression for the old ``async with _sem(), _hand_lock(...)`` order: with
+    max_concurrent=3, one running slowhand task plus two waiters used to hold
+    all three global slots, so a submit to the idle echo hand hung until the
+    slowhand backlog drained. Correct order (hand lock first) leaves waiters
+    off the semaphore: the echo submit below must complete promptly while
+    slowhand is still blocked.
+    """
+    # pin the width this scenario saturates (conftest nulls _global_sem per
+    # test, so the first _sem() below builds the semaphore from this value)
+    monkeypatch.setattr(get_settings(), "max_concurrent", 3)
+    slow = BlockingHand()
+    get_registry().register(slow)
+
+    ids = [await executor.spawn(
+        "slowhand", "occupy the hand", source="test", workspace=tmp_path, fallback=False,
+    )]
+    await asyncio.wait_for(slow.started.wait(), timeout=5)  # running: holds the hand lock
+    for i in range(2):  # two waiters queue up behind the busy hand
+        ids.append(await executor.spawn(
+            "slowhand", f"wait behind it {i}", source="test", workspace=tmp_path, fallback=False,
+        ))
+    await asyncio.sleep(0.05)  # let both waiters reach their lock await
+
+    try:
+        task = await asyncio.wait_for(
+            executor.submit(
+                "echo", "idle hand must still run", source="test",
+                workspace=tmp_path, fallback=False,
+            ),
+            timeout=4,
+        )
+        assert task.status == "completed"
+        assert task.hand == "echo"
+    finally:
+        slow.release.set()  # drain the slowhand backlog either way
+        for tid in ids:
+            atask = executor._running.get(tid)
+            if atask is not None:
+                await atask
+
+    for tid in ids:  # the parked waiters ran normally once the hand freed up
+        row = await db.query_one("SELECT status FROM tasks WHERE id = ?", (tid,))
+        assert row["status"] == "completed"

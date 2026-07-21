@@ -1,21 +1,18 @@
 """market_thesis_import: provenance schema (card M1-001) + the importer (M1-003).
 
 The first block is schema-level (mirrors the documented bundle contract without
-reading market-thesis-data/). The importer block DOES read the real bundle —
-commercial data kept OUTSIDE the repo and located via the
-INSTITUTE_THESIS_BUNDLE env var (in-repo market-thesis-data/ as legacy
-fallback) — so those two integration tests skip when the bundle is absent.
-The apply tests run on a SELF-CONTAINED subset fixture mirroring documented
-bundle entries and need no real bundle (S4-P0-02: the old fixture derived the
-subset FROM the real bundle, which over-skipped six bundle-independent tests
-under one marker).
+reading market-thesis-data/). The importer block runs BOTH modes on the
+SELF-CONTAINED subset fixture mirroring documented bundle entries — the real
+bundle is commercial data kept OUTSIDE the repo (operators import it via the
+INSTITUTE_THESIS_BUNDLE env var + the CLI) and tests never read it, so nothing
+in this module skips (S4-P0-02 killed the over-broad marker that skipped six
+bundle-independent tests; the skip-cleanup pass then ported the last two
+real-bundle integration tests onto the subset fixture).
 """
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -189,18 +186,10 @@ async def test_items_cascade_with_batch():
 
 # ---- the importer (card M1-003) ------------------------------------------------
 # The real dataset contains commercial data and never enters the repo (card
-# M1-003 contract): it is imported from an EXTERNAL path via the
-# INSTITUTE_THESIS_BUNDLE env var, with the legacy in-repo location
-# market-thesis-data/bundle.json as fallback. ONLY the two integration tests
-# that read the real bundle skip when neither is present; the apply tests use
-# the self-contained subset fixture below (S4-P0-02).
-
-_BUNDLE_ENV = os.environ.get("INSTITUTE_THESIS_BUNDLE", "").strip()
-REAL_BUNDLE = (Path(_BUNDLE_ENV).expanduser() if _BUNDLE_ENV
-               else Path(__file__).resolve().parent.parent / "market-thesis-data" / "bundle.json")
-requires_bundle = pytest.mark.skipif(
-    not REAL_BUNDLE.exists(),
-    reason="thesis bundle not present (set INSTITUTE_THESIS_BUNDLE or provide market-thesis-data/bundle.json)")
+# M1-003 contract): operators import it from an EXTERNAL path via the
+# INSTITUTE_THESIS_BUNDLE env var + the CLI. Tests never read it — every
+# importer test (dry_run and apply alike) runs on the self-contained subset
+# fixture below (S4-P0-02 + the skip-cleanup pass).
 
 DOMAIN_TABLES = ("theses", "thesis_versions", "securities", "security_aliases",
                  "thesis_security_edges", "market_thesis_import_items")
@@ -331,36 +320,44 @@ def subset(tmp_path):
     return path, bundle
 
 
-@requires_bundle
-async def test_dry_run_real_bundle_reports_counts_and_writes_nothing():
-    report = await import_bundle(REAL_BUNDLE, mode="dry_run")
+async def test_dry_run_subset_reports_counts_and_writes_nothing(subset, tmp_path):
+    path, bundle = subset
+    report = await import_bundle(path, mode="dry_run")
     assert (report["mode"], report["status"]) == ("dry_run", "completed")
-    # the manifest counts (roadmap/07-market-thesis-data-kickoff.md)
-    assert report["counts"] == {"lanes": 55, "theses": 74, "stocks": 236,
-                                "edges": 1888, "thesis_stock_edges": 1020}
+    # the counts land straight from the fixture's stats block
+    assert report["counts"] == {"lanes": 2, "theses": 2, "stocks": 10,
+                                "edges": 10, "thesis_stock_edges": 4}
     # what apply WOULD do
-    assert report["actions"]["lanes"]["inserted"] == 55
-    assert report["actions"]["theses"]["inserted"] == 74
-    assert report["actions"]["stocks"]["inserted"] == 236
-    assert report["actions"]["edges"] == {"inserted": 1020, "skipped": 74 + 794, "failed": 0}
+    assert report["actions"]["lanes"]["inserted"] == 2
+    assert report["actions"]["theses"]["inserted"] == 2
+    assert report["actions"]["stocks"]["inserted"] == 10
+    # 4 tracks_stock inserted; 2 belongs_to_lane + 4 lane_contains_stock skipped
+    assert report["actions"]["edges"] == {"inserted": 4, "skipped": 2 + 4, "failed": 0}
     assert report["actions"]["aliases"]["skipped"] == 2  # 中芯国际 + 中远海控
     assert report["edge_kinds"]["tracks_stock"]["handling"] == "thesis_security_edges"
     assert "no schema home" in report["edge_kinds"]["lane_contains_stock"]["handling"]
-    # warnings: alias collisions, context-only markets, all-conflicting directions
+    # warnings: alias collisions, context-only markets
     assert any("中芯国际" in w for w in report["warnings"])
     assert any("Korea" in w for w in report["warnings"])
-    assert any("conflicting" in w for w in report["warnings"])
     # no domain rows, no item rows — only the provenance batch row
     for table in DOMAIN_TABLES:
         assert await _count(table) == 0, table
     row = await db.query_one("SELECT * FROM market_thesis_imports WHERE id=?", (report["import_id"],))
     assert (row["mode"], row["status"], row["idempotency_key"]) == ("dry_run", "completed", None)
-    assert (row["thesis_count"], row["lane_count"], row["stock_count"]) == (74, 55, 236)
-    assert (row["edge_count"], row["thesis_stock_edge_count"]) == (1888, 1020)
-    assert json.loads(row["manifest_json"])["stats"]["thesisCount"] == 74
+    assert (row["thesis_count"], row["lane_count"], row["stock_count"]) == (2, 2, 10)
+    assert (row["edge_count"], row["thesis_stock_edge_count"]) == (10, 4)
+    assert json.loads(row["manifest_json"])["stats"]["thesisCount"] == 2
     # dry-runs repeat freely (idempotency_key stays NULL)
-    again = await import_bundle(REAL_BUNDLE, mode="dry_run")
+    again = await import_bundle(path, mode="dry_run")
     assert again["status"] == "completed"
+    # the all-conflicting warn path (the real bundle's documented shape) fires
+    # once every direction is 'conflicting'
+    for t in bundle["theses"]:
+        t["direction"] = "conflicting"
+    flipped = tmp_path / "all-conflicting.json"
+    flipped.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+    report = await import_bundle(flipped, mode="dry_run")
+    assert any("conflicting" in w for w in report["warnings"])
 
 
 async def test_apply_subset_inserts_every_entity_kind(subset):
@@ -542,19 +539,24 @@ async def test_conflicting_existing_title_fails_closed(subset):
     assert await _count("securities") == 0  # nothing was written
 
 
-@requires_bundle
-async def test_apply_real_bundle_full_counts():
-    """Integration: the full 2.4MB bundle lands with the manifest counts."""
-    report = await import_bundle(REAL_BUNDLE, mode="apply")
+async def test_apply_subset_full_counts(subset):
+    """Aggregate contract (the ported real-bundle integration probe): every
+    entity kind lands with the fixture's stats-block counts, per-market
+    normalization totals included."""
+    path, bundle = subset
+    report = await import_bundle(path, mode="apply")
     assert report["status"] == "completed"
-    assert await _count("theses", "kind='lane'") == 55
-    assert await _count("theses", "kind='thesis'") == 74
-    assert await _count("thesis_versions") == 74
-    assert await _count("securities") == 236
-    assert await _count("thesis_security_edges") == 1020
-    assert await _count("market_thesis_import_items") == 55 + 74 + 236 + 1888
-    assert await _count("securities", "market='CN_A'") == 75 + 5
-    assert await _count("securities", "market='GLOBAL_CONTEXT'") == 3
+    assert await _count("theses", "kind='lane'") == 2
+    assert await _count("theses", "kind='thesis'") == 2
+    assert await _count("thesis_versions") == 2
+    assert await _count("securities") == 10
+    assert await _count("thesis_security_edges") == 4
+    # one item row per bundle record: 2 lanes + 2 theses + 10 stocks + 10 edges
+    assert await _count("market_thesis_import_items") == 2 + 2 + 10 + 10
+    assert await _count("securities", "market='CN_A'") == 3   # 510300/688981/601919
+    assert await _count("securities", "market='HK'") == 3     # 0700/0981/1919
+    assert await _count("securities", "market='US'") == 2     # NVDA/MCHI
+    assert await _count("securities", "market='GLOBAL_CONTEXT'") == 2  # Korea/Japan
     assert report["actions"]["aliases"]["skipped"] == 2
-    # every thesis got a parent lane in the full bundle
-    assert await _count("theses", "kind='thesis' AND parent_id IS NOT NULL") == 74
+    # every thesis got a parent lane
+    assert await _count("theses", "kind='thesis' AND parent_id IS NOT NULL") == 2

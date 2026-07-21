@@ -28,6 +28,7 @@ If ``settings.vault_dir`` is None every method is a silent no-op returning None.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -227,6 +228,12 @@ class VaultWriter:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._root: Path | None = settings.vault_dir.expanduser() if settings.vault_dir else None
+        # Coordinates the disk os.replace -> ledger upsert interval with the
+        # operator's final drift recheck. Without this shared lock, a sweep
+        # could observe new bytes against the old ledger and open a false
+        # conflict card while a perfectly normal writer was paused in that
+        # tiny interval (R5 P3).
+        self._coordination_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -235,6 +242,11 @@ class VaultWriter:
     @property
     def root(self) -> Path | None:
         return self._root
+
+    @property
+    def coordination_lock(self) -> asyncio.Lock:
+        """Writer/sweep critical-section lock for disk + ledger consistency."""
+        return self._coordination_lock
 
     # ---- note composition ------------------------------------------------
 
@@ -296,6 +308,17 @@ class VaultWriter:
         ledger hashes the region, not the file (see module docstring)."""
         if self._root is None:
             return None
+        async with self._coordination_lock:
+            return await self._write_note_locked(
+                relpath, frontmatter, body,
+                artifact_kind=artifact_kind, artifact_id=artifact_id, region=region,
+            )
+
+    async def _write_note_locked(
+        self, relpath: str, frontmatter: dict, body: str, *, artifact_kind: str,
+        artifact_id: str, region: bool,
+    ) -> str:
+        """write_note body; caller holds ``coordination_lock``."""
         rel, target = self._resolve(relpath)
         if region:
             return await self._write_region(

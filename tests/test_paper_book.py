@@ -16,6 +16,7 @@ around the router.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from fastapi import FastAPI
@@ -60,12 +61,13 @@ async def _bar(sid: str, bar_date: str, close: float, *, known: str | None = Non
 
 async def _forecast(
     sid: str, *, direction: str = "long", horizon: int = 365, claim: str = "看多",
+    made: str = MADE,
 ) -> dict:
     return await forecasts.create_forecast({
         "thesis_id": "t-macro", "security_id": sid, "claim": claim,
         "direction": direction, "horizon_days": horizon,
         "settlement_rule": {"type": "absolute_move", "threshold": 0.05},
-        "made_at": MADE,
+        "made_at": made,
     })
 
 
@@ -171,19 +173,287 @@ async def test_opener_cap_and_per_security_dedup():
     assert dups[0]["forecast_id"] in {f1["id"], f2["id"]}
 
 
-async def test_opener_cap_switch_restores_advisory_mode(monkeypatch):
+async def test_opener_cap_cannot_be_disabled(monkeypatch):
+    """The INSTITUTE_PAPER_BOOK_ENFORCE_CAPS escape hatch is GONE: the field
+    no longer exists on Settings, the env var resurrects nothing, and the
+    aggregate cap binds unconditionally (a risk limit that can be switched
+    off is not a limit)."""
+    from app.config import Settings
+
+    assert "paper_book_enforce_caps" not in Settings.model_fields
+    assert not hasattr(get_settings(), "paper_book_enforce_caps")
+    monkeypatch.setenv("INSTITUTE_PAPER_BOOK_ENFORCE_CAPS", "false")  # dead knob
+
     await _mk_thesis()
     for sid in ("ADVA.US", "ADVB.US"):
         await _mk_security(sid)
         await _bar(sid, "2026-06-01", 10.0)
-        await _forecast(sid, claim=f"advisory {sid}")
+        await _forecast(sid, claim=f"hard cap {sid}")
     await _set_cap(1)
-    monkeypatch.setattr(get_settings(), "paper_book_enforce_caps", False)
 
     out = await paper_book.opener_tick()
-    assert out["cap"] == 1 and out["cap_enforced"] is False
+    assert out["cap"] == 1
+    assert "cap_enforced" not in out                 # there is no advisory mode to report
+    assert out["opened"] == 1 and out["rejected_cap"] == 1
+    assert len(await _positions("open")) == 1
+    out = await paper_book.opener_tick()             # book full: nothing more, ever
+    assert out["opened"] == 0 and out["rejected_cap"] == 1
+    assert len(await _positions("open")) == 1
+
+
+async def test_backfill_forecasts_never_enter_the_paper_book():
+    """origin='backfill' rows are accountability records: a backdated made_at
+    would hand the book a historically frozen entry (pure look-ahead), so
+    neither the opener sweep nor the operator open path may touch them."""
+    await _mk_thesis()
+    await _mk_security("BKF.US")
+    await _bar("BKF.US", "2026-06-01", 10.0)
+    fc = await forecasts.create_forecast({
+        "thesis_id": "t-macro", "security_id": "BKF.US", "claim": "回填记录",
+        "direction": "long", "horizon_days": 365, "made_at": MADE,
+        "settlement_rule": {"type": "absolute_move", "threshold": 0.05},
+        "origin": "backfill",
+    })
+
+    out = await paper_book.opener_tick()
+    assert (out["opened"], out["considered"]) == (0, 0)   # pre-filtered out entirely
+    assert await _positions() == []
+    with pytest.raises(paper_book.PaperBookError, match="backfill"):
+        await paper_book.open_forecast_position(fc["id"])
+    assert await _positions() == []
+
+    # a standard forecast on the same security still opens normally
+    std = await _forecast("BKF.US", claim="正常记录")
+    out = await paper_book.opener_tick()
+    assert out["opened"] == 1
+    assert [p["forecast_id"] for p in await _positions("open")] == [std["id"]]
+
+
+# ==== loop-fix P8c: bounded opener work per tick ================================
+
+async def test_opener_candidate_batch_is_bounded(monkeypatch):
+    """P8c-a: one tick considers at most OPENER_BATCH_LIMIT candidates (the
+    5-min tick drains the rest in later batches) — an unbounded backlog can
+    no longer turn one tick into an event-loop-blocking full-table sweep."""
+    assert paper_book.OPENER_BATCH_LIMIT == 50
+    await _mk_thesis()
+    for sid in ("BAT1.US", "BAT2.US", "BAT3.US"):
+        await _mk_security(sid)
+        await _forecast(sid, claim=f"batch {sid}")   # no bars yet: unpriceable
+
+    monkeypatch.setattr(paper_book, "OPENER_BATCH_LIMIT", 2)
+    out = await paper_book.opener_tick()
+    assert out["considered"] == 2                    # bounded, not all 3
+    assert out["skipped_no_price"] == 2
+
+    # progress guarantee under the bound: once candidates become priceable,
+    # successive ticks drain the whole backlog batch by batch
+    for sid in ("BAT1.US", "BAT2.US", "BAT3.US"):
+        await _bar(sid, "2026-06-01", 10.0)
+    assert (await paper_book.opener_tick())["opened"] == 2
+    assert (await paper_book.opener_tick())["opened"] == 1
+    assert len(await _positions("open")) == 3
+
+
+async def test_opener_rotates_past_permanently_unpriceable_head(monkeypatch):
+    """R3: the batch bound must not become head-of-queue starvation. A
+    permanently unpriceable OLD forecast fills the (made_at,id) head; with
+    the fixed front-LIMIT the same batch was re-selected every tick and the
+    priceable NEWER forecast behind it was never considered (it could expire
+    unopened). The keyset cursor rotates: next tick starts after the last
+    considered row and wraps at the tail."""
+    await _mk_thesis()
+    await _mk_security("BLKR.US")                        # never gets a bar
+    blocker = await _forecast("BLKR.US", horizon=730, claim="永久无价的老单",
+                              made="2026-06-01T23:00:00+00:00")
+    await _mk_security("FAST.US")
+    await _bar("FAST.US", "2026-06-02", 10.0)
+    fast = await _forecast("FAST.US", horizon=365, claim="可开仓的新单",
+                           made="2026-06-02T23:00:00+00:00")
+    monkeypatch.setattr(paper_book, "OPENER_BATCH_LIMIT", 1)
+
+    out1 = await paper_book.opener_tick()
+    assert (out1["considered"], out1["opened"], out1["skipped_no_price"]) == (1, 0, 1)
+
+    # THE regression: the old fixed head re-selected the blocker forever;
+    # the cursor must reach FAST.US on the very next tick
+    out2 = await paper_book.opener_tick()
+    assert out2["opened"] == 1
+    assert [p["forecast_id"] for p in await _positions("open")] == [fast["id"]]
+
+    # ...and the rotation WRAPS: the blocker is not permanently skipped either
+    out3 = await paper_book.opener_tick()
+    assert (out3["considered"], out3["skipped_no_price"]) == (1, 1)
+    assert blocker["id"] not in {p["forecast_id"] for p in await _positions()}
+
+    # late data for the blocker is picked up within one rotation
+    await _bar("BLKR.US", "2026-06-01", 10.0)
+    opened_late = 0
+    for _ in range(2):
+        opened_late += (await paper_book.opener_tick())["opened"]
+    assert opened_late == 1
+    assert {p["forecast_id"] for p in await _positions("open")} == {fast["id"], blocker["id"]}
+
+
+async def test_benchmark_first_pin_race_loser_normalizes_to_winner(monkeypatch):
+    """R3: two calls both read 'no base yet'; one wins the pin INSERT. The
+    LOSER must re-read and normalize against the base that actually stuck —
+    unconditionally returning 1.0 would write an inconsistent benchmark NAV
+    for its own work date."""
+    await _mk_thesis()
+    await market_data.upsert_benchmark({"id": "CSI300", "name_zh": "沪深300"})
+    await market_data.upsert_benchmark_mark("CSI300", {"mark_date": "2026-01-01", "value": 4000.0})
+    await market_data.upsert_benchmark_mark("CSI300", {"mark_date": "2026-01-02", "value": 5000.0})
+
+    # both calls see the base row ABSENT (stale first reads, the race window)
+    real_query_one = db.query_one
+    stale = {"n": 0}
+
+    async def stale_base_read(sql, params=()):
+        if "FROM admin_state" in sql and params and params[0] == paper_book.BENCH_BASE_KEY \
+                and stale["n"] < 2:
+            stale["n"] += 1
+            return None
+        return await real_query_one(sql, params)
+
+    monkeypatch.setattr(paper_book.db, "query_one", stale_base_read)
+    winner = await paper_book._benchmark_nav("2026-01-02")   # pins base = 5000
+    loser = await paper_book._benchmark_nav("2026-01-01")    # lost the pin race
+    monkeypatch.undo()
+
+    assert winner == pytest.approx(1.0)                      # the actual pinner
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?",
+                             (paper_book.BENCH_BASE_KEY,))
+    assert json.loads(row["value"])["value"] == pytest.approx(5000.0)
+    # the loser normalizes 4000 against the WINNER's 5000 — never a blind 1.0
+    assert loser == pytest.approx(0.8)
+
+    # steady state agrees with the loser's corrected answer
+    assert await paper_book._benchmark_nav("2026-01-01") == pytest.approx(0.8)
+    assert await paper_book._benchmark_nav("2026-01-02") == pytest.approx(1.0)
+
+
+async def test_opener_entry_single_row_read_keeps_pit_semantics():
+    """P8c-b: the entry read fetches ONE last bar instead of scanning the full
+    history — the B6 semantics must survive: fall back to the last PRIOR bar
+    when the made-day close was published after made_at, and fail closed
+    (never fall back further) when the newest known bar is unusable."""
+    await _mk_thesis()
+
+    # made-day close published AFTER made_at: entry = the prior known bar
+    await _mk_security("PRIOR.US")
+    await _bar("PRIOR.US", "2026-05-29", 8.0)                    # known 05-29 noon
+    await _bar("PRIOR.US", "2026-06-01", 10.0, known="2026-06-02T02:00:00+00:00")
+    await _forecast("PRIOR.US", claim="迟发收盘回退")
+    out = await paper_book.opener_tick()
+    assert out["opened"] == 1
+    pos = (await _positions("open"))[0]
+    assert (pos["entry_date"], pos["entry_price"]) == ("2026-05-29", pytest.approx(8.0))
+
+    # unusable NEWEST bar fails closed — no silent fallback to an older price
+    await _mk_security("ZNEW.US")
+    await _bar("ZNEW.US", "2026-05-29", 8.0)
+    await _bar("ZNEW.US", "2026-06-01", 0.0)                     # newest at made_at, unusable
+    await _forecast("ZNEW.US", claim="最新bar不可用")
+    out = await paper_book.opener_tick()
+    assert out["opened"] == 0
+    assert out["skipped_no_price"] == 1
+
+
+# ==== loop-fix P11def: opened ref_id / benchmark base / per-iteration clock ====
+
+async def test_opened_event_refs_position_id_with_compat_payload():
+    """P11d: paper_book.opened ref_id is the POSITION id (ref_kind said
+    'paper_position' all along, and paper_book.closed already refs the
+    position) — payload gains position_id and keeps forecast_id for any
+    existing payload consumer."""
+    await _mk_thesis()
+    await _mk_security("REF1.US")
+    await _bar("REF1.US", "2026-06-01", 10.0)
+    await _forecast("REF1.US", claim="tick 开仓")
+    assert (await paper_book.opener_tick())["opened"] == 1
+
+    await _mk_security("REF2.US")
+    await _bar("REF2.US", "2026-06-01", 10.0)
+    fc2 = await _forecast("REF2.US", claim="手动开仓")
+    assert (await paper_book.open_forecast_position(fc2["id"])) is not None
+
+    events = await bus.replay(0, types=["paper_book.opened"])
+    assert len(events) == 2                          # both emit sites
+    for e in events:
+        pos = await db.query_one("SELECT * FROM paper_positions WHERE id = ?", (e.ref_id,))
+        assert pos is not None                       # ref_id resolves to the position row
+        assert e.ref_kind == "paper_position"
+        assert e.payload["position_id"] == e.ref_id == pos["id"]
+        assert e.payload["forecast_id"] == pos["forecast_id"]    # compat field kept
+        assert e.ref_id != e.payload["forecast_id"]  # regression: no longer the forecast id
+
+
+async def test_benchmark_base_corruption_fails_closed_never_repins(caplog):
+    """P11e: only a NEVER-PINNED base is pinned on first sight; a corrupt or
+    unusable STORED base returns NULL + log.error and is left in place for
+    the operator — silently re-pinning at today's level would quietly reset
+    the whole benchmark_nav history."""
+    await _mk_thesis()
+    await _mk_security("BASE.US")
+    await _bar("BASE.US", "2026-06-01", 10.0)
+    await _forecast("BASE.US")
+    assert (await paper_book.opener_tick())["opened"] == 1
+    await market_data.upsert_benchmark({"id": "CSI300", "name_zh": "沪深300"})
+    await market_data.upsert_benchmark_mark("CSI300", {"mark_date": "2026-06-01", "value": 4000.0})
+
+    # first sight pins the base (unchanged behavior)
+    assert (await paper_book.mark_to_market())["benchmark_nav"] == pytest.approx(1.0)
+
+    # corrupt JSON: fail closed, log loudly, do NOT touch the stored value
+    await db.execute("UPDATE admin_state SET value = 'not json' WHERE key = ?",
+                     (paper_book.BENCH_BASE_KEY,))
+    with caplog.at_level(logging.ERROR, logger="institute.paper_book"):
+        out = await paper_book.mark_to_market()
+    assert out["benchmark_nav"] is None
+    assert any("benchmark base" in r.getMessage() for r in caplog.records)
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?",
+                             (paper_book.BENCH_BASE_KEY,))
+    assert row["value"] == "not json"                # never silently re-pinned
+
+    # parseable but unusable base (0): same fails-closed path
+    await db.execute("UPDATE admin_state SET value = ? WHERE key = ?",
+                     (json.dumps({"value": 0.0}), paper_book.BENCH_BASE_KEY))
+    assert (await paper_book.mark_to_market())["benchmark_nav"] is None
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?",
+                             (paper_book.BENCH_BASE_KEY,))
+    assert json.loads(row["value"]) == {"value": 0.0}
+
+    # the operator repin path: DELETE the key, next MTM pins fresh
+    await db.execute("DELETE FROM admin_state WHERE key = ?", (paper_book.BENCH_BASE_KEY,))
+    assert (await paper_book.mark_to_market())["benchmark_nav"] == pytest.approx(1.0)
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?",
+                             (paper_book.BENCH_BASE_KEY,))
+    assert json.loads(row["value"])["value"] == pytest.approx(4000.0)
+
+
+async def test_opened_at_is_taken_per_iteration(monkeypatch):
+    """P11f: each opened position stamps its OWN bus.now_iso() — a long sweep
+    no longer smears one tick-start timestamp over every row (the journal's
+    exact SGT day window matches on opened_at)."""
+    await _mk_thesis()
+    for sid in ("CLK1.US", "CLK2.US"):
+        await _mk_security(sid)
+        await _bar(sid, "2026-06-01", 10.0)
+        await _forecast(sid, claim=f"clock {sid}")
+
+    ticks = {"n": 0}
+
+    def fake_now() -> str:
+        ticks["n"] += 1
+        return f"2026-07-01T00:{ticks['n'] // 60:02d}:{ticks['n'] % 60:02d}+00:00"
+
+    monkeypatch.setattr(paper_book.bus, "now_iso", fake_now)
+    out = await paper_book.opener_tick()
+    monkeypatch.undo()
     assert out["opened"] == 2
-    assert len(await _positions("open")) == 2
+    stamps = {p["opened_at"] for p in await _positions("open")}
+    assert len(stamps) == 2                          # per-iteration clock, not one stamp
 
 
 # ==== MTM: stop / target / horizon =============================================
@@ -479,15 +749,17 @@ async def test_opener_concurrency_database_is_the_arbiter():
     now = bus.now_iso()
 
     # deterministic race core: two inserts for the same security — the 0017
-    # partial unique index picks exactly one winner
+    # partial unique index picks exactly one winner (the winner gets its
+    # position id back, the loser None)
     r1 = await paper_book._insert_position(f1, "2026-06-01", 10.0, 20, now)
     r2 = await paper_book._insert_position(f2, "2026-06-01", 10.0, 20, now)
-    assert (r1, r2) == ("opened", "lost_race")
+    assert r1 is not None and r2 is None
     open_rows = await db.query(
         "SELECT * FROM paper_positions WHERE security_id = 'RACE.US' AND status = 'open'")
     assert len(open_rows) == 1
+    assert open_rows[0]["id"] == r1                              # the returned position id
     # ... and the same forecast can never open twice (UNIQUE(forecast_id))
-    assert await paper_book._insert_position(f1, "2026-06-01", 10.0, 20, now) == "lost_race"
+    assert await paper_book._insert_position(f1, "2026-06-01", 10.0, 20, now) is None
 
     # cap is a database fact too: the conditional INSERT refuses at the cap
     await _mk_security("CAPX.US")
@@ -629,7 +901,9 @@ def _make_app() -> FastAPI:
     return app
 
 
-async def test_open_api_hard_rejects_cap_then_switch_allows_advisory(monkeypatch):
+async def test_open_api_cap_is_always_hard(monkeypatch):
+    """The operator open path enforces the cap unconditionally — the old
+    advisory switch cannot be flipped back on through any channel."""
     await _mk_thesis()
     forecasts_by_sid = {}
     for sid in ("HARD1.US", "HARD2.US"):
@@ -647,11 +921,17 @@ async def test_open_api_hard_rejects_cap_then_switch_allows_advisory(monkeypatch
         assert refused.status_code == 409
         assert "max_positions" in refused.json()["detail"]
 
-        monkeypatch.setattr(get_settings(), "paper_book_enforce_caps", False)
-        allowed = await client.post(
+        monkeypatch.setenv("INSTITUTE_PAPER_BOOK_ENFORCE_CAPS", "false")  # dead knob
+        still_refused = await client.post(
             f"/api/book/forecasts/{forecasts_by_sid['HARD2.US']['id']}/open")
-        assert allowed.status_code == 200
-        assert allowed.json()["forecast_id"] == forecasts_by_sid["HARD2.US"]["id"]
+        assert still_refused.status_code == 409
+        assert "max_positions" in still_refused.json()["detail"]
+    assert len(await _positions("open")) == 1
+
+    # raising the ADMIN cap (the legitimate governance path) still works
+    await _set_cap(2)
+    pos = await paper_book.open_forecast_position(forecasts_by_sid["HARD2.US"]["id"])
+    assert pos is not None
     assert len(await _positions("open")) == 2
 
 

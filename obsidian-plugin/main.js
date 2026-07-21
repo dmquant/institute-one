@@ -138,11 +138,16 @@ function researchStatusIcon(status) {
   return map[status] ?? "\xB7";
 }
 var InstituteApi = class {
-  constructor(getBaseUrl) {
+  constructor(getBaseUrl, getToken) {
     this.getBaseUrl = getBaseUrl;
+    this.getToken = getToken;
   }
   baseUrl() {
     return this.getBaseUrl().replace(/\/+$/, "");
+  }
+  authHeaders() {
+    const token = this.getToken().trim();
+    return token ? { Authorization: `Bearer ${token}` } : void 0;
   }
   /** JSON request with a hard timeout (default 10s). Never uses fetch. */
   async request(path, opts = {}) {
@@ -152,6 +157,7 @@ var InstituteApi = class {
       (0, import_obsidian.requestUrl)({
         url,
         method,
+        headers: this.authHeaders(),
         contentType: opts.body !== void 0 ? "application/json" : void 0,
         body: opts.body !== void 0 ? JSON.stringify(opts.body) : void 0,
         throw: false
@@ -174,7 +180,7 @@ var InstituteApi = class {
   async requestText(path, timeoutMs = DEFAULT_TIMEOUT_MS) {
     const url = this.baseUrl() + path;
     const resp = await withTimeout(
-      (0, import_obsidian.requestUrl)({ url, method: "GET", throw: false }),
+      (0, import_obsidian.requestUrl)({ url, method: "GET", headers: this.authHeaders(), throw: false }),
       timeoutMs,
       `GET ${path}`
     );
@@ -356,6 +362,12 @@ var InstituteApi = class {
   triage() {
     return this.request("/api/operator/triage");
   }
+  /** GET /api/operator/actions — `open` is the backend's pending-inbox state. */
+  operatorActions(status = "open", limit = 1e3) {
+    return this.request(
+      `/api/operator/actions?status=${encodeURIComponent(status)}&limit=${limit}`
+    );
+  }
   // ---- paper book ---------------------------------------------------------------
   /** GET /api/book/nav — nav_history rows ascending; last row = latest NAV. */
   bookNav(days = 30) {
@@ -365,6 +377,27 @@ var InstituteApi = class {
   bookPositions(status = "open", limit = 200) {
     return this.request(
       `/api/book/positions?status=${encodeURIComponent(status)}&limit=${limit}`
+    );
+  }
+  // ---- forecasts ----------------------------------------------------------------
+  /** GET /api/forecasts — newest first. */
+  forecasts(limit = 5) {
+    return this.request(`/api/forecasts?limit=${limit}`);
+  }
+  /** GET /api/forecasts/{id} — includes the settlement row. */
+  forecast(forecastId) {
+    return this.request(
+      `/api/forecasts/${encodeURIComponent(forecastId)}`
+    );
+  }
+  // ---- research trees -----------------------------------------------------------
+  researchTrees(status, limit = 200) {
+    const q = status ? `?status=${encodeURIComponent(status)}&limit=${limit}` : `?limit=${limit}`;
+    return this.request(`/api/research/trees${q}`);
+  }
+  researchTree(treeId) {
+    return this.request(
+      `/api/research/tree/${encodeURIComponent(treeId)}`
     );
   }
   // ---- digests (/api/institute/*.md — text/markdown) ---------------------------
@@ -715,6 +748,36 @@ var DAILY_STATUS_ZH = {
   failed: "\u5931\u8D25",
   pending: "\u5F85\u8FD0\u884C"
 };
+var FORECAST_DIRECTION_ZH = {
+  long: "\u770B\u591A",
+  short: "\u770B\u7A7A",
+  neutral: "\u4E2D\u6027"
+};
+var FORECAST_STATUS_ZH = {
+  open: "\u5F85\u7ED3\u7B97",
+  settled: "\u5DF2\u7ED3\u7B97",
+  invalid: "\u65E0\u6548"
+};
+var FORECAST_VERDICT_ZH = {
+  hit: "\u547D\u4E2D",
+  miss: "\u843D\u7A7A",
+  partial: "\u90E8\u5206\u547D\u4E2D",
+  invalid: "\u65E0\u6548"
+};
+var TREE_STATUS_ZH = {
+  pending: "\u5F85\u63A2\u7D22",
+  exploring: "\u63A2\u7D22\u4E2D",
+  completed: "\u5DF2\u5B8C\u6210",
+  stopped: "\u5DF2\u505C\u6B62",
+  failed: "\u5931\u8D25"
+};
+var TREE_NODE_STATUS_ZH = {
+  pending: "\u5F85\u5904\u7406",
+  running: "\u8FD0\u884C\u4E2D",
+  completed: "\u5DF2\u5B8C\u6210",
+  failed: "\u5931\u8D25",
+  pruned: "\u5DF2\u526A\u679D"
+};
 var InstituteDashboardView = class extends import_obsidian3.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -755,6 +818,9 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
     this.handsEl = this.section(root, "\u6267\u884C\u624B");
     this.dailyEl = this.section(root, "\u4ECA\u65E5\u65E5\u62A5");
     this.runningEl = this.section(root, "\u8FDB\u884C\u4E2D");
+    [this.inboxWrapEl, this.inboxSummaryEl, this.inboxBodyEl] = this.collapsible(root, "Operator \u6536\u4EF6\u7BB1");
+    [this.forecastsWrapEl, this.forecastsSummaryEl, this.forecastsBodyEl] = this.collapsible(root, "\u9884\u6D4B\u8D26\u672C\u901F\u89C8");
+    [this.treesWrapEl, this.treesSummaryEl, this.treesBodyEl] = this.collapsible(root, "\u7814\u7A76\u6811\u76D1\u63A7");
     [this.triageWrapEl, this.triageSummaryEl, this.triageBodyEl] = this.collapsible(root, "\u64CD\u4F5C\u53F0 triage");
     [this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] = this.collapsible(root, "\u7EB8\u9762\u8D26\u672C");
     this.eventsEl = this.section(root, "\u6700\u8FD1\u4E8B\u4EF6");
@@ -857,7 +923,13 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
       ]);
       this.renderDaily(daily);
       this.renderRunning(running, queued);
-      await Promise.all([this.refreshTriage(), this.refreshBook()]);
+      await Promise.all([
+        this.refreshOperatorInbox(),
+        this.refreshForecasts(),
+        this.refreshResearchTrees(),
+        this.refreshTriage(),
+        this.refreshBook()
+      ]);
       try {
         await this.pollEvents();
       } catch {
@@ -866,6 +938,176 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
     } finally {
       this.refreshing = false;
     }
+  }
+  // ---- Operator 收件箱（裁决仍只在 SPA 中进行） ------------------------------------
+  async refreshOperatorInbox() {
+    let result;
+    try {
+      result = await this.plugin.api.operatorActions("open", 1e3);
+    } catch (e) {
+      if (isMissingEndpoint(e)) {
+        this.inboxWrapEl.style.display = "none";
+      } else {
+        this.inboxWrapEl.style.display = "";
+        this.inboxSummaryEl.setText("\uFF08\u83B7\u53D6\u5931\u8D25\uFF09");
+        this.inboxBodyEl.empty();
+        this.muted(this.inboxBodyEl, errMsg(e).slice(0, 120));
+      }
+      return;
+    }
+    this.inboxWrapEl.style.display = "";
+    this.inboxBodyEl.empty();
+    const count = result.count;
+    this.inboxSummaryEl.setText(`${count >= 1e3 ? "1000+" : count} \u5F85\u88C1\u51B3`);
+    this.inboxSummaryEl.style.color = count > 0 ? "var(--color-orange)" : "var(--text-muted)";
+    if (!result.actions.length) {
+      this.muted(this.inboxBodyEl, "\u6CA1\u6709\u5F85\u88C1\u51B3 action\u3002");
+      return;
+    }
+    for (const action of result.actions.slice(0, 5)) {
+      const line = this.inboxBodyEl.createDiv({
+        text: `${action.priority > 1 ? "\u26A0\uFE0F " : ""}${action.title}`
+      });
+      line.style.padding = "2px 0";
+      line.style.color = "var(--text-accent)";
+      line.style.cursor = "pointer";
+      line.setAttribute("title", "\u5728 Web \u64CD\u4F5C\u53F0\u4E2D\u5904\u7406");
+      line.addEventListener("click", () => this.openOperatorAction(action));
+    }
+    if (count > 5) {
+      this.muted(this.inboxBodyEl, `\u2026 \u8FD8\u6709 ${count - 5} \u6761\uFF0C\u70B9\u51FB\u6807\u9898\u524D\u5F80\u64CD\u4F5C\u53F0`);
+    }
+  }
+  openOperatorAction(action) {
+    new import_obsidian3.Notice(`Institute: action #${action.id} \u7684\u88C1\u51B3\u53EA\u5728 Web \u64CD\u4F5C\u53F0\u8FDB\u884C\u3002`, 5e3);
+    window.open(`${this.plugin.api.baseUrl()}/operator`);
+  }
+  // ---- 预测账本速览（API 无 stats；聚合近 5 条的 detail verdict） ----------------------
+  async refreshForecasts() {
+    let rows;
+    try {
+      const recent = await this.plugin.api.forecasts(5);
+      rows = await Promise.all(
+        recent.map(
+          (row) => row.status === "open" ? Promise.resolve(row) : this.plugin.api.forecast(row.id)
+        )
+      );
+    } catch (e) {
+      if (isMissingEndpoint(e)) {
+        this.forecastsWrapEl.style.display = "none";
+      } else {
+        this.forecastsWrapEl.style.display = "";
+        this.forecastsSummaryEl.setText("\uFF08\u83B7\u53D6\u5931\u8D25\uFF09");
+        this.forecastsBodyEl.empty();
+        this.muted(this.forecastsBodyEl, errMsg(e).slice(0, 120));
+      }
+      return;
+    }
+    this.forecastsWrapEl.style.display = "";
+    this.forecastsBodyEl.empty();
+    const evaluated = rows.filter(
+      (row) => row.settlement && row.settlement.verdict !== "invalid"
+    );
+    const hits = evaluated.filter((row) => row.settlement?.verdict === "hit").length;
+    const partial = evaluated.filter((row) => row.settlement?.verdict === "partial").length;
+    const rate = evaluated.length ? `${Math.round(hits / evaluated.length * 100)}%` : "\u2014";
+    this.forecastsSummaryEl.setText(
+      `\u8FD1 ${rows.length} \u6761 \xB7 \u547D\u4E2D\u7387 ${rate}` + (evaluated.length ? `\uFF08${hits}/${evaluated.length}\uFF09` : "")
+    );
+    this.forecastsSummaryEl.style.color = "var(--text-muted)";
+    if (!rows.length) {
+      this.muted(this.forecastsBodyEl, "\u8FD8\u6CA1\u6709\u9884\u6D4B\u8BB0\u5F55\u3002");
+      return;
+    }
+    for (const row of rows) {
+      const verdict = row.settlement?.verdict;
+      const state = verdict ? FORECAST_VERDICT_ZH[verdict] ?? verdict : FORECAST_STATUS_ZH[row.status] ?? row.status;
+      const direction = FORECAST_DIRECTION_ZH[row.direction] ?? row.direction;
+      const date = sgtDate(row.made_at) ?? "";
+      const line = this.forecastsBodyEl.createDiv({
+        text: `${direction} \xB7 ${row.claim}${date ? ` \xB7 ${date}` : ""} \xB7 ${state}`
+      });
+      line.style.padding = "1px 0";
+      line.setAttribute("title", row.claim);
+    }
+    const denominator = `\u53E3\u5F84\uFF1A\u8FD1 5 \u6761\u4E2D\u7684\u547D\u4E2D/\u843D\u7A7A/\u90E8\u5206\u547D\u4E2D\uFF0Cinvalid \u4E0D\u8BA1`;
+    this.muted(
+      this.forecastsBodyEl,
+      partial > 0 ? `${denominator}\uFF1B\u90E8\u5206\u547D\u4E2D ${partial}` : denominator
+    );
+  }
+  // ---- 研究树监控 ----------------------------------------------------------------
+  async refreshResearchTrees() {
+    let active;
+    let activeTruncated = false;
+    let detail;
+    let latest;
+    try {
+      const [pending, exploring] = await Promise.all([
+        this.plugin.api.researchTrees("pending", 200),
+        this.plugin.api.researchTrees("exploring", 200)
+      ]);
+      active = [...pending, ...exploring].sort(
+        (a, b) => b.created_at.localeCompare(a.created_at)
+      );
+      activeTruncated = pending.length >= 200 || exploring.length >= 200;
+      if (active.length) {
+        latest = active[0];
+      } else {
+        const recent = await this.plugin.api.researchTrees(void 0, 1);
+        latest = recent[0] ?? null;
+      }
+      detail = latest ? await this.plugin.api.researchTree(latest.id) : null;
+    } catch (e) {
+      if (isMissingEndpoint(e)) {
+        this.treesWrapEl.style.display = "none";
+      } else {
+        this.treesWrapEl.style.display = "";
+        this.treesSummaryEl.setText("\uFF08\u83B7\u53D6\u5931\u8D25\uFF09");
+        this.treesBodyEl.empty();
+        this.muted(this.treesBodyEl, errMsg(e).slice(0, 120));
+      }
+      return;
+    }
+    this.treesWrapEl.style.display = "";
+    this.treesBodyEl.empty();
+    this.treesSummaryEl.setText(
+      `${active.length}${activeTruncated ? "+" : ""} \u6D3B\u8DC3` + (detail ? ` \xB7 \u6700\u65B0 ${TREE_STATUS_ZH[detail.status] ?? detail.status}` : "")
+    );
+    this.treesSummaryEl.style.color = active.length > 0 ? "var(--color-green)" : "var(--text-muted)";
+    if (!latest || !detail) {
+      this.muted(this.treesBodyEl, "\u8FD8\u6CA1\u6709\u7814\u7A76\u6811\u3002");
+      return;
+    }
+    const progress = `${latest.nodes_completed ?? 0}/${latest.nodes_total ?? detail.nodes.length}`;
+    const treeLine = this.treesBodyEl.createDiv({
+      text: `${detail.root_topic} \xB7 \u8282\u70B9 ${progress}`
+    });
+    treeLine.style.padding = "1px 0";
+    const latestNode = this.latestTreeNode(detail.nodes);
+    if (latestNode) {
+      const state = TREE_NODE_STATUS_ZH[latestNode.status] ?? latestNode.status;
+      const nodeLine = this.treesBodyEl.createDiv({
+        text: `\u6700\u65B0\u8282\u70B9\uFF1A${latestNode.topic} \xB7 ${state}`
+      });
+      nodeLine.style.padding = "1px 0";
+      nodeLine.style.color = latestNode.status === "failed" ? "var(--color-red)" : latestNode.status === "running" ? "var(--color-green)" : "";
+    } else {
+      this.muted(this.treesBodyEl, "\u8BE5\u6811\u5C1A\u65E0\u8282\u70B9\u3002");
+    }
+  }
+  latestTreeNode(nodes) {
+    let latest = null;
+    let latestAt = Number.NEGATIVE_INFINITY;
+    for (const node of nodes) {
+      const at = Date.parse(node.finished_at ?? node.created_at);
+      const rank = Number.isNaN(at) ? 0 : at;
+      if (rank >= latestAt) {
+        latest = node;
+        latestAt = rank;
+      }
+    }
+    return latest;
   }
   // ---- 状态 / 队列 / 执行手 -----------------------------------------------------
   renderHeader(meta) {
@@ -1657,7 +1899,9 @@ var backlog_default = {
     "M5 Forecast Ledger",
     "M6 Alpha & Paper Book",
     "M7 Roadmap Control Plane",
-    "M8 Post-Audit Hardening"
+    "M8 Post-Audit Hardening",
+    "M9 North Star R1",
+    "M10 Loop Bounded-Autonomy"
   ],
   cards: [
     {
@@ -1814,7 +2058,7 @@ var backlog_default = {
       title: "Import market-thesis-data bundle",
       type: "feature",
       phase: "M1 Thesis Registry",
-      status: "review",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "Import lanes, theses, stocks, and thesis-stock edges from market-thesis-data/bundle.json as the initial local coverage universe. \u6570\u636E\u96C6\u7ECF INSTITUTE_THESIS_BUNDLE \u73AF\u5883\u53D8\u91CF\u6307\u5411\u5916\u90E8\u8DEF\u5F84\u5BFC\u5165\uFF08\u6570\u636E\u96C6\u542B\u5546\u4E1A\u6570\u636E\u4E0D\u5165\u5E93\uFF09\u3002",
@@ -2207,7 +2451,7 @@ var backlog_default = {
       title: "Durable executor retry lineage and idempotency",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P1",
       risk: "high",
       summary: "S4-P1-01 (A1/F1): retry does not persist the original fallback chain/lineage, so a cross-process retry after restart loses hand confinement and has no idempotency key; rate_limited tasks still terminate permanently after one fallback retry (ROADMAP Phase 2 'Executor depth'). Persist retry lineage + idempotency key, add the cooldown-expiry resurrection job, and lock the exact output-cap/marker boundary with tests.",
@@ -2235,7 +2479,7 @@ var backlog_default = {
       title: "Calibrate similarity gates against real bge-m3 (50+ pairs)",
       type: "test",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "review",
       priority: "P1",
       risk: "low",
       summary: "ROADMAP Phase 1a acceptance debt: the whiteboard similarity gate (0.85/14d skip, 0.65/30d build-on) shipped with uncalibrated default thresholds \u2014 the one-off distribution sanity check against ~50 known duplicate/related/unrelated pairs with real bge-m3 embeddings was never run. Run it against local Ollama, record the distribution, and adjust the config-row thresholds if the defaults misclassify.",
@@ -2260,7 +2504,7 @@ var backlog_default = {
       title: "Unify memory injection entrypoints and compact claim",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "S4-P1-08 (B3/C8) + ROADMAP Phase 2 gap: analyst standing memory is injected only at the four workflow prompt-assembly points; ad-hoc /api/ask, ask_stream, sessions and MCP asks run memory-less, and concurrent compacts can double-burn the model. Decide the unified injection entrypoint first, then wire the remaining callers and add a conditional-claim around compact_one.",
@@ -2289,7 +2533,7 @@ var backlog_default = {
       title: "Operator product surface: enforcement, CAS, SPA routes",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "S4-P2-05 + ROADMAP Phase 6 partials: feature switches are stored/displayed but never enforced and PUT is not CAS; the SPA has no operator route, so the actions kanban and triage page exist only as backend JSON. Deliver switch enforcement + compare-and-swap PUT, the operator kanban/triage SPA pages, and define the human-auth boundary and shadow-exit policy before any unshadow.",
@@ -2319,7 +2563,7 @@ var backlog_default = {
       title: "Frontend test runner and useSSE state-machine tests",
       type: "test",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P1",
       risk: "medium",
       summary: "S4-P2-10 (C7/S3): useSSE has no automated tests for bootstrap, pagination, reconnect-with-cursor, ring eviction or the watchdog; event grouping staleness and error rendering are unlocked. Introduce a frontend test runner (vitest) and lock the cursor state machine and UI edges.",
@@ -2347,7 +2591,7 @@ var backlog_default = {
       title: "Recipes, observations, proposals, effect measurement loop",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "review",
       priority: "P2",
       risk: "high",
       summary: "ROADMAP Phase 6 L item, still schema-only (0018 recipes placeholder): recurring fixes become recipes; observations feed proposals; proposals require explicit human approval in the web UI (never via vault frontmatter or MCP \u2014 proposal \xA78.2 invariant); parameter history + effect measurement close the self-improvement loop.",
@@ -2377,7 +2621,7 @@ var backlog_default = {
       title: "Research tree product surface: viewer, retry, scoring",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P2-13/14/15 + ROADMAP Phase 7 partial: the BFS engine is server-side only \u2014 no SSE tree viewer page, failed nodes have no retry policy, the score column is never written (no ranking), child replay is only exact-topic idempotent (normalized child key or documented contract), the daily booked counter is never cleaned and cap refusal returns 200 instead of 429.",
@@ -2408,7 +2652,7 @@ var backlog_default = {
       title: "Projects product surface: operations API, SPA page, MCP project_id",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "review",
       priority: "P2",
       risk: "medium",
       summary: "S4-P2-16/17 + ROADMAP Phase 7 partial: projects are backend containers only \u2014 no SPA page, no archive/unlink API routes, no project digest endpoint; MCP research_queue_add has no optional project_id so the write side cannot attach a project (keep the 3-write-tool boundary).",
@@ -2440,7 +2684,7 @@ var backlog_default = {
       title: "Bilingual twins read API, locale toggle, retry policy",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P2-18 + ROADMAP Phase 7 partial: bilingual twins ship as by-reference events only \u2014 no per-run+locale read endpoint or twin index, no SPA/admin locale toggle, failed translations are not retried, and replayed events can duplicate work. Add a stable read API, the locale toggle UI, and a bounded retry/idempotency policy.",
@@ -2498,7 +2742,7 @@ var backlog_default = {
       title: "Durable outbox for disputed-claim delivery",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P2-01 (C1/S3): the factcheck disputed handler is best-effort \u2014 a crash between verdict and mailbox/vault delivery loses the dispute notification. Add a durable outbox with idempotent retry; optionally split extract/verify hand config and extend the parser oracle with production-shaped adversarial cases.",
@@ -2524,7 +2768,7 @@ var backlog_default = {
       title: "Forecast seeding, settlement reconciliation, risk enforcement",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "high",
       summary: "S4-P1-10 + S4-P2-03 (B6/C3/S3): scheduled forecast seeding, batch settlement reconciliation (repeatable command over history), benchmark-base backfill, historical MTM/backfill-price recomputation, strict risk/cap enforcement and the forecast Vault export are all incomplete. Split into seeding / reconciliation / risk-enforcement work items when claimed.",
@@ -2581,7 +2825,7 @@ var backlog_default = {
       title: "Whiteboard session/workspace claim lease and reaper",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P1-03 (A5/F1): a failed board transaction can orphan the session/workspace it created, and a hard kill leaves a used topic claim with no lease/recovery. Add a claim lease + reaper (or widen the session+board atomic boundary) so crashes never leak workspaces or strand topics.",
@@ -2606,7 +2850,7 @@ var backlog_default = {
       title: "Vector health: degradation reasons, content reuse, model GC",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "low",
       summary: "S4-P1-04 (A8/S1): vector search mode cannot distinguish a healthy zero-hit from a degraded (Ollama-down) result; identical content embedded via different paths is not reused; superseded-model projections are hidden but never garbage-collected. Add a degradation reason/health surface, content-addressed embedding reuse, and old-model GC.",
@@ -2632,7 +2876,7 @@ var backlog_default = {
       title: "Events retention policy and stale counter janitor",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P2-19 + S4-P2-15 (partial): the events table has no global retention (long-run growth), and per-day research-tree booked counters accumulate forever. Define the audit-retention requirement first, then extend the janitor with age-based event retention and 30-day counter cleanup.",
@@ -2657,7 +2901,7 @@ var backlog_default = {
       title: "Interactive ask cancellation and optional bearer auth",
       type: "feature",
       phase: "M8 Post-Audit Hardening",
-      status: "inbox",
+      status: "done",
       priority: "P2",
       risk: "medium",
       summary: "S4-P3-01 = the two remaining ROADMAP Phase 0 opens: interactive asks still queue behind long workflow steps with no timeout/cancel/recoverable-task protocol (busy-hand preference or an interactive lane for source=api), and there is no optional INSTITUTE_TOKEN bearer middleware while INSTITUTE_HOST is settable.",
@@ -2704,6 +2948,473 @@ var backlog_default = {
         "deprecation warnings reduced batch by batch with no behavior change",
         "stale comments/docs corrected against current code",
         "shutdown stops probing APScheduler private structures"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "M9-101",
+      title: "Prompt overrides: data-driven prompt iteration",
+      type: "feature",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "prompt_overrides table (shadow/active/retired per scope), resolve() over prompt constants with byte-stable defaults, ops API + diff preview (ROADMAP Phase 2).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0029_prompt_overrides.sql",
+        "app/institute/prompt_overrides.py",
+        "app/api/prompt_overrides.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "active override wins, shadow records only",
+        "defaults byte-identical without overrides",
+        "lifecycle transitions are conditional claims"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_prompt_overrides.py -q"
+      ]
+    },
+    {
+      id: "M9-102",
+      title: "Chain properties with supersede/conflict adjudication",
+      type: "feature",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "chain_properties + hybrid supersede/conflict, conflicts surface as operator actions transactionally, late-period assertions cannot regress current (ROADMAP Phase 4).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0030_chain_properties.sql",
+        "app/institute/chain.py",
+        "app/api/chain.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "conflict rows pair with an operator action atomically",
+        "late assertions only touch their period",
+        "tick cursor never loses assertions nor replays model calls"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_chain.py -q"
+      ]
+    },
+    {
+      id: "M9-103",
+      title: "Portfolios L1-L3 and Sunday proposer",
+      type: "feature",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "Per-analyst conviction-tiered virtual portfolios with Sunday 22:00 proposer and conditional-claim adjudication (ROADMAP Phase 5).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0032_portfolios.sql",
+        "app/institute/portfolios.py",
+        "app/api/portfolios.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "forecast routes to highest passing tier",
+        "proposal per (portfolio, work_date) is idempotent",
+        "adjudication re-checks liveness per item"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_portfolios.py -q"
+      ]
+    },
+    {
+      id: "M9-104",
+      title: "Favorites and Insights visualizations",
+      type: "ui",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P2",
+      risk: "low",
+      summary: "Global favorites (migration 0031) + zero-dependency Insights charts page; star buttons on Trees/Forecasts (ROADMAP Phase 7).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0031_favorites.sql",
+        "app/api/favorites.py",
+        "frontend/src/pages/Insights.tsx"
+      ],
+      dependencies: [],
+      acceptance: [
+        "favorite add is idempotent",
+        "charts aggregate live API data with no new deps"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_favorites.py -q"
+      ]
+    },
+    {
+      id: "M9-105",
+      title: "Forecast ledger integrity: evidence chain, exactly-once extract, hard boundaries",
+      type: "feature",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P0",
+      risk: "high",
+      summary: "System-fixed knowledge cutoff persisted per settlement (migration 0033), single PIT snapshot + benchmark alignment fail-closed, deterministic extract replay, made_at tolerance + backfill origin, cap switch removed (adversarial audit findings).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0033_forecast_evidence.sql",
+        "app/institute/forecasts.py",
+        "app/institute/forecast_extract.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "settle ignores caller-supplied as_of",
+        "extract survives claim/create crash without loss",
+        "backfilled forecasts excluded from performance scopes",
+        "aggregate caps cannot be disabled"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_forecasts.py tests/test_forecast_extract.py tests/test_paper_book.py -q"
+      ]
+    },
+    {
+      id: "M9-106",
+      title: "Factcheck trust boundary: strict verdicts, consistency gate, lease tokens, dispute outbox",
+      type: "feature",
+      phase: "M9 North Star R1",
+      status: "review",
+      priority: "P0",
+      risk: "high",
+      summary: "Ambiguous verdicts fall to UNVERIFIABLE, evidence required for actionable verdicts, similarity reuse gated on numeric/date/negation consistency, lease_id ownership (migration 0034), dispute events via durable outbox (adversarial audit findings).",
+      design_links: [
+        "ROADMAP.md"
+      ],
+      expected_files: [
+        "migrations/0034_factcheck_lease.sql",
+        "app/institute/factcheck.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "conflicting verdicts never mint DISPUTED",
+        "no-evidence verdicts are not actionable",
+        "stale workers lose the lease",
+        "dispute events survive crash via outbox"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_factcheck.py -q"
+      ]
+    },
+    {
+      id: "LOOP-P1",
+      title: "executor \u9501\u987A\u5E8F\uFF1A\u5148 hand \u9501\u540E\u4FE1\u53F7\u91CF",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "\u7B49 hand \u9501\u7684\u4EFB\u52A1\u4E0D\u518D\u767D\u5360\u5168\u5C40\u5E76\u53D1\u69FD\u997F\u6B7B\u7A7A\u95F2 hand\uFF1B\u9501\u5E8F _hand_lock\u2192_sem\uFF0C\u65E0 ABBA\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/router/executor.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u5FD9 hand + \u6392\u961F\u4EFB\u52A1\u65F6\u7A7A\u95F2 hand \u7684 submit \u4E0D\u88AB\u963B\u585E"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P2",
+      title: "operator \u8DEF\u7531\u6BD2\u884C\u5199\u5360\u4F4D disposition",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "\u8DEF\u7531\u5931\u8D25/\u89E3\u6790\u5F02\u5E38\u5199\u5360\u4F4D shadow disposition \u5360\u6389 propose-once \u540D\u989D\uFF0C\u5835\u6B7B\u540C\u4E00 action \u65E0\u9650\u91CD\u9009\u70E7\u914D\u989D\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/operator.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u5931\u8D25 action \u4E0D\u88AB\u7B2C\u4E8C\u6B21\u91CD\u9009",
+        "\u5360\u4F4D\u884C shadow=1 \u4E14\u4E0D\u53EF\u6D88\u8D39"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P3",
+      title: "factcheck \u6BD2\u5361\u7247 attempts \u4E0A\u754C",
+      type: "schema",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P1",
+      risk: "medium",
+      summary: "fact_cards.attempts \u5931\u8D25\u81EA\u589E\uFF0C3 \u6B21\u540E\u6761\u4EF6\u5BA3\u5360\u8F6C\u7EC8\u6001 unverifiable\uFF1Bpicker \u6309 attempts \u6C89\u5E95\u6392\u9664\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/factcheck.py",
+        "migrations/0035_fact_cards_attempts.sql"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u6BD2\u5361 N \u6B21\u540E\u4E0D\u518D\u88AB\u9009\u4E2D\u5E76\u843D\u7EC8\u6001",
+        "\u9884\u7B97\u8017\u5C3D\u7684\u91CA\u653E\u4E0D\u8BA1\u6570"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P4",
+      title: "chain \u6E38\u6807\u6301\u4E45\u5316\u5931\u8D25\u6709\u754C\u8DF3\u8FC7",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "\u786E\u5B9A\u6027\u6301\u4E45\u5316\u5931\u8D25\u6309\u4E8B\u4EF6\u8BA1\u6570\uFF0C3 \u6B21\u540E\u5F00 failed_run \u5361\u5E76\u63A8\u8FDB\u6E38\u6807\uFF0C\u5355\u6BD2\u4E8B\u4EF6\u6A21\u578B\u82B1\u8D39\u5C01\u9876 3 \u6B21\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/chain.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u6BD2\u4E8B\u4EF6\u6709\u9650\u6B21\u540E\u8DF3\u8FC7\u4E0D\u65E0\u9650\u91CD\u4ED8\u6A21\u578B\u8C03\u7528"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P5",
+      title: "research_tree \u7EC8\u6001\u5B88\u536B\u4E0E\u5D29\u6E83\u5B89\u5168\u5BA3\u544A",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "_maybe_finish_tree \u52A0 NOT EXISTS \u5B88\u536B\u9632 retry \u7ADE\u6001\u9759\u9ED8 prune\uFF1Btree.completed \u6539 emit \u6210\u529F\u540E\u7F6E\u4F4D announced_at\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/research_tree.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "retry \u8282\u70B9\u4E0D\u88AB\u9759\u9ED8 prune",
+        "emit \u524D\u5D29\u6E83\u4E8B\u4EF6\u4E0D\u6C38\u4E45\u4E22\u5931"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P6",
+      title: "operator \u81EA\u6539\u8FDB\u94FE\u5E42\u7B49\u91CD\u653E\u4E0E\u697C\u5C42\u53EA\u5347",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "approved+applied=0 \u5141\u8BB8\u5E42\u7B49\u91CD\u653E apply\uFF1B\u9648\u65E7 set_parameter \u63D0\u6848 apply \u65F6\u6821\u9A8C new_floor>\u5F53\u524D\u5426\u5219\u62D2\u7EDD\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/operator.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "approve \u540E apply \u5931\u8D25\u53EF\u91CD\u653E\u4E0D\u5361\u6B7B",
+        "\u9648\u65E7\u63D0\u6848\u4E0D\u80FD\u6279\u964D confidence_floor"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P7",
+      title: "fact_extract_queue worker lease",
+      type: "schema",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "\u8BA4\u9886\u5199\u968F\u673A lease_id\uFF0C\u7EC8\u6001\u5199\u5E26 AND lease_id=?\uFF0Cstale \u56DE\u6536\u6E05 lease\uFF0C\u8001 worker \u8FDF\u5230\u5199\u81EA\u7136\u4E22\u5931\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/factcheck.py",
+        "migrations/0036_fact_extract_queue_lease.sql"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u8FC7\u671F\u91CD\u5F00\u540E\u65E7 worker \u8FDF\u5230\u5199\u5165\u4E0D\u8986\u76D6\u65B0 claim"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P8",
+      title: "\u4E8B\u4EF6\u5FAA\u73AF\u963B\u585E\u4E09\u5904\u642C\u79BB/\u52A0\u754C",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "P8a vault \u626B\u63CF\u5408\u5E76\u5355\u904D\u8FDB to_thread\uFF1BP8b _auto_cluster \u52A0 LIMIT 200+30 \u5929\u8001\u5316\uFF1BP8c opener \u9650 50 \u5019\u9009 + get_last_bar_pit \u5355\u884C\u8BFB\u66FF\u4EE3\u5168\u5386\u53F2\u626B\u63CF\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/operator.py",
+        "app/institute/chain.py",
+        "app/institute/paper_book.py",
+        "app/institute/market_data.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u4E09\u5904\u540C\u6B65\u963B\u585E\u4E0D\u518D\u51BB\u7ED3\u4E8B\u4EF6\u5FAA\u73AF",
+        "\u626B\u63CF\u6709\u754C"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P9",
+      title: "janitor \u4E00\u81F4\u6027\u5907\u4EFD VACUUM INTO",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P2",
+      risk: "medium",
+      summary: "\u5907\u4EFD\u6539 VACUUM INTO \u4E34\u65F6\u6587\u4EF6+\u539F\u5B50\u6539\u540D\u7684\u4E00\u81F4\u6027\u5FEB\u7167\uFF0C\u5E76\u53D1 checkpoint \u4E0D\u518D\u635F\u574F\u5907\u4EFD\uFF1B\u5931\u8D25\u9694\u79BB\u4E0D\u5F71\u54CD janitor \u5176\u4F59\u6B65\u9AA4\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/scheduler.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u5907\u4EFD\u662F\u6709\u6548\u4E00\u81F4\u7684 sqlite \u5FEB\u7167",
+        "\u5907\u4EFD\u5931\u8D25\u4E0D\u6BD2\u5316 janitor"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P10",
+      title: "\u4F4E\u5371\u4FEE\u8865 A\uFF08operator/factcheck\uFF09",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P3",
+      risk: "medium",
+      summary: "operator sweep \u5F00\u5361\u4E0A\u9650 20 + \u9648\u65E7\u89C2\u5BDF\u5FEB\u7167 7 \u5929\u8FC7\u6EE4\uFF1Bfactcheck outbox CAS \u5931\u914D\u91CD\u8BFB\u3001\u4E3B tick \u5F02\u5E38\u4EA4 @metered\u3001\u5411\u91CF\u626B\u63CF\u52A0 LIMIT 2000\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/operator.py",
+        "app/institute/factcheck.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u5404\u4F4E\u5371\u8DEF\u5F84\u6709\u754C\uFF0C\u4E0D\u9759\u9ED8\u541E\u5F02\u5E38"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P11",
+      title: "\u4F4E\u5371\u4FEE\u8865 B\uFF08chain/paper_book/scheduler/mailbox\uFF09",
+      type: "feature",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P3",
+      risk: "medium",
+      summary: "chain _auto_promote \u6BCF\u8F6E 20 \u4E0A\u9650 + artifact \u8BFB 512KB \u94B3\u5236\uFF1Bpaper_book opened \u4E8B\u4EF6 ref \u6539 position id + benchmark \u635F\u574F fail-closed + opened_at \u9010\u7B14\u53D6\u65F6\uFF1Bscheduler revival LIMIT 50\uFF1Bmailbox sweep \u5C01\u9876 20\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "app/institute/chain.py",
+        "app/institute/paper_book.py",
+        "app/institute/scheduler.py",
+        "app/institute/mailbox.py"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u5404\u6709\u754C\u6027\u4FEE\u8865\u751F\u6548\uFF0C\u6D88\u8D39\u65B9\u4E0D\u53D7 ref \u6539\u52A8\u7834\u574F"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      id: "LOOP-P12",
+      title: "\u6536\u5C3E\uFF1ACLAUDE.md \u786C\u89C4\u5219 + backlog \u8865\u5361 + \u5168\u91CF",
+      type: "docs",
+      phase: "M10 Loop Bounded-Autonomy",
+      status: "review",
+      priority: "P3",
+      risk: "medium",
+      summary: "CLAUDE.md \u65B0\u589E\u786C\u89C4\u5219 11\uFF08\u5931\u8D25\u91CD\u8BD5\u5FC5\u987B\u5E26 attempts/lease \u4E0A\u754C\uFF09\uFF1B\u672C\u6E05\u5355 12 \u5305\u8865\u5361\uFF1B\u6743\u5A01\u5168\u91CF 1078 passed / 1 skipped + compileall\u3002",
+      design_links: [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      expected_files: [
+        "CLAUDE.md",
+        "roadmap/backlog.json"
+      ],
+      dependencies: [],
+      acceptance: [
+        "\u786C\u89C4\u5219\u843D\u5730",
+        "\u5168\u91CF\u7EFF"
       ],
       verification: [
         ".venv/bin/python -m pytest tests -q",
@@ -4153,6 +4864,7 @@ function ensureRoadmapStyles() {
 // src/main.ts
 var DEFAULT_SETTINGS = {
   baseUrl: "http://127.0.0.1:8100",
+  token: "",
   vaultSubfolder: "Institute",
   defaultAnalyst: "",
   insertStyle: "callout",
@@ -4168,7 +4880,10 @@ var InstituteOnePlugin = class extends import_obsidian6.Plugin {
   }
   async onload() {
     await this.loadSettings();
-    this.api = new InstituteApi(() => this.settings.baseUrl);
+    this.api = new InstituteApi(
+      () => this.settings.baseUrl,
+      () => this.settings.token
+    );
     this.addSettingTab(new InstituteSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new InstituteDashboardView(leaf, this));
     this.registerView(VIEW_TYPE_ROADMAP, (leaf) => new RoadmapView(leaf, this));
@@ -4877,6 +5592,13 @@ var InstituteSettingTab = class extends import_obsidian6.PluginSettingTab {
         void this.plugin.refreshStatus();
       })
     );
+    new import_obsidian6.Setting(containerEl).setName("\u8BBF\u95EE\u4EE4\u724C (bearer token)").setDesc("\u540E\u7AEF\u8BBE\u7F6E INSTITUTE_TOKEN \u65F6\u586B\u5199\u540C\u4E00\u4EE4\u724C\uFF1B\u672A\u542F\u7528\u9274\u6743\u65F6\u7559\u7A7A\u3002").addText((t) => {
+      t.inputEl.type = "password";
+      t.setPlaceholder("\u672A\u8BBE\u7F6E").setValue(this.plugin.settings.token).onChange(async (v) => {
+        this.plugin.settings.token = v.trim();
+        await this.plugin.saveSettings();
+      });
+    });
     new import_obsidian6.Setting(containerEl).setName("Vault \u5B50\u76EE\u5F55").setDesc(
       "\u540E\u7AEF\u5BFC\u51FA\u7B14\u8BB0\u6240\u5728\u7684 vault \u5B50\u76EE\u5F55\uFF08\u5BF9\u5E94\u540E\u7AEF\u7684 vault_dir\uFF09\u3002\u7559\u7A7A\u8868\u793A vault \u6839\u76EE\u5F55\u3002"
     ).addText(

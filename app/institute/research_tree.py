@@ -54,12 +54,22 @@ The loop (house rules throughout):
    transaction — SQLite's single writer means a concurrently completing
    parent either commits its children first (they get pruned here) or reads
    the stopped tree and inserts nothing; no stranded pending rows either
-   way. Running nodes finish naturally. The ``tree.completed`` event is a
-   FINAL SNAPSHOT: emitted only when the tree is terminal
-   (completed/failed/stopped) AND drained (no pending/running nodes), via a
-   conditional claim on the ``announced_at`` column — exactly one event per
-   drain generation (a manual failed-node retry starts a new generation),
-   payload read from the database rows after the terminal state is durable.
+   way. Running nodes finish naturally. The exploring -> terminal flip
+   carries its own "no live nodes" NOT EXISTS guard (LOOP-P5a), so a
+   concurrent ``retry_node`` can never be flipped over and silently pruned.
+   The ``tree.completed`` event is a FINAL SNAPSHOT: emitted only when the
+   tree is terminal (completed/failed/stopped) AND drained (no
+   pending/running nodes), with the conditional claim on ``announced_at``
+   as the generation's single-shot arbiter — one event per drain generation
+   (a manual failed-node retry starts a new generation), payload read from
+   the database rows after the terminal state is durable. The marker is set
+   only AFTER the emit succeeds (LOOP-P5b): a crash mid-announce leaves the
+   tree unannounced and the sweep re-emits — the event ROW is at-least-once
+   and duplicates are safe to consume. The guarantee stops at the durable
+   row (R3 P2): bus.emit swallows handler failures, so a consumer failing
+   AFTER the row lands (e.g. the vault write) is not retried by this loop —
+   projection-level at-least-once needs an exporter-side cursor/outbox
+   (tracked as a follow-up card).
    Crash recovery: the app lifespan calls ``recover_orphans()`` to prune
    running nodes under terminal trees and requeue the rest; the tick sweep
    settles/announces whatever a crash left unflipped or unannounced.
@@ -107,7 +117,12 @@ MAX_TOPIC_LEN = 200            # parse_followups' topic cap (house convention)
 MAX_QUESTION_LEN = 500         # parse_followups' question cap
 SUMMARY_CAP = 800              # extract_summary's cap (house convention)
 ANCESTRY_SUMMARY_CAP = 300     # per-ancestor slice in the prompt chain block
-NODES_PER_TICK = 3             # one tick claims at most this many nodes (== global semaphore width)
+# One tick claims at most this many nodes (== global semaphore width). With the
+# default 2 research hands (codex,agy) the 3rd node necessarily doubles up on a
+# busy hand; that is SAFE only because the executor acquires the hand mutex
+# BEFORE the global semaphore (LOOP-P1): the doubled-up node just queues on its
+# hand's lock without pinning a global slot, so other hands are never starved.
+NODES_PER_TICK = 3
 CLAIM_SCAN_LIMIT = 10          # BFS candidates examined per claim attempt
 MAX_DEPTH_LIMIT = 4            # create_tree hard bound on max_depth
 MAX_NODES_LIMIT = 50           # create_tree hard bound on max_nodes
@@ -538,7 +553,19 @@ async def _maybe_finish_tree(tree_id: str) -> bool:
     """Flip an exploring tree terminal once every node is (no event here —
     the announce arbiter below owns the event). 'completed' needs at least
     one completed node; a tree whose every node failed/pruned lands
-    'failed'. Stopped trees are already terminal and never flip."""
+    'failed'. Stopped trees are already terminal and never flip.
+
+    The counts above are only advisory: the flip UPDATE re-checks "no live
+    nodes" as a NOT EXISTS guard in the statement itself (the
+    _announce_if_drained idiom — LOOP-P5a). Without it, a retry_node landing
+    between the reads and the flip (failed -> pending under the still-
+    exploring tree, so its reopen UPDATE no-ops) left the fresh pending row
+    stranded under a terminal tree, where the next sweep silently pruned the
+    operator's retry. With the guard, SQLite's single writer means the flip
+    either commits before the retry (which then reopens the tree) or sees
+    the pending row and loses. The 'completed'-count read cannot go stale
+    once the guard holds: with no live nodes, only retry_node can change
+    node states, and doing so creates a pending row that blocks the flip."""
     live = await db.query_one(
         "SELECT COUNT(*) AS n FROM research_tree_nodes "
         "WHERE tree_id = ? AND status IN ('pending','running')",
@@ -553,7 +580,11 @@ async def _maybe_finish_tree(tree_id: str) -> bool:
     )
     final = "completed" if done and done["n"] else "failed"
     n = await db.execute(
-        "UPDATE research_trees SET status = ?, finished_at = ? WHERE id = ? AND status = 'exploring'",
+        "UPDATE research_trees SET status = ?, finished_at = ? "
+        "WHERE id = ? AND status = 'exploring' "
+        "AND NOT EXISTS (SELECT 1 FROM research_tree_nodes n "
+        "                WHERE n.tree_id = research_trees.id "
+        "                AND n.status IN ('pending','running'))",
         (final, bus.now_iso(), tree_id),
     )
     if n:
@@ -561,44 +592,83 @@ async def _maybe_finish_tree(tree_id: str) -> bool:
     return bool(n)
 
 
+# Serializes the announce section below IN-PROCESS (the app is one process by
+# design), so the emit-then-mark order cannot double-emit under concurrent
+# settles; crash recovery rides the database state alone (announced_at NULL).
+_announce_lock = asyncio.Lock()
+
+
 async def _announce_if_drained(tree_id: str) -> bool:
     """Emit one ``tree.completed`` final snapshot per drain generation.
 
-    The conditional claim on ``announced_at`` is the generation's single-shot
-    arbiter (``retry_node`` deliberately clears it when reopening a terminal
-    tree):
-    it only fires when the tree is terminal AND drained (no pending/running
+    It only fires when the tree is terminal AND drained (no pending/running
     nodes left — a stopped tree with naturally-finishing running nodes waits
-    for its last finisher). The payload is read from the database AFTER the
-    terminal state is durable, so SSE viewers may disconnect on receipt and
-    the vault exporter projects a settled tree, never a half-running one.
+    for its last finisher). The conditional claim on ``announced_at`` is the
+    generation's single-shot arbiter (``retry_node`` deliberately clears it
+    when reopening a terminal tree).
+
+    Order matters (LOOP-P5b): the event is emitted FIRST and the marker is
+    claimed AFTER the emit succeeds. The old claim-then-emit order made a
+    crash between the two swallow the snapshot forever (marker durable,
+    event never written, so the sweep never retried). Now a crash in the
+    window leaves ``announced_at`` NULL and the next tick's sweep
+    re-announces — the event ROW is at-least-once (the factcheck
+    event-outbox posture) and duplicate deliveries are safe (the vault
+    exporter re-reads rows and rewrites the same note idempotently).
+    The marker acknowledges the durable event row ONLY (R3 P2): bus.emit
+    swallows handler exceptions and the exporter catches its own, so a
+    vault write failing after the row lands is NOT retried by this loop —
+    making the PROJECTION at-least-once needs an exporter-side
+    cursor/outbox (follow-up card; vault writes are idempotent, so a
+    re-project is safe at any time). ``_announce_lock`` keeps normal operation
+    single-fire: concurrent settles serialize and only the first sees the
+    unannounced row. Both the eligibility read and the marker UPDATE carry
+    the terminal+drained+unannounced conditions, so a retry_node reopening
+    the generation mid-window no-ops the marker and the NEW generation
+    announces again when it drains. The payload is read from the database
+    AFTER the terminal state is durable, so SSE viewers may disconnect on
+    receipt and the vault exporter projects a settled tree, never a
+    half-running one.
     """
-    n = await db.execute(
-        "UPDATE research_trees SET announced_at = ? "
-        "WHERE id = ? AND status IN ('completed','stopped','failed') "
-        "AND announced_at IS NULL "
-        "AND NOT EXISTS (SELECT 1 FROM research_tree_nodes n "
-        "                WHERE n.tree_id = research_trees.id "
-        "                AND n.status IN ('pending','running'))",
-        (bus.now_iso(), tree_id),
-    )
-    if not n:
-        return False
-    tree = await db.query_one("SELECT * FROM research_trees WHERE id = ?", (tree_id,))
-    counts = await db.query(
-        "SELECT status, COUNT(*) AS n FROM research_tree_nodes WHERE tree_id = ? GROUP BY status",
-        (tree_id,),
-    )
-    await bus.emit(TREE_COMPLETED_EVENT, "research_tree", tree_id, {
-        "tree_id": tree_id,
-        "root_topic": (tree or {}).get("root_topic", ""),
-        "status": (tree or {}).get("status", ""),
-        "nodes": {r["status"]: r["n"] for r in counts},
-        "finished_at": (tree or {}).get("finished_at"),
-    })
-    log.info("research tree %s announced terminal snapshot (%s)",
-             tree_id, (tree or {}).get("status"))
-    return True
+    async with _announce_lock:
+        tree = await db.query_one(
+            "SELECT * FROM research_trees "
+            "WHERE id = ? AND status IN ('completed','stopped','failed') "
+            "AND announced_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM research_tree_nodes n "
+            "                WHERE n.tree_id = research_trees.id "
+            "                AND n.status IN ('pending','running'))",
+            (tree_id,),
+        )
+        if tree is None:
+            return False
+        counts = await db.query(
+            "SELECT status, COUNT(*) AS n FROM research_tree_nodes WHERE tree_id = ? GROUP BY status",
+            (tree_id,),
+        )
+        await bus.emit(TREE_COMPLETED_EVENT, "research_tree", tree_id, {
+            "tree_id": tree_id,
+            "root_topic": tree.get("root_topic", ""),
+            "status": tree.get("status", ""),
+            "nodes": {r["status"]: r["n"] for r in counts},
+            "finished_at": tree.get("finished_at"),
+        })
+        n = await db.execute(
+            "UPDATE research_trees SET announced_at = ? "
+            "WHERE id = ? AND status IN ('completed','stopped','failed') "
+            "AND announced_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM research_tree_nodes n "
+            "                WHERE n.tree_id = research_trees.id "
+            "                AND n.status IN ('pending','running'))",
+            (bus.now_iso(), tree_id),
+        )
+        if not n:
+            log.warning("research tree %s reopened before its announce marker landed; "
+                        "the new generation will re-announce", tree_id)
+            return False
+        log.info("research tree %s announced terminal snapshot (%s)",
+                 tree_id, tree.get("status"))
+        return True
 
 
 async def _settle_tree(tree_id: str) -> bool:

@@ -1,0 +1,13 @@
+-- R4 P1: bind every consumed verification attempt to a durable task row.
+--
+-- The R3 attempt pre-book closed the "model started, crash skipped the
+-- counting" window but opened the symmetric one: attempts+1 committed on its
+-- own, and a crash before executor.submit created the tasks row meant a card
+-- could exhaust VERIFY_MAX_ATTEMPTS and terminalize with ZERO factcheck task
+-- rows. Booking is now ONE transaction — daily-slot increment + card
+-- attempts+1 + a born-'queued' tasks row + this binding — so an attempt
+-- exists if and only if its durable task exists: after a crash the queued
+-- task is either driven or settled by the boot orphan sweep, never guessed
+-- at. verify_task_id always points at the LATEST verification task for the
+-- card (provenance; overwritten by each new booking, kept on settle).
+ALTER TABLE fact_cards ADD COLUMN verify_task_id TEXT;

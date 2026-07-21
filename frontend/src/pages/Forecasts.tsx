@@ -1,12 +1,15 @@
 import { useState } from "react";
 import {
+  addFavorite,
   ApiError,
+  AUTH_TOKEN_KEY,
   BookNavPoint,
   BookPosition,
   Forecast,
   getBookNav,
   listBookPositions,
-  listForecasts,
+  listFavorites,
+  removeFavorite,
   settleForecast,
 } from "../api";
 import { Empty, ErrorNote, Loading, PageHead, StatusBadge, ago, fmtTime, useLoad } from "../ui";
@@ -30,11 +33,39 @@ export default function Forecasts() {
 
 // ---- forecasts (GET /api/forecasts) -----------------------------------------
 
+/** The LEDGER view must show every row, backfills included: the API's default
+ * scope excludes origin='backfill' (correct for the Dashboard hit-rate, which
+ * keeps using listForecasts), so this page passes origin=all explicitly.
+ * Raw fetch with the Dashboard's auth pattern — api.listForecasts has no
+ * origin parameter and api.ts belongs to another change. */
+async function listAllForecasts(status?: string): Promise<Forecast[]> {
+  const params = new URLSearchParams({ origin: "all", limit: "100" });
+  if (status) params.set("status", status);
+  const headers = new Headers();
+  const token = window.localStorage.getItem(AUTH_TOKEN_KEY)?.trim() ?? "";
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`/api/forecasts?${params}`, { headers });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      // Non-JSON errors keep the HTTP status text.
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return (await response.json()) as Forecast[];
+}
+
 function ForecastsCard() {
   const [status, setStatus] = useState("");
-  const rows = useLoad(() => listForecasts(status || undefined), [status], 30000);
+  const rows = useLoad(() => listAllForecasts(status || undefined), [status], 30000);
+  const favorites = useLoad(() => listFavorites("forecast"), [], 30000);
+  const favoriteIds = new Set((favorites.data ?? []).map((favorite) => favorite.ref_id));
   const [err, setErr] = useState<string | null>(null);
   const [settling, setSettling] = useState<string | null>(null);
+  const [favoriteBusy, setFavoriteBusy] = useState<string | null>(null);
 
   const settle = async (id: string) => {
     setErr(null);
@@ -46,6 +77,20 @@ function ForecastsCard() {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setSettling(null);
+    }
+  };
+
+  const toggleFavorite = async (id: string) => {
+    setErr(null);
+    setFavoriteBusy(id);
+    try {
+      if (favoriteIds.has(id)) await removeFavorite("forecast", id);
+      else await addFavorite("forecast", id);
+      favorites.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFavoriteBusy(null);
     }
   };
 
@@ -74,6 +119,7 @@ function ForecastsCard() {
       </h2>
       <ErrorNote error={err} />
       <ErrorNote error={rows.error} />
+      <ErrorNote error={favorites.error} />
       {rows.loading && !rows.data && <Loading />}
       <table className="data">
         <thead>
@@ -92,7 +138,7 @@ function ForecastsCard() {
             const expiresMs = new Date(f.expires_at).getTime();
             const expired = f.status === "open" && !isNaN(expiresMs) && expiresMs <= Date.now();
             return (
-              <tr key={f.id}>
+              <tr id={`forecast-${f.id}`} key={f.id}>
                 <td title={f.claim}>
                   <div className="ellipsis" style={{ maxWidth: 300 }}>
                     {f.claim}
@@ -131,6 +177,19 @@ function ForecastsCard() {
                   {expired && <span className="hand-cooldown"> 可结算</span>}
                 </td>
                 <td>
+                  <button
+                    aria-label={favoriteIds.has(f.id) ? "取消收藏" : "收藏预测"}
+                    className="small ghost"
+                    disabled={favorites.loading || favoriteBusy === f.id}
+                    onClick={() => toggleFavorite(f.id)}
+                    style={{
+                      color: favoriteIds.has(f.id) ? "var(--amber)" : undefined,
+                      marginRight: expired ? 6 : 0,
+                    }}
+                    title={favoriteIds.has(f.id) ? "取消收藏" : "收藏到洞察页"}
+                  >
+                    {favoriteIds.has(f.id) ? "★" : "☆"}
+                  </button>
                   {expired && (
                     <button className="small ghost" onClick={() => settle(f.id)} disabled={settling === f.id}>
                       {settling === f.id ? "结算中…" : "结算"}

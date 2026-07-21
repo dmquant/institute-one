@@ -1,6 +1,15 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { createTree, getTree, listTrees, retryTreeNode, stopTree } from "../api";
+import {
+  addFavorite,
+  createTree,
+  getTree,
+  listFavorites,
+  listTrees,
+  removeFavorite,
+  retryTreeNode,
+  stopTree,
+} from "../api";
 import type { TreeNode } from "../api";
 import { useSSE } from "../useSSE";
 import {
@@ -27,11 +36,17 @@ function TreeList() {
   const navigate = useNavigate();
   const { lastEvent } = useSSE({ types: ["tree."], max: 1 });
   const trees = useLoad(() => listTrees(undefined, 50), [lastEvent?.id ?? 0], 20000);
+  const favorites = useLoad(() => listFavorites("research_tree"), [], 30000);
+  const favoriteIds = useMemo(
+    () => new Set((favorites.data ?? []).map((favorite) => favorite.ref_id)),
+    [favorites.data],
+  );
 
   const [topic, setTopic] = useState("");
   const [maxDepth, setMaxDepth] = useState(2);
   const [maxNodes, setMaxNodes] = useState(12);
   const [busy, setBusy] = useState(false);
+  const [favoriteBusy, setFavoriteBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -53,6 +68,20 @@ function TreeList() {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const toggleFavorite = async (treeId: string) => {
+    setErr(null);
+    setFavoriteBusy(treeId);
+    try {
+      if (favoriteIds.has(treeId)) await removeFavorite("research_tree", treeId);
+      else await addFavorite("research_tree", treeId);
+      favorites.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFavoriteBusy(null);
     }
   };
 
@@ -112,6 +141,7 @@ function TreeList() {
           树列表<span className="en">trees</span>
         </h2>
         <ErrorNote error={trees.error} />
+        <ErrorNote error={favorites.error} />
         {trees.loading && !trees.data && <Loading />}
         <table className="data">
           <thead>
@@ -122,6 +152,7 @@ function TreeList() {
               <th>深度/上限</th>
               <th>创建</th>
               <th>完成</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -141,6 +172,18 @@ function TreeList() {
                 </td>
                 <td className="dim nowrap">{ago(t.created_at)}</td>
                 <td className="dim nowrap">{t.finished_at ? ago(t.finished_at) : "—"}</td>
+                <td>
+                  <button
+                    aria-label={favoriteIds.has(t.id) ? "取消收藏" : "收藏研究树"}
+                    className="small ghost"
+                    disabled={favorites.loading || favoriteBusy === t.id}
+                    onClick={() => toggleFavorite(t.id)}
+                    style={{ color: favoriteIds.has(t.id) ? "var(--amber)" : undefined }}
+                    title={favoriteIds.has(t.id) ? "取消收藏" : "收藏到洞察页"}
+                  >
+                    {favoriteIds.has(t.id) ? "★" : "☆"}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>

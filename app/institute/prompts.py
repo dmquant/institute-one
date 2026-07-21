@@ -14,7 +14,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ..config import get_settings
+from . import prompt_overrides
 from .analysts import Analyst
+
+# The four override mount points below (prompt_overrides.SCOPES) render
+# through prompt_overrides.render(): an ACTIVE override row replaces the code
+# default; with no active override the output is byte-identical to these
+# constants (the templates are the former inline strings, unchanged).
 
 CITATION_MANDATE = """\
 【引用规范】所有事实性论断必须给出来源（链接、报告名或数据出处）。无法核实的内容必须明确标注「未经核实」。
@@ -25,6 +31,10 @@ FILE_DELIVERABLE = """\
 【交付规范】把完整成果写入工作目录下的文件 {filename}（Markdown，中文为主）。\
 写完后只回复一行：DONE: {filename}\
 """
+
+DATE_ANCHOR_TEMPLATE = "【时间锚点】今天是 {datetime}（新加坡时间）。所有「最近/目前/今年」均以此为准。"
+
+PERSONA_TEMPLATE = "你是 {name}（{name_en}），AI 研究所的{focus}。\n{persona}"
 
 
 def now_sgt() -> datetime:
@@ -38,13 +48,17 @@ def work_date() -> str:
 
 def date_anchor() -> str:
     n = now_sgt()
-    return f"【时间锚点】今天是 {n.strftime('%Y-%m-%d %A %H:%M')}（新加坡时间）。所有「最近/目前/今年」均以此为准。"
+    return prompt_overrides.render(
+        "prompts.date_anchor", DATE_ANCHOR_TEMPLATE,
+        datetime=n.strftime("%Y-%m-%d %A %H:%M"),
+    )
 
 
 def persona_block(analyst: Analyst) -> str:
-    return (
-        f"你是 {analyst.name}（{analyst.name_en}），AI 研究所的{analyst.focus}。\n"
-        f"{analyst.persona}"
+    return prompt_overrides.render(
+        "prompts.persona_block", PERSONA_TEMPLATE,
+        name=analyst.name, name_en=analyst.name_en,
+        focus=analyst.focus, persona=analyst.persona,
     )
 
 
@@ -84,9 +98,11 @@ def build_analyst_prompt(
         if block and block.strip():
             parts.append(block.strip())
     parts.append(f"## 任务\n{task.strip()}")
-    parts.append(CITATION_MANDATE)
+    parts.append(prompt_overrides.render("prompts.citation_mandate", CITATION_MANDATE))
     if output_file:
-        parts.append(FILE_DELIVERABLE.format(filename=output_file))
+        parts.append(prompt_overrides.render(
+            "prompts.file_deliverable", FILE_DELIVERABLE, filename=output_file,
+        ))
     return "\n\n".join(parts)
 
 

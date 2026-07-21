@@ -177,6 +177,13 @@ async def test_briefing_job_skips_under_maintenance_and_runs_after_resume():
     assert runs[0]["status"] == "completed"
 
 
+def test_scheduler_source_never_calls_raw_datetime_now():
+    """Hard rule 7 (R3 P3): storage timestamps come from bus.now_iso() and
+    work-date logic from now_sgt()/work_date() — scheduler.py must not call
+    datetime.now() directly (the janitor's UTC cutoff base had regressed)."""
+    assert "datetime.now(" not in inspect.getsource(scheduler)
+
+
 def test_job_gating_registry_matches_semantics():
     """Everything that submits new model calls is gated; ungated jobs never
     spend quota. FULL-SET assertion (F3 P3-3): reflect over every @metered
@@ -201,6 +208,9 @@ def test_job_gating_registry_matches_semantics():
         "operator-fast-route": True,
         "operator-deep-route": True,
         # ungated: pure DB/PIT/HTTP upkeep — never spends model quota
+        "factcheck-outbox": False,  # drain-only delivery, no model calls
+        "operator-selfimprove": False,  # deterministic observe/propose/measure, zero model calls
+        "portfolio-proposer": False,  # DB reads + PIT marks, zero model calls
         "janitor": False,
         "hand-scorecard": False,
         "market-refresh": False,
@@ -214,4 +224,4 @@ def test_job_gating_registry_matches_semantics():
         if hasattr(fn, "job_name")
     }
     assert found == expected  # full set: nothing missing, nothing extra, gates exact
-    assert len(found) == 21   # 7 cron + 14 interval (rate-limit-revival joined in H1)
+    assert len(found) == 24   # 9 cron + 15 interval (R1 additions)

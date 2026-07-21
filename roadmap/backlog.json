@@ -18,7 +18,9 @@
     "M5 Forecast Ledger",
     "M6 Alpha & Paper Book",
     "M7 Roadmap Control Plane",
-    "M8 Post-Audit Hardening"
+    "M8 Post-Audit Hardening",
+    "M9 North Star R1",
+    "M10 Loop Bounded-Autonomy"
   ],
   "cards": [
     {
@@ -596,7 +598,7 @@
       "title": "Calibrate similarity gates against real bge-m3 (50+ pairs)",
       "type": "test",
       "phase": "M8 Post-Audit Hardening",
-      "status": "inbox",
+      "status": "review",
       "priority": "P1",
       "risk": "low",
       "summary": "ROADMAP Phase 1a acceptance debt: the whiteboard similarity gate (0.85/14d skip, 0.65/30d build-on) shipped with uncalibrated default thresholds — the one-off distribution sanity check against ~50 known duplicate/related/unrelated pairs with real bge-m3 embeddings was never run. Run it against local Ollama, record the distribution, and adjust the config-row thresholds if the defaults misclassify.",
@@ -708,7 +710,7 @@
       "title": "Recipes, observations, proposals, effect measurement loop",
       "type": "feature",
       "phase": "M8 Post-Audit Hardening",
-      "status": "inbox",
+      "status": "review",
       "priority": "P2",
       "risk": "high",
       "summary": "ROADMAP Phase 6 L item, still schema-only (0018 recipes placeholder): recurring fixes become recipes; observations feed proposals; proposals require explicit human approval in the web UI (never via vault frontmatter or MCP — proposal §8.2 invariant); parameter history + effect measurement close the self-improvement loop.",
@@ -769,7 +771,7 @@
       "title": "Projects product surface: operations API, SPA page, MCP project_id",
       "type": "feature",
       "phase": "M8 Post-Audit Hardening",
-      "status": "inbox",
+      "status": "review",
       "priority": "P2",
       "risk": "medium",
       "summary": "S4-P2-16/17 + ROADMAP Phase 7 partial: projects are backend containers only — no SPA page, no archive/unlink API routes, no project digest endpoint; MCP research_queue_add has no optional project_id so the write side cannot attach a project (keep the 3-write-tool boundary).",
@@ -1065,6 +1067,473 @@
         "deprecation warnings reduced batch by batch with no behavior change",
         "stale comments/docs corrected against current code",
         "shutdown stops probing APScheduler private structures"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "M9-101",
+      "title": "Prompt overrides: data-driven prompt iteration",
+      "type": "feature",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "prompt_overrides table (shadow/active/retired per scope), resolve() over prompt constants with byte-stable defaults, ops API + diff preview (ROADMAP Phase 2).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0029_prompt_overrides.sql",
+        "app/institute/prompt_overrides.py",
+        "app/api/prompt_overrides.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "active override wins, shadow records only",
+        "defaults byte-identical without overrides",
+        "lifecycle transitions are conditional claims"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_prompt_overrides.py -q"
+      ]
+    },
+    {
+      "id": "M9-102",
+      "title": "Chain properties with supersede/conflict adjudication",
+      "type": "feature",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "chain_properties + hybrid supersede/conflict, conflicts surface as operator actions transactionally, late-period assertions cannot regress current (ROADMAP Phase 4).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0030_chain_properties.sql",
+        "app/institute/chain.py",
+        "app/api/chain.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "conflict rows pair with an operator action atomically",
+        "late assertions only touch their period",
+        "tick cursor never loses assertions nor replays model calls"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_chain.py -q"
+      ]
+    },
+    {
+      "id": "M9-103",
+      "title": "Portfolios L1-L3 and Sunday proposer",
+      "type": "feature",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "Per-analyst conviction-tiered virtual portfolios with Sunday 22:00 proposer and conditional-claim adjudication (ROADMAP Phase 5).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0032_portfolios.sql",
+        "app/institute/portfolios.py",
+        "app/api/portfolios.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "forecast routes to highest passing tier",
+        "proposal per (portfolio, work_date) is idempotent",
+        "adjudication re-checks liveness per item"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_portfolios.py -q"
+      ]
+    },
+    {
+      "id": "M9-104",
+      "title": "Favorites and Insights visualizations",
+      "type": "ui",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P2",
+      "risk": "low",
+      "summary": "Global favorites (migration 0031) + zero-dependency Insights charts page; star buttons on Trees/Forecasts (ROADMAP Phase 7).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0031_favorites.sql",
+        "app/api/favorites.py",
+        "frontend/src/pages/Insights.tsx"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "favorite add is idempotent",
+        "charts aggregate live API data with no new deps"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_favorites.py -q"
+      ]
+    },
+    {
+      "id": "M9-105",
+      "title": "Forecast ledger integrity: evidence chain, exactly-once extract, hard boundaries",
+      "type": "feature",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P0",
+      "risk": "high",
+      "summary": "System-fixed knowledge cutoff persisted per settlement (migration 0033), single PIT snapshot + benchmark alignment fail-closed, deterministic extract replay, made_at tolerance + backfill origin, cap switch removed (adversarial audit findings).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0033_forecast_evidence.sql",
+        "app/institute/forecasts.py",
+        "app/institute/forecast_extract.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "settle ignores caller-supplied as_of",
+        "extract survives claim/create crash without loss",
+        "backfilled forecasts excluded from performance scopes",
+        "aggregate caps cannot be disabled"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_forecasts.py tests/test_forecast_extract.py tests/test_paper_book.py -q"
+      ]
+    },
+    {
+      "id": "M9-106",
+      "title": "Factcheck trust boundary: strict verdicts, consistency gate, lease tokens, dispute outbox",
+      "type": "feature",
+      "phase": "M9 North Star R1",
+      "status": "review",
+      "priority": "P0",
+      "risk": "high",
+      "summary": "Ambiguous verdicts fall to UNVERIFIABLE, evidence required for actionable verdicts, similarity reuse gated on numeric/date/negation consistency, lease_id ownership (migration 0034), dispute events via durable outbox (adversarial audit findings).",
+      "design_links": [
+        "ROADMAP.md"
+      ],
+      "expected_files": [
+        "migrations/0034_factcheck_lease.sql",
+        "app/institute/factcheck.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "conflicting verdicts never mint DISPUTED",
+        "no-evidence verdicts are not actionable",
+        "stale workers lose the lease",
+        "dispute events survive crash via outbox"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests/test_factcheck.py -q"
+      ]
+    },
+    {
+      "id": "LOOP-P1",
+      "title": "executor 锁顺序：先 hand 锁后信号量",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "等 hand 锁的任务不再白占全局并发槽饿死空闲 hand；锁序 _hand_lock→_sem，无 ABBA。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/router/executor.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "忙 hand + 排队任务时空闲 hand 的 submit 不被阻塞"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P2",
+      "title": "operator 路由毒行写占位 disposition",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "路由失败/解析异常写占位 shadow disposition 占掉 propose-once 名额，堵死同一 action 无限重选烧配额。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/operator.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "失败 action 不被第二次重选",
+        "占位行 shadow=1 且不可消费"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P3",
+      "title": "factcheck 毒卡片 attempts 上界",
+      "type": "schema",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P1",
+      "risk": "medium",
+      "summary": "fact_cards.attempts 失败自增，3 次后条件宣占转终态 unverifiable；picker 按 attempts 沉底排除。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/factcheck.py",
+        "migrations/0035_fact_cards_attempts.sql"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "毒卡 N 次后不再被选中并落终态",
+        "预算耗尽的释放不计数"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P4",
+      "title": "chain 游标持久化失败有界跳过",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "确定性持久化失败按事件计数，3 次后开 failed_run 卡并推进游标，单毒事件模型花费封顶 3 次。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/chain.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "毒事件有限次后跳过不无限重付模型调用"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P5",
+      "title": "research_tree 终态守卫与崩溃安全宣告",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "_maybe_finish_tree 加 NOT EXISTS 守卫防 retry 竞态静默 prune；tree.completed 改 emit 成功后置位 announced_at。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/research_tree.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "retry 节点不被静默 prune",
+        "emit 前崩溃事件不永久丢失"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P6",
+      "title": "operator 自改进链幂等重放与楼层只升",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "approved+applied=0 允许幂等重放 apply；陈旧 set_parameter 提案 apply 时校验 new_floor>当前否则拒绝。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/operator.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "approve 后 apply 失败可重放不卡死",
+        "陈旧提案不能批降 confidence_floor"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P7",
+      "title": "fact_extract_queue worker lease",
+      "type": "schema",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "认领写随机 lease_id，终态写带 AND lease_id=?，stale 回收清 lease，老 worker 迟到写自然丢失。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/factcheck.py",
+        "migrations/0036_fact_extract_queue_lease.sql"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "过期重开后旧 worker 迟到写入不覆盖新 claim"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P8",
+      "title": "事件循环阻塞三处搬离/加界",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "P8a vault 扫描合并单遍进 to_thread；P8b _auto_cluster 加 LIMIT 200+30 天老化；P8c opener 限 50 候选 + get_last_bar_pit 单行读替代全历史扫描。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/operator.py",
+        "app/institute/chain.py",
+        "app/institute/paper_book.py",
+        "app/institute/market_data.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "三处同步阻塞不再冻结事件循环",
+        "扫描有界"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P9",
+      "title": "janitor 一致性备份 VACUUM INTO",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P2",
+      "risk": "medium",
+      "summary": "备份改 VACUUM INTO 临时文件+原子改名的一致性快照，并发 checkpoint 不再损坏备份；失败隔离不影响 janitor 其余步骤。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/scheduler.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "备份是有效一致的 sqlite 快照",
+        "备份失败不毒化 janitor"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P10",
+      "title": "低危修补 A（operator/factcheck）",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P3",
+      "risk": "medium",
+      "summary": "operator sweep 开卡上限 20 + 陈旧观察快照 7 天过滤；factcheck outbox CAS 失配重读、主 tick 异常交 @metered、向量扫描加 LIMIT 2000。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/operator.py",
+        "app/institute/factcheck.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "各低危路径有界，不静默吞异常"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P11",
+      "title": "低危修补 B（chain/paper_book/scheduler/mailbox）",
+      "type": "feature",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P3",
+      "risk": "medium",
+      "summary": "chain _auto_promote 每轮 20 上限 + artifact 读 512KB 钳制；paper_book opened 事件 ref 改 position id + benchmark 损坏 fail-closed + opened_at 逐笔取时；scheduler revival LIMIT 50；mailbox sweep 封顶 20。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "app/institute/chain.py",
+        "app/institute/paper_book.py",
+        "app/institute/scheduler.py",
+        "app/institute/mailbox.py"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "各有界性修补生效，消费方不受 ref 改动破坏"
+      ],
+      "verification": [
+        ".venv/bin/python -m pytest tests -q",
+        ".venv/bin/python -m compileall app -q"
+      ]
+    },
+    {
+      "id": "LOOP-P12",
+      "title": "收尾：CLAUDE.md 硬规则 + backlog 补卡 + 全量",
+      "type": "docs",
+      "phase": "M10 Loop Bounded-Autonomy",
+      "status": "review",
+      "priority": "P3",
+      "risk": "medium",
+      "summary": "CLAUDE.md 新增硬规则 11（失败重试必须带 attempts/lease 上界）；本清单 12 包补卡；权威全量 1078 passed / 1 skipped + compileall。",
+      "design_links": [
+        "roadmap/loop-fix-backlog.md"
+      ],
+      "expected_files": [
+        "CLAUDE.md",
+        "roadmap/backlog.json"
+      ],
+      "dependencies": [],
+      "acceptance": [
+        "硬规则落地",
+        "全量绿"
       ],
       "verification": [
         ".venv/bin/python -m pytest tests -q",

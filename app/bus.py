@@ -54,15 +54,14 @@ def on(type_prefix: str, handler: Handler) -> None:
     _handlers.append((type_prefix, handler))
 
 
-async def emit(type: str, ref_kind: str = "", ref_id: str = "", payload: dict | None = None) -> Event:
-    payload = payload or {}
-    created = now_iso()
-    event_id = await db.insert(
-        "INSERT INTO events (type, ref_kind, ref_id, payload, created_at) VALUES (?,?,?,?,?)",
-        (type, ref_kind, str(ref_id), json.dumps(payload, ensure_ascii=False), created),
-    )
-    event = Event(id=event_id, type=type, ref_kind=ref_kind, ref_id=str(ref_id), payload=payload, created_at=created)
+async def _publish(event: Event) -> None:
+    """Fan out an event that is already durable.
 
+    Keeping persistence separate from publication lets domain transactions
+    insert an ``events`` row atomically with their own state and then wake
+    live listeners after commit.  Durable cursor readers remain correct even
+    if the process dies in the small commit-to-publish window.
+    """
     for q in list(_subscribers):
         try:
             q.put_nowait(event)
@@ -75,6 +74,40 @@ async def emit(type: str, ref_kind: str = "", ref_id: str = "", payload: dict | 
                 await handler(event)
             except Exception:  # noqa: BLE001 - handlers must never break the emitter
                 log.exception("event handler failed for %s", event.type)
+
+
+async def emit(type: str, ref_kind: str = "", ref_id: str = "", payload: dict | None = None) -> Event:
+    payload = payload or {}
+    created = now_iso()
+    event_id = await db.insert(
+        "INSERT INTO events (type, ref_kind, ref_id, payload, created_at) VALUES (?,?,?,?,?)",
+        (type, ref_kind, str(ref_id), json.dumps(payload, ensure_ascii=False), created),
+    )
+    event = Event(id=event_id, type=type, ref_kind=ref_kind, ref_id=str(ref_id), payload=payload, created_at=created)
+    await _publish(event)
+    return event
+
+
+async def publish_durable(event_id: int) -> Event | None:
+    """Publish one event row inserted by an enclosing domain transaction.
+
+    This function never inserts a second row.  It is therefore safe for an
+    atomic domain transition to persist the canonical event itself, commit,
+    and call here for low-latency SSE/handler delivery.  If the call is lost
+    to a crash, ``replay()`` still exposes the durable event exactly once.
+    """
+    row = await db.query_one("SELECT * FROM events WHERE id = ?", (event_id,))
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    event = Event(
+        id=row["id"], type=row["type"], ref_kind=row["ref_kind"],
+        ref_id=row["ref_id"], payload=payload, created_at=row["created_at"],
+    )
+    await _publish(event)
     return event
 
 

@@ -21,6 +21,7 @@ import Analysts from "./pages/Analysts";
 import Hands from "./pages/Hands";
 import CronHealth from "./pages/CronHealth";
 import Operator from "./pages/Operator";
+import Insights from "./pages/Insights";
 import Settings from "./pages/Settings";
 
 const NAV: { to: string; zh: string; en: string }[] = [
@@ -40,6 +41,7 @@ const NAV: { to: string; zh: string; en: string }[] = [
   { to: "/hands", zh: "执行手", en: "Hands" },
   { to: "/cron", zh: "定时任务", en: "Cron" },
   { to: "/operator", zh: "运维", en: "Operator" },
+  { to: "/insights", zh: "洞察", en: "Insights" },
   { to: "/settings", zh: "设置", en: "Settings" },
 ];
 
@@ -119,6 +121,7 @@ export default function App() {
             <Route path="/hands" element={<Hands />} />
             <Route path="/cron" element={<CronHealth />} />
             <Route path="/operator" element={<Operator />} />
+            <Route path="/insights" element={<Insights />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

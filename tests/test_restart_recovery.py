@@ -14,6 +14,7 @@ the handler list afterwards so nothing leaks into later tests.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -131,6 +132,184 @@ async def test_second_restart_is_idempotent():
         from app.institute import research
 
         assert await research.recover_orphans() == 0
+
+
+async def test_lifespan_boot_drives_bound_revival_child_instead_of_failing_it(tmp_path):
+    """R5 boot integration: executor recovery recognizes a canonical revival
+    child as durable prepared work. The exact queued id survives lifespan boot
+    and completes; generic orphan semantics must not turn it failed first."""
+    from app.router import executor
+
+    now = bus.now_iso()
+    await db.execute(
+        "INSERT INTO tasks "
+        "(id, requested_hand, prompt, status, source, workspace_dir, timeout_s, "
+        " fallback_chain, error, created_at, finished_at) "
+        "VALUES ('boot-revival-src','echo','boot retry','rate_limited','test',?,60,"
+        " '[\"echo\"]','quota',?,?)",
+        (str(tmp_path), now, now),
+    )
+    source = await db.query_one("SELECT * FROM tasks WHERE id='boot-revival-src'")
+    async with db.transaction() as conn:
+        prepared = await executor.prepare_respawn_from_row(conn, source, max_attempts=5)
+    await db.execute(
+        "UPDATE tasks SET error=error || '\n[rate-limit-revival:claimed]' "
+        "WHERE id='boot-revival-src'"
+    )
+
+    async with _lifespan():
+        for _ in range(100):
+            child = await db.query_one(
+                "SELECT status FROM tasks WHERE id=?", (prepared.task_id,)
+            )
+            if child["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+        assert child["status"] == "completed"
+        source = await db.query_one(
+            "SELECT revival_task_id FROM tasks WHERE id='boot-revival-src'"
+        )
+        assert source["revival_task_id"] == prepared.task_id
+        assert len(await db.query(
+            "SELECT id FROM tasks WHERE revived_from_task_id='boot-revival-src'"
+        )) == 1
+
+
+async def test_paused_boot_reconciles_without_model_work_then_scheduler_resumes(tmp_path):
+    """Maintenance covers the pre-scheduler boot window too.
+
+    Durable revival/mailbox work is reconciled to queued, but neither echo
+    driver may start until maintenance is explicitly resumed.  Pure cleanup
+    (generic task failure and research requeue) still runs at boot; after the
+    flip, the existing gated jobs adopt the exact same prepared task ids.
+    """
+    from app.institute import mailbox
+    from app.router import executor
+
+    now = bus.now_iso()
+
+    await db.execute(
+        "INSERT INTO tasks "
+        "(id, requested_hand, prompt, status, source, workspace_dir, timeout_s, "
+        " fallback_chain, error, created_at, finished_at) "
+        "VALUES ('paused-revival-src','echo','paused retry','rate_limited','test',?,60,"
+        " '[\"echo\"]','quota',?,?)",
+        (str(tmp_path / "revival"), now, now),
+    )
+    source = await db.query_one("SELECT * FROM tasks WHERE id='paused-revival-src'")
+    async with db.transaction() as conn:
+        prepared = await executor.prepare_respawn_from_row(conn, source, max_attempts=5)
+    assert prepared is not None
+    await db.execute(
+        "UPDATE tasks SET status='running', started_at=? WHERE id=?",
+        (now, prepared.task_id),
+    )
+
+    await db.execute(
+        "INSERT INTO mailbox_threads "
+        "(id, subject, analyst_id, status, created_at, updated_at) "
+        "VALUES ('paused-mailbox','暂停恢复','macro-analyst','open',?,?)",
+        (now, now),
+    )
+    dispatch_id = await db.insert(
+        "INSERT INTO mailbox_messages "
+        "(thread_id, author, kind, body, status, created_at) "
+        "VALUES ('paused-mailbox','macro-analyst','dispatch','','pending',?)",
+        (now,),
+    )
+    _thread, analyst, hand, prompt = await mailbox._prepare_dispatch(
+        "paused-mailbox", dispatch_id,
+    )
+    mailbox_task_id, _lease, reason = await mailbox._book_dispatch_task(
+        "paused-mailbox", dispatch_id,
+        hand=hand, model=analyst.model, prompt=prompt,
+    )
+    assert reason == "ok" and mailbox_task_id
+    await db.execute(
+        "UPDATE tasks SET status='running', started_at=? WHERE id=?",
+        (now, mailbox_task_id),
+    )
+
+    await db.execute(
+        "INSERT INTO tasks (id, requested_hand, prompt, status, source, created_at) "
+        "VALUES ('paused-generic','echo','cleanup only','queued','test',?)",
+        (now,),
+    )
+    await db.execute(
+        "INSERT INTO research_queue "
+        "(id, topic, status, source, created_at, started_at) "
+        "VALUES ('paused-research','纯状态对账','running','test',?,?)",
+        (now, now),
+    )
+    await scheduler_mod.set_maintenance(True)
+
+    async with _lifespan():
+        revival_child = await db.query_one(
+            "SELECT status FROM tasks WHERE id=?", (prepared.task_id,),
+        )
+        mailbox_task = await db.query_one(
+            "SELECT status FROM tasks WHERE id=?", (mailbox_task_id,),
+        )
+        dispatch = await db.query_one(
+            "SELECT status, leased_at FROM mailbox_messages WHERE id=?", (dispatch_id,),
+        )
+        assert revival_child["status"] == "queued"
+        assert mailbox_task["status"] == "queued"
+        assert dispatch == {"status": "pending", "leased_at": None}
+        assert prepared.task_id not in executor._running
+        assert mailbox_task_id not in executor._running
+
+        generic = await db.query_one(
+            "SELECT status, error FROM tasks WHERE id='paused-generic'"
+        )
+        assert generic == {"status": "failed", "error": "orphaned by restart"}
+        research = await db.query_one(
+            "SELECT status, started_at FROM research_queue WHERE id='paused-research'"
+        )
+        assert research == {"status": "pending", "started_at": None}
+
+        await scheduler_mod.set_maintenance(False)
+        await scheduler_mod._rate_limit_revival_job()
+        await scheduler_mod._mailbox_sweep_job()
+        for _ in range(200):
+            revival_child = await db.query_one(
+                "SELECT status FROM tasks WHERE id=?", (prepared.task_id,),
+            )
+            dispatch = await db.query_one(
+                "SELECT status FROM mailbox_messages WHERE id=?", (dispatch_id,),
+            )
+            if revival_child["status"] == "completed" and dispatch["status"] == "done":
+                break
+            await asyncio.sleep(0.01)
+        assert revival_child["status"] == "completed"
+        assert dispatch["status"] == "done"
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE revived_from_task_id='paused-revival-src'"
+        ))["n"] == 1
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM tasks WHERE mailbox_dispatch_id=?",
+            (dispatch_id,),
+        ))["n"] == 1
+
+
+async def test_lifespan_boot_prewarms_active_prompt_override():
+    """A persisted active override is live on the first prompt after boot."""
+    from app.institute import prompt_overrides, prompts
+    from app.institute.analysts import get_analyst
+
+    row = await prompt_overrides.create(
+        "prompts.citation_mandate", "【重启后立即生效的引用规范】",
+    )
+    await prompt_overrides.activate(row["id"])
+    prompt_overrides.invalidate_cache()  # model a fresh process
+    assert prompt_overrides._cache is None
+
+    async with _lifespan():
+        prompt = prompts.build_analyst_prompt(get_analyst("macro-analyst"), "启动探针")
+        assert "【重启后立即生效的引用规范】" in prompt
+        assert prompt_overrides._cache == {
+            "prompts.citation_mandate": "【重启后立即生效的引用规范】",
+        }
 
 
 # ---- janitor adoption of stuck workflow runs (no prior coverage) ---------------

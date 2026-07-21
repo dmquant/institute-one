@@ -69,6 +69,12 @@ SINA_HQ_BASE = "https://hq.sinajs.cn"
 SINA_KLINE_BASE = "https://money.finance.sina.com.cn"
 # hq.sinajs.cn rejects requests without a finance.sina referer
 SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
+# GB18030 is a strict superset of GBK for the legacy quote endpoint and has a
+# canonical codec module across supported Python builds.  Some long-running
+# Python 3.14 test/process states have returned a transient failed lookup for
+# the ``gbk`` alias even though the payload was valid; the superset avoids an
+# alias-specific availability/cache failure without changing decoded bytes.
+SINA_TEXT_ENCODING = "gb18030"
 USER_AGENT = "Mozilla/5.0 (institute-one market fetcher)"
 
 
@@ -278,7 +284,7 @@ async def _stooq_quote(client: httpx.AsyncClient, security_id: str, sym: str) ->
 async def _sina_quote(client: httpx.AsyncClient, security_id: str, sym: str) -> dict[str, Any] | None:
     r = await client.get(f"{SINA_HQ_BASE}/list={sym}", headers=SINA_HEADERS)
     r.raise_for_status()
-    text = r.content.decode("gbk", errors="replace")
+    text = r.content.decode(SINA_TEXT_ENCODING, errors="replace")
     m = re.search(r'="([^"]*)"', text)
     if not m or not m.group(1).strip():
         return None

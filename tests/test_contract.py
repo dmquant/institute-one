@@ -43,18 +43,30 @@ def _client() -> AsyncClient:
 
 # ---- /api/contract -------------------------------------------------------------
 
-def _enum_from_0001(table: str) -> list[str]:
-    """Independently parse a table's status CHECK enum out of the 0001 SQL
-    text — deliberately NOT the module under test, so a constant drifting
-    away from the schema fails here even if code and contract drift together."""
-    sql = (REPO / "migrations" / "0001_init.sql").read_text(encoding="utf-8")
-    m = re.search(
-        rf"CREATE TABLE IF NOT EXISTS {table}\b.*?status\s+TEXT\s+NOT\s+NULL\s+"
-        rf"CHECK \(status IN \(([^)]*)\)\)",
-        sql, re.DOTALL,
-    )
-    assert m, f"no status CHECK found for {table} in 0001_init.sql"
-    return sorted(v.strip().strip("'") for v in m.group(1).split(","))
+def _enum_from_migrations(table: str) -> list[str]:
+    """Independently parse a table's status CHECK enum out of the migration
+    SQL text — deliberately NOT the module under test, so a constant drifting
+    away from the schema fails here even if code and contract drift together.
+    Tables can be REBUILT by later migrations (0028 rebuilt tasks to extend
+    the enum), so the LAST migration that declares the CHECK wins."""
+    result: list[str] | None = None
+    for path in sorted((REPO / "migrations").glob("*.sql")):
+        sql = path.read_text(encoding="utf-8")
+        # [^;]*? keeps the match inside ONE create statement (no semicolons
+        # occur within a CREATE TABLE body) so it cannot leak across tables
+        for m in re.finditer(
+            r"CREATE TABLE IF NOT EXISTS (\w+)\b[^;]*?status\s+TEXT\s+NOT\s+NULL\s+"
+            r"CHECK \(status IN \(([^)]*)\)\)",
+            sql, re.DOTALL,
+        ):
+            # rebuild migrations create <table>_rebuild_NNNN then RENAME TO <table>
+            created = m.group(1)
+            renamed = re.search(rf"ALTER TABLE {created} RENAME TO (\w+)", sql)
+            target = renamed.group(1) if renamed else created
+            if target == table:
+                result = sorted(v.strip().strip("'") for v in m.group(2).split(","))
+    assert result is not None, f"no status CHECK found for {table} in migrations/*.sql"
+    return result
 
 
 async def test_contract_enums_come_from_code_constants():
@@ -73,9 +85,9 @@ async def test_contract_enums_come_from_code_constants():
     assert body["statuses"]["whiteboard_boards"] == sorted(whiteboard.BOARD_STATUSES)
     assert body["terminal_task_statuses"] == sorted(executor.TERMINAL)
 
-    # ...and the constants match the 0001 schema text, independently parsed
+    # ...and the constants match the migration schema text, independently parsed
     for table in ("tasks", "workflow_runs", "research_queue", "whiteboard_boards"):
-        assert body["statuses"][table] == _enum_from_0001(table), table
+        assert body["statuses"][table] == _enum_from_migrations(table), table
 
 
 async def test_contract_caps_and_ref_grammar():

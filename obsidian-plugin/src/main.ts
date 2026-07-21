@@ -43,6 +43,8 @@ import { RoadmapView, VIEW_TYPE_ROADMAP } from "./roadmap";
 
 export interface InstituteSettings {
 	baseUrl: string;
+	/** Optional bearer token matching the backend's INSTITUTE_TOKEN. */
+	token: string;
 	/** Obsidian-vault subfolder that maps to the backend's vault_dir. */
 	vaultSubfolder: string;
 	/** Last-used / default analyst id ("" = default hand, no persona). */
@@ -56,6 +58,7 @@ export interface InstituteSettings {
 
 export const DEFAULT_SETTINGS: InstituteSettings = {
 	baseUrl: "http://127.0.0.1:8100",
+	token: "",
 	vaultSubfolder: "Institute",
 	defaultAnalyst: "",
 	insertStyle: "callout",
@@ -77,7 +80,10 @@ export default class InstituteOnePlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
-		this.api = new InstituteApi(() => this.settings.baseUrl);
+		this.api = new InstituteApi(
+			() => this.settings.baseUrl,
+			() => this.settings.token,
+		);
 		this.addSettingTab(new InstituteSettingTab(this.app, this));
 
 		// ---- dashboard view ------------------------------------------------
@@ -877,6 +883,19 @@ class InstituteSettingTab extends PluginSettingTab {
 						void this.plugin.refreshStatus();
 					}),
 			);
+
+		new Setting(containerEl)
+			.setName("访问令牌 (bearer token)")
+			.setDesc("后端设置 INSTITUTE_TOKEN 时填写同一令牌；未启用鉴权时留空。")
+			.addText((t) => {
+				t.inputEl.type = "password";
+				t.setPlaceholder("未设置")
+					.setValue(this.plugin.settings.token)
+					.onChange(async (v) => {
+						this.plugin.settings.token = v.trim();
+						await this.plugin.saveSettings();
+					});
+			});
 
 		new Setting(containerEl)
 			.setName("Vault 子目录")

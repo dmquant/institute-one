@@ -110,7 +110,28 @@ async def lifespan(app: FastAPI):
     # call happens (registry is sync and never reads the DB itself)
     from .api.hands import refresh_weights_cache
     await refresh_weights_cache()
-    await executor.recover_orphans()
+
+    # The prompt render path is synchronous and cache-backed. Pre-warm before
+    # any recovery path can assemble/drive model work so persisted active
+    # overrides take effect on the first prompt after a restart.
+    from .institute import prompt_overrides as prompt_overrides_boot
+    await prompt_overrides_boot.refresh_cache()
+
+    from .institute import scheduler as sched
+    maintenance_paused = await sched.get_maintenance()
+    if maintenance_paused:
+        log.info("maintenance paused: boot recovery will not attach model drivers")
+    await executor.recover_orphans(drive_prepared=not maintenance_paused)
+
+    # Domain task bindings must converge immediately after the executor's
+    # boot sweep, before periodic scheduler jobs begin. A completed factcheck
+    # task is parsed instead of called again; prepared mailbox work keeps its
+    # existing dispatch id and is re-driven only when maintenance is open.
+    from .institute import factcheck as factcheck_boot
+    await factcheck_boot._recover_stale_running()  # noqa: SLF001 - boot recovery contract
+
+    from .institute import mailbox as mailbox_boot
+    await mailbox_boot.recover_orphans(redrive=not maintenance_paused)
 
     from .institute import research
     await research.recover_orphans()
@@ -140,7 +161,6 @@ async def lifespan(app: FastAPI):
     from .institute import operator as operator_loop
     operator_loop.register()
 
-    from .institute import scheduler as sched
     sched.start()
 
     log.info("institute-one ready on http://%s:%s", settings.host, settings.port)
@@ -183,6 +203,7 @@ def create_app() -> FastAPI:
         events as api_events,
         factcheck as api_factcheck,
         forecasts as api_forecasts,
+        favorites as api_favorites,
         hands as api_hands,
         mailbox as api_mailbox,
         market_data as api_market_data,
@@ -190,7 +211,9 @@ def create_app() -> FastAPI:
         multi_agent as api_multi_agent,
         operator as api_operator,
         paper_book as api_paper_book,
+        portfolios as api_portfolios,
         projects as api_projects,
+        prompt_overrides as api_prompt_overrides,
         research as api_research,
         research_tree as api_research_tree,
         roadmap as api_roadmap,
@@ -211,9 +234,10 @@ def create_app() -> FastAPI:
         api_research_tree.router, api_projects.router,
         api_roadmap.router, api_theses.router, api_market_data.router,
         api_forecasts.router, api_chain.router, api_paper_book.router,
+        api_portfolios.router, api_prompt_overrides.router,
         api_factcheck.router, api_operator.router, api_multi_agent.router,
         api_archive.router, api_vault.router, api_bilingual.router,
-        api_contract.router, api_mcp.router,
+        api_contract.router, api_favorites.router, api_mcp.router,
     ):
         app.include_router(r)
 
@@ -225,6 +249,10 @@ def create_app() -> FastAPI:
         # Registered last, so every /api route above wins first.
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa(full_path: str):
+            # an unknown /api/* path is a client/API drift bug, not a page:
+            # serving index.html (200 text/html) would mask it from callers
+            if full_path == "api" or full_path.startswith("api/"):
+                return JSONResponse(status_code=404, content={"detail": "unknown API route"})
             target = (dist / full_path).resolve()
             if full_path and target.is_file() and target.is_relative_to(dist.resolve()):
                 return FileResponse(target)

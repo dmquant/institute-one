@@ -12,9 +12,13 @@ The shadow-mode iron rules are LOCKED here:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import shutil
 import sqlite3
+import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -45,6 +49,29 @@ def clean_vault_dir():
 
 
 # ---- feeds -------------------------------------------------------------------
+
+def test_register_is_idempotent_and_repairs_restored_handler_snapshot():
+    """Registration truth is the bus list, not a stale module boolean.
+
+    Other subsystem tests and embedded lifecycles legitimately restore a
+    saved handler snapshot.  A later operator.register() must put its feeds
+    back exactly once.
+    """
+    before = list(bus._handlers)
+    expected = (
+        (operator.FACTCHECK_DISPUTED_EVENT, operator._on_factcheck_disputed),
+        ("task.failed", operator._on_task_failed),
+        ("workflow.failed", operator._on_workflow_failed),
+        ("scorecard.completed", operator._on_scorecard_completed),
+    )
+    try:
+        bus._handlers[:] = [item for item in bus._handlers if item not in expected]
+        operator.register()
+        operator.register()
+        assert all(bus._handlers.count(item) == 1 for item in expected)
+    finally:
+        bus._handlers[:] = before
+
 
 async def test_task_failed_feed_idempotent_per_ref():
     operator.register()
@@ -136,6 +163,15 @@ async def test_feed_handlers_never_raise(caplog):
 
 # ---- vault-conflict sweep ------------------------------------------------------
 
+def _age_file(p, seconds: int = 600) -> None:
+    """Backdate a file's mtime past the sweep's freshness grace (R3-P2): the
+    sweep defers carding paths whose bytes changed moments ago (they may be a
+    writer's os.replace whose ledger upsert hasn't landed yet). Tests that
+    stage a genuine stale human edit age the file to get same-sweep cards."""
+    t = time.time() - seconds
+    os.utime(p, (t, t))
+
+
 async def test_sweep_vault_conflicts_idempotent(clean_vault_dir):
     writer = get_writer()
     rel = await writer.write_note("Reports/c4.md", {"title": "x"}, "v1",
@@ -163,6 +199,7 @@ async def test_sweep_vault_drifted(clean_vault_dir):
                                   artifact_kind="report", artifact_id="d4")
     p = writer.root / rel
     p.write_text(p.read_text(encoding="utf-8") + "\n人工加注\n", encoding="utf-8")
+    _age_file(p)
 
     res = await operator.sweep_vault_conflicts()
     assert res["doctor"]["drifted"] == 1
@@ -170,13 +207,289 @@ async def test_sweep_vault_drifted(clean_vault_dir):
     assert row is not None and "drifted" in row["title"]
 
 
+async def test_sweep_reverifies_against_fresh_ledger_before_carding(clean_vault_dir, monkeypatch):
+    """R3-P2 loop-fix: the thread scan judges a ledger SNAPSHOT while the
+    event loop keeps running VaultWriter (disk os.replace lands BEFORE the
+    ledger upsert) — a scan verdict can describe a moment the world has
+    already moved past. Every candidate is re-verified against the FRESH
+    ledger row before carding, so a stale drift verdict opens nothing."""
+    writer = get_writer()
+    rel = await writer.write_note("Reports/rv1.md", {"title": "x"}, "v1",
+                                  artifact_kind="report", artifact_id="rv1")
+    real = operator._classify_vault_rows
+
+    def stale_scan(root, rows):
+        counts, nonclean = real(root, rows)
+        # the snapshot-time verdict: swears the path drifted, though the
+        # ledger and disk are consistent by the time cards would open
+        counts["clean"] -= 1
+        counts["drifted"] += 1
+        return counts, [*nonclean, (rel, "drifted")]
+
+    monkeypatch.setattr(operator, "_classify_vault_rows", stale_scan)
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 0
+    assert await db.query("SELECT * FROM operator_actions") == []
+
+
+async def test_sweep_grace_defers_inflight_writer_updates(clean_vault_dir):
+    """R3-P2 loop-fix: VaultWriter replaces the file FIRST, then upserts the
+    ledger — a sweep landing in that window used to card a perfectly normal
+    write as drift (new bytes vs old hash). Freshly-changed files (mtime
+    within the grace) are deferred one sweep: an in-flight write reads clean
+    once its upsert lands, while a genuine stale human edit still cards as
+    soon as it has aged past the grace."""
+    writer = get_writer()
+    rel = await writer.write_note("Reports/g1.md", {"title": "x"}, "v1",
+                                  artifact_kind="report", artifact_id="g1")
+    p = writer.root / rel
+    # mid-write shape: file already replaced, ledger upsert not yet landed
+    v2 = p.read_text(encoding="utf-8").replace("v1", "v2")
+    p.write_text(v2, encoding="utf-8")
+
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 0                          # deferred, not carded
+    assert await db.query("SELECT * FROM operator_actions") == []
+
+    # the writer's upsert lands: the path reads clean, no card ever opens
+    await db.execute("UPDATE vault_index SET sha256 = ? WHERE path = ?",
+                     (operator._sha_file(p), rel))
+    res = await operator.sweep_vault_conflicts()
+    assert res["doctor"]["clean"] == res["doctor"]["total"]
+    assert await db.query("SELECT * FROM operator_actions") == []
+
+    # a genuine human edit: deferred while fresh, carded once aged past grace
+    p.write_text(v2 + "\n人工批注\n", encoding="utf-8")
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 0
+    _age_file(p)
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 1
+    row = await db.query_one("SELECT * FROM operator_actions WHERE ref = ?", (f"vault:{rel}",))
+    assert row is not None and row["status"] == "open"
+
+
+async def test_sweep_waits_through_writer_replace_to_ledger_window(
+    clean_vault_dir, monkeypatch,
+):
+    """R5 P3: even a writer paused past the mtime grace cannot open a false card.
+
+    The writer has replaced the disk file but deliberately parks before its
+    ledger upsert.  The sweep's snapshot sees apparent drift; its final check
+    must wait on the shared writer lock, then observe the committed ledger and
+    converge cleanly.
+    """
+    writer = get_writer()
+    rel = await writer.write_note(
+        "Reports/r5-lock.md", {"title": "x"}, "v1",
+        artifact_kind="report", artifact_id="r5-lock",
+    )
+    replaced = asyncio.Event()
+    release = asyncio.Event()
+    real_upsert = writer._upsert
+
+    async def park_after_replace(*args, **kwargs):
+        replaced.set()
+        await release.wait()
+        return await real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(writer, "_upsert", park_after_replace)
+    write_task = asyncio.create_task(writer.write_note(
+        rel, {"title": "x"}, "v2",
+        artifact_kind="report", artifact_id="r5-lock",
+    ))
+    await asyncio.wait_for(replaced.wait(), timeout=5)
+    _age_file(writer.root / rel, operator.SWEEP_FRESH_GRACE_S + 10)
+
+    sweep_task = asyncio.create_task(operator.sweep_vault_conflicts())
+    await asyncio.sleep(0.1)
+    assert not sweep_task.done()  # final recheck is waiting for writer commit
+
+    release.set()
+    assert await asyncio.wait_for(write_task, timeout=5) == rel
+    result = await asyncio.wait_for(sweep_task, timeout=5)
+    assert result["opened"] == 0
+    assert await db.query("SELECT * FROM operator_actions WHERE kind='vault_conflict'") == []
+    ledger = await db.query_one("SELECT sha256 FROM vault_index WHERE path=?", (rel,))
+    assert ledger["sha256"] == operator._sha_file(writer.root / rel)
+
+
+async def test_sweep_future_mtime_is_not_forever_fresh(clean_vault_dir):
+    """R4-P2: the grace was ``now - mtime < 120`` with no lower bound — a
+    FUTURE mtime (clock drift, restored backup, sync tool) gives a negative
+    age that stays "fresh" until the wall clock catches up, deferring a real
+    human edit for months. Freshness is now a bounded window: small future
+    skew still defers, but an mtime beyond the allowed skew is a logged clock
+    anomaly and cards immediately."""
+    writer = get_writer()
+    rel = await writer.write_note("Reports/fm1.md", {"title": "x"}, "v1",
+                                  artifact_kind="report", artifact_id="fm1")
+    p = writer.root / rel
+    p.write_text(p.read_text(encoding="utf-8") + "\n人工\n", encoding="utf-8")
+
+    t = time.time() + 60                        # plausible small skew: still fresh
+    os.utime(p, (t, t))
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 0                   # deferred like any fresh change
+
+    t = time.time() + 365 * 24 * 3600           # a year in the future: anomaly
+    os.utime(p, (t, t))
+    res = await operator.sweep_vault_conflicts()
+    assert res["opened"] == 1                   # carded, not deferred until 2027
+    row = await db.query_one("SELECT * FROM operator_actions WHERE ref = ?", (f"vault:{rel}",))
+    assert row is not None and row["status"] == "open"
+
+
+async def test_sweep_poison_path_does_not_abort_the_round(clean_vault_dir):
+    """R4-P2: VaultWriter accepts filenames the action-ref grammar refuses
+    (control chars, e.g. a newline) — open_action's injection guard raises,
+    and that used to escape to the sweep's OUTER try before the cursor was
+    saved: every later sweep restarted at the same poison path and the tail
+    starved. Candidates are now isolated per-path (a poison row is logged and
+    skipped) and the cursor persists in a finally, so one bad filename can
+    never wedge the rotation. Root fix — refusing control chars at the
+    VaultWriter entry — lives in writer.py (out of this card's boundary)."""
+    writer = get_writer()
+    bad = await writer.write_note("Reports/a\nbad.md", {"title": "x"}, "v1",
+                                  artifact_kind="report", artifact_id="bad")
+    good = await writer.write_note("Reports/z-good.md", {"title": "x"}, "v1",
+                                   artifact_kind="report", artifact_id="good")
+    assert bad == "Reports/a\nbad.md"           # the writer really allows it
+    for rel in (bad, good):
+        p = writer.root / rel
+        p.write_text(p.read_text(encoding="utf-8") + "\n人工\n", encoding="utf-8")
+        _age_file(p)
+
+    res = await operator.sweep_vault_conflicts()
+    assert "error" not in res                   # the round survives the poison row
+    assert res["errors"] == 1
+    assert res["opened"] == 1                   # ...and still cards the good path
+    refs = {a["ref"] for a in await db.query("SELECT ref FROM operator_actions")}
+    assert f"vault:{good}" in refs
+
+    res2 = await operator.sweep_vault_conflicts()
+    assert "error" not in res2                  # repeat rounds converge, no wedge
+    assert res2["opened"] == 0 and res2["errors"] == 1
+
+
+async def test_sweep_cap_does_not_starve_the_tail(clean_vault_dir, monkeypatch):
+    """R3-P2 liveness: the cap with a stable iteration order let the HEAD
+    monopolize every sweep — dismissing a head card (disk unfixed) freed its
+    ref, the next sweep re-opened the same head path and re-exhausted the
+    cap, and the tail stayed deferred forever. A persisted round-robin
+    cursor rotates the start point, so every drifted path is eventually
+    visited even when earlier cards keep being closed."""
+    writer = get_writer()
+    rels = []
+    for i in range(3):
+        rel = await writer.write_note(f"Reports/s{i}.md", {"title": "x"}, "v1",
+                                      artifact_kind="report", artifact_id=f"s{i}")
+        p = writer.root / rel
+        p.write_text(p.read_text(encoding="utf-8") + "\n人工\n", encoding="utf-8")
+        _age_file(p)
+        rels.append(rel)
+
+    monkeypatch.setattr(operator, "SWEEP_MAX_NEW_ACTIONS", 1)
+    carded: set[str] = set()
+    for _ in range(3):
+        res = await operator.sweep_vault_conflicts()
+        assert res["opened"] == 1
+        rows = await db.query("SELECT id, ref FROM operator_actions WHERE status = 'open'")
+        assert len(rows) == 1
+        carded.add(rows[0]["ref"])
+        # the human closes the card each round WITHOUT fixing the disk — the
+        # freed ref must not let the head re-consume the cap forever
+        assert await operator.dismiss_action(rows[0]["id"], "later") is True
+    assert carded == {f"vault:{rel}" for rel in rels}  # every path was visited
+
+
 async def test_sweep_skips_when_vault_disabled(monkeypatch):
     class Dummy:
+        root = None  # the disabled shape (VaultWriter.root is None)
+
         async def doctor(self):
             return None
 
     monkeypatch.setattr(operator, "get_writer", lambda: Dummy())
     assert await operator.sweep_vault_conflicts() == {"skipped": "vault_disabled"}
+
+
+async def test_sweep_scan_runs_off_the_event_loop(clean_vault_dir, monkeypatch):
+    """P8a loop-fix: the sweep's full-table file read + SHA used to run
+    synchronously ON the event loop (twice: once in writer.doctor(), once in
+    the per-path mirror), freezing every other coroutine for the duration of
+    a big vault scan. The classification now runs in a worker thread — a
+    deliberately slowed read must leave the loop breathing."""
+    import asyncio
+    import time
+
+    writer = get_writer()
+    rel = await writer.write_note("Reports/p8.md", {"title": "x"}, "v1",
+                                  artifact_kind="report", artifact_id="p8", region=True)
+    p = writer.root / rel
+    p.write_text(p.read_text(encoding="utf-8").replace("v1", "v1 人工改动"),
+                 encoding="utf-8")               # region edited -> drifted
+    _age_file(p)
+
+    real_read = operator._read_exact
+
+    def slow_read(path):
+        time.sleep(0.4)  # a big vault, compressed into one slow region read
+        return real_read(path)
+
+    monkeypatch.setattr(operator, "_read_exact", slow_read)
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    t = asyncio.create_task(ticker())
+    try:
+        res = await operator.sweep_vault_conflicts()
+    finally:
+        t.cancel()
+    assert "error" not in res
+    assert res["doctor"]["drifted"] == 1      # counts still authoritative
+    assert res["opened"] == 1                 # ...and the action still opens
+    # blocked-loop behaviour yields ~0 ticks during the 0.4s read; a threaded
+    # scan yields ~40 — a generous threshold keeps the test load-tolerant
+    assert ticks >= 5
+
+
+async def test_sweep_flood_is_capped_per_run(clean_vault_dir, monkeypatch):
+    """P10a loop-fix: a mass drift event (a human reorganising the vault) used
+    to bury the kanban in one sweep — one card per drifted path, unbounded.
+    New cards per run are now capped; the surplus is reported as deferred and
+    later sweeps drain it (live cards from earlier runs never consume the
+    cap, so the flood converges instead of starving)."""
+    writer = get_writer()
+    for i in range(3):
+        rel = await writer.write_note(f"Reports/f{i}.md", {"title": "x"}, "v1",
+                                      artifact_kind="report", artifact_id=f"f{i}")
+        p = writer.root / rel
+        p.write_text(p.read_text(encoding="utf-8") + "\n人工\n", encoding="utf-8")
+        _age_file(p)
+
+    monkeypatch.setattr(operator, "SWEEP_MAX_NEW_ACTIONS", 2)
+    n_cards = ("SELECT COUNT(*) AS n FROM operator_actions "
+               "WHERE kind = 'vault_conflict' AND status = 'open'")
+
+    res = await operator.sweep_vault_conflicts()
+    assert res["doctor"]["drifted"] == 3                    # counts stay authoritative
+    assert res["opened"] == 2 and res["deferred"] == 1      # flood capped
+    assert (await db.query_one(n_cards))["n"] == 2
+
+    res2 = await operator.sweep_vault_conflicts()           # drains next run
+    assert res2["opened"] == 1 and res2["deferred"] == 0
+    assert (await db.query_one(n_cards))["n"] == 3
+
+    res3 = await operator.sweep_vault_conflicts()           # steady state
+    assert res3["opened"] == 0 and res3["deferred"] == 0
+    assert (await db.query_one(n_cards))["n"] == 3
 
 
 # ---- the shadow router ---------------------------------------------------------
@@ -747,6 +1060,107 @@ async def test_disposition_unique_index_scoped_to_loops():
     assert [r["proposed_by"] for r in rows] == ["deep_loop", "human", "human"]
 
 
+# ---- P2 loop-fix: route failures spend the propose-once slot -----------------
+# A poison action (router task keeps failing) used to leave NO disposition row,
+# so the candidate query's NOT EXISTS guard never engaged: the same
+# high-priority row was re-selected every tick, burning model quota forever and
+# hogging the cap. Failures now write a placeholder shadow disposition.
+
+def _failing_submit(counter: dict):
+    """A stand-in model whose task always ends non-completed."""
+    async def submit(hand, prompt, **kwargs):
+        counter["calls"] = counter.get("calls", 0) + 1
+
+        class _T:
+            id = "fake-task"
+            status = "failed"
+            output = ""
+        return _T()
+    return submit
+
+
+def _raising_submit(counter: dict):
+    """A stand-in executor that blows up in-flight (the 753-755 except path)."""
+    async def submit(hand, prompt, **kwargs):
+        counter["calls"] = counter.get("calls", 0) + 1
+        raise RuntimeError("boom")
+    return submit
+
+
+def _assert_route_error_placeholder(d: dict) -> None:
+    assert d["shadow"] == 1                      # iron rule 1, unchanged
+    assert d["disposition"] == "unparsed"        # 0018's legal "nothing usable" value
+    assert d["confidence"] is None               # approve gate refuses NULL forever
+    assert d["recipe_id"] is None
+    assert "route_error" in d["flags"].split(",")  # distinguishable from model garbage
+
+
+async def test_router_failed_task_writes_placeholder_and_is_not_reselected(monkeypatch):
+    await operator.open_action("failed_run", "task:poison1", "t", "d")
+    counter: dict = {}
+    monkeypatch.setattr(operator.executor, "submit", _failing_submit(counter))
+
+    r1 = await operator.route_actions(5)
+    assert r1["errors"] == 1 and counter["calls"] == 1
+
+    disps = await db.query("SELECT * FROM action_dispositions")
+    assert len(disps) == 1
+    _assert_route_error_placeholder(disps[0])
+
+    # the poison row spent this loop's propose-once slot: next tick re-selects
+    # nothing and burns no further model call
+    r2 = await operator.route_actions(5)
+    assert r2["routed"] == 0 and counter["calls"] == 1
+
+
+async def test_router_inflight_exception_writes_placeholder_and_is_not_reselected(monkeypatch):
+    await operator.open_action("failed_run", "task:poison2", "t", "d")
+    counter: dict = {}
+    monkeypatch.setattr(operator.executor, "submit", _raising_submit(counter))
+
+    r1 = await operator.route_actions(5)
+    assert r1["errors"] == 1 and counter["calls"] == 1
+    disps = await db.query("SELECT * FROM action_dispositions")
+    assert len(disps) == 1
+    _assert_route_error_placeholder(disps[0])
+
+    r2 = await operator.route_actions(5)
+    assert r2["routed"] == 0 and counter["calls"] == 1
+
+
+async def test_router_failure_placeholder_keeps_pinned_marker(monkeypatch):
+    """A pinned KIND stays flagged human_pinned even on the failure path — the
+    placeholder must not launder prompt/schedule territory."""
+    await operator.open_action("cron_failure", "cron:poison", "t", "d")
+    counter: dict = {}
+    monkeypatch.setattr(operator.executor, "submit", _failing_submit(counter))
+    await operator.route_actions(5)
+    d = (await db.query("SELECT * FROM action_dispositions"))[0]
+    flags = d["flags"].split(",")
+    assert "route_error" in flags and "human_pinned" in flags
+
+
+async def test_router_failure_placeholder_is_never_consumable(client, monkeypatch):
+    """The placeholder is telemetry, not a suggestion: the approve endpoint's
+    live-floor gate refuses its NULL confidence, and it can never be promoted
+    to a recipe ('unparsed' is not promotable vocabulary). The action itself
+    stays open for a human to dispose manually."""
+    await operator.open_action("failed_run", "task:poison3", "t", "d")
+    counter: dict = {}
+    monkeypatch.setattr(operator.executor, "submit", _failing_submit(counter))
+    await operator.route_actions(5)
+    d = (await db.query("SELECT * FROM action_dispositions"))[0]
+
+    r = await client.post(f"/api/operator/dispositions/{d['id']}/approve", json={})
+    assert r.status_code == 409  # confidence missing → below any live floor
+
+    r = await client.post(f"/api/operator/dispositions/{d['id']}/promote-recipe")
+    assert r.status_code == 409  # not approved, not promotable vocabulary
+
+    a = await db.query_one("SELECT status FROM operator_actions WHERE ref = 'task:poison3'")
+    assert a["status"] == "open"  # route_actions still changes NOTHING else
+
+
 # ---- recipes: the minimal self-improvement loop (0023) ----------------------
 
 async def _approved_disposition(
@@ -969,3 +1383,767 @@ async def test_promote_unparsed_or_empty_keywords_fail_closed(client, monkeypatc
     with pytest.raises(ValueError, match="over-match"):
         await operator.promote_disposition_to_recipe(disp2)
     assert await db.query("SELECT * FROM recipes") == []
+
+
+# ---- self-improvement chain (M8-008 / 0026): observations -----------------------
+
+async def test_observe_operator_snapshots_and_upserts(client, monkeypatch):
+    """The observation sweep snapshots action recurrence, per-recipe hit rate
+    and router quality as durable rows; a same-day re-run refreshes in place
+    (one row per kind/subject/work-date, never duplicates)."""
+    d = await _approved_disposition(client, monkeypatch)          # task:rcp1, approved+done
+    await operator.promote_disposition_to_recipe(d["id"])
+    await operator.open_action("failed_run", "task:ob2", "Task failed: research/echo (t-201)", "d")
+    await operator.route_actions(10)                              # recipe hit, zero model calls
+    await operator.open_action("disputed_fact", "fact:ob1", "Disputed fact: x y", "d")
+
+    r = await client.post("/api/operator/observe")
+    assert r.status_code == 200
+    assert r.json()["observations"] == 4  # 2 kinds + 1 recipe + router
+
+    r = await client.get("/api/operator/observations", params={"kind": "action_recurrence"})
+    by_subject = {o["subject"]: o["metrics"] for o in r.json()["observations"]}
+    assert by_subject["failed_run"]["opened"] == 2
+    assert by_subject["failed_run"]["resolved"] == 1
+    assert by_subject["failed_run"]["open_now"] == 1
+    assert by_subject["disputed_fact"] == {"opened": 1, "resolved": 0, "dismissed": 0, "open_now": 1}
+
+    r = await client.get("/api/operator/observations", params={"kind": "recipe_performance"})
+    rec = r.json()["observations"][0]
+    assert rec["recipe_id"] is not None                           # linked to the recipe
+    assert rec["metrics"]["hits"] == 1 and rec["metrics"]["hits_approved"] == 0
+
+    r = await client.get("/api/operator/observations", params={"subject": "router"})
+    m = r.json()["observations"][0]["metrics"]
+    assert m["suggestions"] == 2 and m["recipe_hits"] == 1 and m["approved"] == 1
+
+    # same-day re-run: refreshed in place, not duplicated
+    n_before = (await db.query_one("SELECT COUNT(*) AS n FROM operator_observations"))["n"]
+    assert "error" not in await operator.observe_operator()
+    assert (await db.query_one("SELECT COUNT(*) AS n FROM operator_observations"))["n"] == n_before
+
+    r = await client.get("/api/operator/observations", params={"kind": "bogus"})
+    assert r.status_code == 422
+
+
+# ---- proposals: generation + the human decision gate -----------------------------
+
+async def _promote_proposal(client, monkeypatch, prefix: str = "pp") -> int:
+    """Three unanimous same-signature approvals → observe → generate; returns
+    the promote_recipe proposal id."""
+    for i in range(3):
+        await _approved_disposition(client, monkeypatch, ref=f"task:{prefix}{i}",
+                                    title=f"Task failed: research/echo (t-30{i})")
+    r = await client.post("/api/operator/observe")
+    assert r.status_code == 200 and "error" not in r.json()
+    r = await client.post("/api/operator/proposals/generate")
+    assert r.status_code == 200
+    assert r.json()["count"] == 1
+    return r.json()["created"][0]
+
+
+async def test_promote_proposal_full_loop(client, monkeypatch):
+    """The chain end to end: recurring approved fixes → observation → proposal
+    (inbox card) → HUMAN approve → recipe active + effect baseline frozen →
+    the recurring shape routes with zero model calls."""
+    pid = await _promote_proposal(client, monkeypatch)
+
+    r = await client.get("/api/operator/proposals", params={"status": "proposed"})
+    assert r.json()["count"] == 1
+    p = r.json()["proposals"][0]
+    assert p["id"] == pid and p["kind"] == "promote_recipe"
+    assert p["params"]["disposition_id"]
+    assert p["observation_id"] is not None                      # provenance: fed by an observation
+    card = await db.query_one("SELECT * FROM operator_actions WHERE id = ?", (p["action_id"],))
+    assert card["ref"] == f"proposal:{pid}" and card["status"] == "open"
+
+    # regenerate: one LIVE proposal per change (0026 partial unique index)
+    r = await client.post("/api/operator/proposals/generate")
+    assert r.json()["count"] == 0
+
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={"note": "值得"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "approved" and body["applied"] == 1
+    rid = body["applied_info"]["recipe_id"]
+    assert body["recipe_id"] == rid
+    recipe = await db.query_one("SELECT * FROM recipes WHERE id = ?", (rid,))
+    assert recipe["status"] == "active" and recipe["kind"] == "failed_run"
+
+    eff = await db.query_one("SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert eff is not None and eff["subject_ref"] == f"recipe:{rid}"
+    assert eff["outcome"] is None                                # measured later
+    card = await db.query_one("SELECT * FROM operator_actions WHERE id = ?", (p["action_id"],))
+    assert card["status"] == "done"
+
+    # the conditional claim is spent: double-approve (and reject) lose
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+    r = await client.post(f"/api/operator/proposals/{pid}/reject", json={})
+    assert r.status_code == 409
+
+    # payoff: the recurring shape now routes via the recipe, zero model calls
+    await operator.open_action("failed_run", "task:pp9", "Task failed: research/echo (t-399)", "d")
+    res = await operator.route_actions(5)
+    assert res["recipe_hits"] == 1
+
+
+async def test_promote_proposal_thresholds_fail_closed(client, monkeypatch):
+    """No proposal below the recurrence threshold, on disagreeing humans, or
+    when an active recipe already covers the signature."""
+    await _approved_disposition(client, monkeypatch, ref="task:th1")
+    await operator.observe_operator()
+    assert (await operator.generate_proposals())["count"] == 0   # opened=1 < 3
+
+    # recurrence reached but the humans disagreed (retry vs dismiss) → no knowledge
+    await _approved_disposition(client, monkeypatch, ref="task:th2",
+                                title="Task failed: research/echo (t-2)")
+    await _approved_disposition(client, monkeypatch, ref="task:th3",
+                                title="Task failed: research/echo (t-3)",
+                                reply="DISPOSITION: dismiss\nCONFIDENCE: 0.9")
+    await operator.observe_operator()
+    assert (await operator.generate_proposals())["count"] == 0
+
+    # unanimous group, but an active recipe already covers the signature
+    for i in range(2):
+        await _approved_disposition(client, monkeypatch, ref=f"task:cv{i}",
+                                    title=f"Task failed: mailbox/claude (m-{i})")
+    d = await _approved_disposition(client, monkeypatch, ref="task:cv9",
+                                    title="Task failed: mailbox/claude (m-9)")
+    await operator.promote_disposition_to_recipe(d["id"])
+    await operator.observe_operator()
+    assert (await operator.generate_proposals())["count"] == 0
+    assert await db.query("SELECT * FROM operator_proposals") == []
+
+
+async def test_stale_observations_do_not_feed_proposals(client, monkeypatch):
+    """P10b loop-fix: _latest_observations returned the newest snapshot per
+    subject REGARDLESS of age, so a subject the observe sweep stopped covering
+    kept feeding proposal generation from its frozen last snapshot forever
+    (reject frees the dedupe ref → the same stale change re-proposes every
+    sweep). Snapshots older than the freshness horizon are now ignored; the
+    same facts re-observed today propose normally."""
+    from datetime import datetime, timedelta
+
+    d = await _approved_disposition(client, monkeypatch)
+    recipe = await operator.promote_disposition_to_recipe(d["id"])
+    rotten = json.dumps({"status": "active", "hits": 9, "hits_approved": 0,
+                         "adoption_rate": 0.0, "kind_actions_opened": 9})
+    today = operator.prompts.work_date()
+    stale_wd = (datetime.fromisoformat(today) - timedelta(days=30)).date().isoformat()
+    ins = ("INSERT INTO operator_observations "
+           "(kind, subject, recipe_id, work_date, window_days, metrics, created_at) "
+           "VALUES (?,?,?,?,?,?,?)")
+    await db.execute(ins, ("recipe_performance", f"recipe:{recipe['id']}",
+                           recipe["id"], stale_wd, 7, rotten, bus.now_iso()))
+
+    gen = await operator.generate_proposals()
+    assert gen["count"] == 0                                # month-old facts: ignored
+    assert await db.query("SELECT * FROM operator_proposals") == []
+
+    # the SAME facts observed today (fresh snapshot row) propose normally
+    await db.execute(ins, ("recipe_performance", f"recipe:{recipe['id']}",
+                           recipe["id"], today, 7, rotten, bus.now_iso()))
+    gen = await operator.generate_proposals()
+    assert gen["count"] == 1
+    p = await db.query_one("SELECT * FROM operator_proposals WHERE id = ?",
+                           (gen["created"][0],))
+    assert p["kind"] == "retire_recipe" and p["recipe_id"] == recipe["id"]
+
+
+async def test_retire_proposal_from_low_adoption(client, monkeypatch):
+    """A recipe whose hits nobody approves gets a retire proposal; approving
+    it retires the recipe (conditional claim) and freezes an effect baseline."""
+    d = await _approved_disposition(client, monkeypatch)
+    recipe = await operator.promote_disposition_to_recipe(d["id"])
+    for i in range(5):
+        await operator.open_action("failed_run", f"task:ra{i}",
+                                   f"Task failed: research/echo (t-5{i})", "d")
+    res = await operator.route_actions(10)
+    assert res["recipe_hits"] == 5                               # hits, none approved
+
+    await operator.observe_operator()
+    gen = await operator.generate_proposals()
+    assert gen["count"] == 1
+    pid = gen["created"][0]
+    p = await db.query_one("SELECT * FROM operator_proposals WHERE id = ?", (pid,))
+    assert p["kind"] == "retire_recipe" and p["recipe_id"] == recipe["id"]
+
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200
+    row = await db.query_one("SELECT * FROM recipes WHERE id = ?", (recipe["id"],))
+    assert row["status"] == "retired" and row["retired_at"]
+    effs = await db.query("SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert len(effs) == 1 and effs[0]["subject_ref"] == f"recipe:{recipe['id']}"
+
+
+async def test_floor_tune_proposal_from_rejected_confident_suggestions(client, monkeypatch):
+    """Confident suggestions humans keep dismissing propose a floor RAISE
+    (tighten-only); approval applies it via set_parameter → live floor moves,
+    parameter_history records the proposal as changed_by."""
+    await _approved_disposition(client, monkeypatch, ref="task:ft0",
+                                title="Task failed: alpha/one (a-0)")
+    for i in range(1, 6):
+        await operator.open_action("failed_run", f"task:ft{i}",
+                                   f"Task failed: beta/two (b-{i})", "d")
+    monkeypatch.setattr(operator.executor, "submit",
+                        _fake_submit("DISPOSITION: retry\nCONFIDENCE: 0.9"))
+    await operator.route_actions(10)
+    for i in range(1, 6):
+        row = await db.query_one("SELECT id FROM operator_actions WHERE ref = ?",
+                                 (f"task:ft{i}",))
+        assert await operator.dismiss_action(row["id"], "噪音") is True
+
+    await operator.observe_operator()
+    gen = await operator.generate_proposals()
+    assert gen["count"] == 1
+    pid = gen["created"][0]
+    p = (await operator.list_proposals("proposed"))[0]
+    assert p["kind"] == "set_parameter"
+    assert p["params"] == {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.75}
+
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200
+    assert r.json()["applied_info"]["parameter_history_id"]
+    assert await operator.get_confidence_floor() == pytest.approx(0.75)
+    hist = await db.query_one("SELECT * FROM parameter_history ORDER BY id DESC LIMIT 1")
+    assert hist["changed_by"] == f"proposal:{pid}" and hist["proposal_id"] == pid
+    eff = await db.query_one("SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert eff["subject_kind"] == "parameter" and eff["subject_ref"] == f"param:{operator.CONFIDENCE_FLOOR_KEY}"
+
+
+async def test_proposal_reject_conditional_and_reproposable(client, monkeypatch):
+    """Rejection applies NOTHING, dismisses the inbox card, spends the decide
+    claim — and frees the dedupe ref so a later sweep may re-propose."""
+    pid = await _promote_proposal(client, monkeypatch)
+    p = await db.query_one("SELECT * FROM operator_proposals WHERE id = ?", (pid,))
+
+    r = await client.post(f"/api/operator/proposals/{pid}/reject", json={"note": "不要"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "rejected" and r.json()["applied"] == 0
+    assert "不要" in r.json()["decided_note"]
+    card = await db.query_one("SELECT * FROM operator_actions WHERE id = ?", (p["action_id"],))
+    assert card["status"] == "dismissed"
+    assert await db.query("SELECT * FROM recipes") == []          # nothing applied
+
+    r = await client.post(f"/api/operator/proposals/{pid}/reject", json={})
+    assert r.status_code == 409                                   # claim spent
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+    r = await client.post("/api/operator/proposals/424242/approve", json={})
+    assert r.status_code == 404
+    r = await client.post("/api/operator/proposals/424242/reject", json={})
+    assert r.status_code == 404
+
+    # live-only dedupe: the rejected change may be proposed again
+    r = await client.post("/api/operator/proposals/generate")
+    assert r.json()["count"] == 1
+
+
+async def test_approve_apply_failure_is_replayable(client, monkeypatch):
+    """P6a loop-fix: an apply that fails AFTER the proposed→approved claim
+    used to strand the proposal as approved-with-applied=0 forever (every
+    retry hit 'already decided'). An approved, never-applied proposal may now
+    REPLAY the apply through the same endpoint — the primitives it dispatches
+    are idempotent/conditional — and applied=1 closes the replay window."""
+    pid = await _promote_proposal(client, monkeypatch)
+
+    real_promote = operator.promote_disposition_to_recipe
+    calls = {"n": 0}
+
+    async def flaky_promote(disposition_id, *, proposal_id=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("infra hiccup mid-apply")
+        return await real_promote(disposition_id, proposal_id=proposal_id)
+
+    monkeypatch.setattr(operator, "promote_disposition_to_recipe", flaky_promote)
+    with pytest.raises(RuntimeError):
+        await operator.approve_proposal(pid)
+
+    p = await db.query_one("SELECT * FROM operator_proposals WHERE id = ?", (pid,))
+    assert p["status"] == "approved" and p["applied"] == 0     # the stuck shape
+    assert await db.query("SELECT * FROM recipes") == []       # nothing half-executed
+    card = await db.query_one(
+        "SELECT status FROM operator_actions WHERE id = ?", (p["action_id"],))
+    assert card["status"] == "open"                            # card not resolved either
+
+    # replay through the same human endpoint: applies, resolves, measures
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "approved" and body["applied"] == 1
+    recipe = await db.query_one(
+        "SELECT * FROM recipes WHERE id = ?", (body["applied_info"]["recipe_id"],))
+    assert recipe["status"] == "active"
+    card = await db.query_one(
+        "SELECT status FROM operator_actions WHERE id = ?", (p["action_id"],))
+    assert card["status"] == "done"
+    eff = await db.query_one(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert eff is not None
+
+    # applied=1 closes the replay window: a further approve is refused again
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+    # ...and rejected proposals never replay (decided is decided)
+    r = await client.post(f"/api/operator/proposals/{pid}/reject", json={})
+    assert r.status_code == 409
+
+
+async def test_stale_floor_proposal_cannot_lower_live_floor(client):
+    """P6b loop-fix: the floor-tune rule is raise-only at GENERATION time, but
+    a proposal can rot in the inbox while a human moves the floor. Approve
+    re-checks the direction against the LIVE floor, so a stale proposal can
+    never quietly lower the consumption gate (equal is refused too). The
+    refusal burns nothing — the proposal stays proposed/rejectable — and the
+    direct human parameter PUT keeps its move-either-way semantics."""
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.75", "stale",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.75},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+    await operator.set_parameter(PARAM_KEY, 0.9)   # human raised it meanwhile
+
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409 and "raise-only" in r.json()["detail"]
+    p = await db.query_one("SELECT * FROM operator_proposals WHERE id = ?", (pid,))
+    assert p["status"] == "proposed" and p["applied"] == 0     # claim not burned
+    assert await operator.get_confidence_floor() == pytest.approx(0.9)
+
+    await operator.set_parameter(PARAM_KEY, 0.75)              # equal → still refused
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+
+    await operator.set_parameter(PARAM_KEY, 0.6)               # now it IS a raise again
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200
+    assert await operator.get_confidence_floor() == pytest.approx(0.75)
+
+    # the human primitive is untouched: a direct PUT may still lower
+    r = await client.put(f"/api/operator/parameters/{PARAM_KEY}", json={"value": 0.5})
+    assert r.status_code == 200
+    assert await operator.get_confidence_floor() == pytest.approx(0.5)
+
+
+async def test_parameter_effect_commits_before_legacy_post_commit_crash(client, monkeypatch):
+    """R5-P2: old set_parameter committed admin_state + history, then called
+    _open_effect outside the transaction. A hard crash at that seam left a
+    durable change with no effect forever because every replay converged on
+    the history row and skipped effect creation.
+
+    The seam is gone: application-time, pre-change baseline + history +
+    admin_state commit together. Patching the legacy post-commit helper to
+    hard-crash therefore cannot interrupt this path; replay converges on the
+    SAME history/effect and never recaptures a current-time baseline."""
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.8", "r5",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.8},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+
+    async def legacy_hard_crash(*args, **kwargs):
+        raise RuntimeError("hard crash after parameter commit")
+
+    monkeypatch.setattr(operator, "_open_effect", legacy_hard_crash)
+    hist = await operator.set_parameter(
+        PARAM_KEY, 0.8, changed_by=f"proposal:{pid}", proposal_id=pid,
+        raise_only=True,
+    )
+
+    effects = await db.query(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert len(effects) == 1
+    first_effect = effects[0]
+    baseline = json.loads(first_effect["baseline"])
+    assert baseline["floor"] == pytest.approx(0.7)  # captured BEFORE 0.8 applied
+    assert first_effect["baseline_at"] == hist["created_at"]
+    assert first_effect["created_at"] == hist["created_at"]
+    assert await operator.get_confidence_floor() == pytest.approx(0.8)
+
+    # Move current telemetry after the original application. Replay through
+    # the human endpoint must preserve the original baseline/time byte-for-byte.
+    await operator.open_action("other", "", "post-apply telemetry")
+    monkeypatch.undo()
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200 and r.json()["applied"] == 1
+    rows = await db.query(
+        "SELECT * FROM parameter_history WHERE proposal_id = ?", (pid,))
+    effects2 = await db.query(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert len(rows) == 1 and rows[0]["id"] == hist["id"]
+    assert effects2 == [first_effect]
+
+
+async def test_parameter_effect_insert_failure_rolls_back_change(monkeypatch):
+    """R5-P2: effect insertion is part of the parameter write transaction.
+    If it fails, admin_state and parameter_history must both roll back — no
+    durable parameter change may exist without its measurement audit."""
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.8", "r5-fail",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.8},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+
+    conn = db.conn()
+    real_execute = conn.execute
+
+    async def fail_effect_insert(sql, *args, **kwargs):
+        if isinstance(sql, str) and "INSERT INTO operator_effects" in sql:
+            raise sqlite3.OperationalError("synthetic effect insert failure")
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(conn, "execute", fail_effect_insert)
+    with pytest.raises(sqlite3.OperationalError, match="effect insert failure"):
+        await operator.set_parameter(
+            PARAM_KEY, 0.8, changed_by=f"proposal:{pid}", proposal_id=pid,
+            raise_only=True,
+        )
+    monkeypatch.undo()
+
+    assert await db.query_one(
+        "SELECT * FROM admin_state WHERE key = ?", (PARAM_KEY,)) is None
+    assert await db.query(
+        "SELECT * FROM parameter_history WHERE proposal_id = ?", (pid,)) == []
+    assert await db.query(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,)) == []
+
+
+async def test_legacy_missing_parameter_effect_backfills_with_marker(client):
+    """R5-P2 legacy repair: if old code already committed history and even
+    marked the proposal applied=1 but lost its effect, one explicit replay may
+    repair it. The replacement baseline is CURRENT, not original, so it must
+    carry a durable late_backfill marker and use capture time as baseline_at;
+    it must never masquerade as the application-time baseline."""
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.8", "legacy",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.8},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+    application_at = "2026-01-01T00:00:00+00:00"
+    await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES (?, ?)",
+        (PARAM_KEY, json.dumps(0.8)))
+    await db.execute(
+        "INSERT INTO parameter_history "
+        "(key, old_value, new_value, changed_by, proposal_id, rollback_of, created_at) "
+        "VALUES (?,?,?,?,?,NULL,?)",
+        (PARAM_KEY, None, json.dumps(0.8), f"proposal:{pid}", pid, application_at))
+    await db.execute(
+        "UPDATE operator_proposals SET status='approved', applied=1, decided_at=? WHERE id=?",
+        (application_at, pid))
+
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200 and r.json()["applied"] == 1
+    effects = await db.query(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert len(effects) == 1
+    effect = effects[0]
+    meta = json.loads(effect["baseline"])["_baseline_capture"]
+    assert meta == {
+        "mode": "late_backfill",
+        "application_at": application_at,
+        "captured_at": effect["baseline_at"],
+    }
+    assert effect["baseline_at"] != application_at
+
+    # Once repaired, ordinary double-approve semantics return: no second row.
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+    assert (await db.query_one(
+        "SELECT COUNT(*) AS n FROM operator_effects WHERE proposal_id = ?",
+        (pid,)))["n"] == 1
+
+
+def test_migration_0037_never_deletes_real_audit_transitions():
+    """R4-P1: 0037's pre-index DELETE used to keep MIN(id) per proposal and
+    drop EVERY later duplicate — but an old replay interleaved with a human
+    change could produce a second row that really moved the value (X→Y): an
+    audit fact that must survive. The DELETE is now narrowed to provable
+    no-op echoes (old_value = new_value with an earlier same-proposal row);
+    a real duplicate transition is left in place so the unique index fails
+    LOUD (manual reconciliation) instead of silently rewriting history."""
+    mig_dir = Path(db.__file__).resolve().parent.parent / "migrations"
+    fname = "0037_parameter_history_proposal_unique.sql"
+    pre = [p for p in sorted(mig_dir.glob("*.sql")) if p.name < fname]
+    stmts_37 = db._split_statements((mig_dir / fname).read_text(encoding="utf-8"))
+
+    def fresh_scratch() -> sqlite3.Connection:
+        c = sqlite3.connect(":memory:")
+        for p in pre:  # the real chain builds the real parameter_history shape
+            for stmt in db._split_statements(p.read_text(encoding="utf-8")):
+                c.execute(stmt)
+        return c
+
+    ins = ("INSERT INTO parameter_history "
+           "(key, old_value, new_value, changed_by, proposal_id, rollback_of, created_at) "
+           "VALUES (?,?,?,?,?,NULL,?)")
+    key = "operator:confidence_floor"
+
+    # dataset A — a no-op echo behind a real first apply: echo pruned, real
+    # row kept, index lands (the clean-replay shape the old bug produced)
+    c = fresh_scratch()
+    c.execute(ins, (key, None, "0.75", "proposal:1", 1, "t1"))
+    c.execute(ins, (key, "0.75", "0.75", "proposal:1", 1, "t2"))
+    for stmt in stmts_37:
+        c.execute(stmt)
+    assert c.execute(
+        "SELECT old_value, new_value FROM parameter_history WHERE proposal_id = 1"
+    ).fetchall() == [(None, "0.75")]
+
+    # dataset B — the review's counterexample: the second application REALLY
+    # moved the value (human set 0.8 in between; the replay CAS'd 0.8→0.75).
+    # Both rows are audit facts: neither may be deleted, and the index build
+    # must fail loud instead of silently passing over rewritten history.
+    c = fresh_scratch()
+    c.execute(ins, (key, "0.7", "0.75", "proposal:9", 9, "t1"))
+    c.execute(ins, (key, "0.8", "0.75", "proposal:9", 9, "t2"))
+    with pytest.raises(sqlite3.IntegrityError, match="parameter_history.proposal_id"):
+        for stmt in stmts_37:
+            c.execute(stmt)
+    assert c.execute(
+        "SELECT old_value, new_value FROM parameter_history WHERE proposal_id = 9 ORDER BY id"
+    ).fetchall() == [("0.7", "0.75"), ("0.8", "0.75")]
+
+    # dataset C — NULL-valued rows are never "equal": both survive, fail loud
+    c = fresh_scratch()
+    c.execute(ins, (key, None, "0.75", "proposal:3", 3, "t1"))
+    c.execute(ins, (key, None, "0.75", "proposal:3", 3, "t2"))
+    with pytest.raises(sqlite3.IntegrityError):
+        for stmt in stmts_37:
+            c.execute(stmt)
+    assert len(c.execute(
+        "SELECT 1 FROM parameter_history WHERE proposal_id = 3").fetchall()) == 2
+
+
+async def test_concurrent_proposal_replays_leave_one_history_row(monkeypatch):
+    """R3-P2 loop-fix: two replays of the same stuck proposal could BOTH miss
+    the per-proposal history lookup, and the second — reading admin_state
+    after the first committed — passed its byte-CAS (SET v WHERE value=v) and
+    appended a second, no-op history row for the same proposal_id. The write
+    now re-checks per proposal inside set_parameter and migrations/0037's
+    partial unique index arbitrates the raced case: the loser rolls back and
+    converges on the winner's row.
+
+    Choreography: both calls start; the SECOND admin_state read is held until
+    the first call fully commits — the exact interleaving from the review."""
+    import asyncio
+
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.75", "r3p2",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.75},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+
+    first_done = asyncio.Event()
+    admin_reads = 0
+    real_q1 = db.query_one
+
+    async def gated_q1(sql, params=()):
+        nonlocal admin_reads
+        if sql.startswith("SELECT value FROM admin_state") and tuple(params) == (PARAM_KEY,):
+            admin_reads += 1
+            if admin_reads == 2:              # the straggler reads AFTER the winner commits
+                await asyncio.wait_for(first_done.wait(), timeout=10)
+        return await real_q1(sql, params)
+
+    monkeypatch.setattr(db, "query_one", gated_q1)
+    t1 = asyncio.create_task(operator.set_parameter(
+        PARAM_KEY, 0.75, changed_by=f"proposal:{pid}", proposal_id=pid))
+    t2 = asyncio.create_task(operator.set_parameter(
+        PARAM_KEY, 0.75, changed_by=f"proposal:{pid}", proposal_id=pid))
+    done, _pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED, timeout=10)
+    assert done, "neither replay completed"
+    first_done.set()
+    r1, r2 = await t1, await t2
+    monkeypatch.undo()
+
+    assert r1["id"] == r2["id"]               # both converged on the SAME history row
+    rows = await db.query(
+        "SELECT * FROM parameter_history WHERE proposal_id = ?", (pid,))
+    effects = await db.query(
+        "SELECT * FROM operator_effects WHERE proposal_id = ?", (pid,))
+    assert len(rows) == 1                     # exactly one change recorded
+    assert len(effects) == 1                  # ...and exactly one effect atomically
+    assert effects[0]["baseline_at"] == rows[0]["created_at"]
+    assert not any(h["old_value"] == h["new_value"] for h in rows)  # no 0.75→0.75 noise
+    assert await operator.get_confidence_floor() == pytest.approx(0.75)
+
+
+async def test_floor_raise_only_holds_against_concurrent_human_put(client, monkeypatch):
+    """R3-P1 loop-fix: the raise-only PRE-check and the actual write used to
+    be separated — a human PUT landing exactly between them let the proposal
+    apply anyway (set_parameter re-read the human's fresh value and CAS'd
+    against THAT), quietly lowering a floor the human had just raised
+    (probe: proposal 0.75, human 0.9 in the window, final was 0.75). The
+    raise-only judgment is now bound to the byte-CAS reference inside the
+    write itself, so the write can only land against the exact value the
+    direction was judged on."""
+    pid = await operator._file_proposal(
+        "set_parameter", "Raise confidence floor 0.7 → 0.75", "stale",
+        {"key": operator.CONFIDENCE_FLOOR_KEY, "value": 0.75},
+        f"set_parameter:{operator.CONFIDENCE_FLOOR_KEY}",
+    )
+    assert pid is not None
+
+    real_check = operator._check_floor_raise_only
+
+    async def check_then_human_put(key, value, proposal_id):
+        await real_check(key, value, proposal_id)      # passes: 0.75 > 0.7
+        await operator.set_parameter(PARAM_KEY, 0.9)   # human lands IN the window
+
+    monkeypatch.setattr(operator, "_check_floor_raise_only", check_then_human_put)
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    monkeypatch.undo()
+
+    assert r.status_code == 409 and "raise-only" in r.json()["detail"]
+    assert await operator.get_confidence_floor() == pytest.approx(0.9)  # human's raise survives
+    hist = await db.query("SELECT * FROM parameter_history WHERE proposal_id = ?", (pid,))
+    assert hist == []                                   # the proposal wrote NOTHING
+
+    # the claim was burned before the apply refused: the proposal is a stuck
+    # approved+applied=0 zombie — inert (replay keeps refusing while the
+    # direction is invalid) but recoverable once the raise is a raise again
+    p = await db.query_one("SELECT status, applied FROM operator_proposals WHERE id = ?", (pid,))
+    assert p["status"] == "approved" and p["applied"] == 0
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 409
+    assert await operator.get_confidence_floor() == pytest.approx(0.9)
+
+    await operator.set_parameter(PARAM_KEY, 0.6)        # human lowers deliberately
+    r = await client.post(f"/api/operator/proposals/{pid}/approve", json={})
+    assert r.status_code == 200                         # 0.75 > 0.6: a raise again
+    assert await operator.get_confidence_floor() == pytest.approx(0.75)
+
+
+async def test_proposal_inbox_cards_are_never_routed(client, monkeypatch):
+    """Proposal cards are decided by the human proposal endpoints — the router
+    must not classify them (no quota burn on the operator's own paperwork)."""
+    await _promote_proposal(client, monkeypatch)
+    open_rows = await db.query("SELECT ref FROM operator_actions WHERE status = 'open'")
+    assert len(open_rows) == 1 and open_rows[0]["ref"].startswith("proposal:")
+    tasks_before = (await db.query_one("SELECT COUNT(*) AS n FROM tasks"))["n"]
+
+    res = await operator.route_actions(10)
+    assert res["routed"] == 0
+    assert (await db.query_one("SELECT COUNT(*) AS n FROM tasks"))["n"] == tasks_before
+
+
+# ---- parameters: whitelist, history, rollback -------------------------------------
+
+PARAM_KEY = "operator:confidence_floor"
+
+
+async def test_parameters_api_set_history_and_validation(client):
+    r = await client.get("/api/operator/parameters")
+    assert r.json()["parameters"][PARAM_KEY] == {"stored": None, "default": 0.7, "set": False}
+
+    r = await client.put(f"/api/operator/parameters/{PARAM_KEY}", json={"value": 0.8})
+    assert r.status_code == 200
+    assert r.json()["changed_by"] == "api" and r.json()["old_value"] is None
+    assert r.json()["new_value"] == "0.8"                        # raw JSON, byte-CAS unit
+    assert await operator.get_confidence_floor() == pytest.approx(0.8)
+
+    r = await client.get("/api/operator/parameters")
+    assert r.json()["parameters"][PARAM_KEY]["stored"] == pytest.approx(0.8)
+    r = await client.get("/api/operator/parameter-history", params={"key": PARAM_KEY})
+    assert r.json()["count"] == 1
+    r = await client.get("/api/operator/effects", params={"subject_kind": "parameter"})
+    assert r.json()["count"] == 1 and r.json()["effects"][0]["outcome"] is None
+
+    # whitelist + value validation
+    r = await client.put(f"/api/operator/parameters/{PARAM_KEY}", json={"value": 1.5})
+    assert r.status_code == 422
+    r = await client.put(f"/api/operator/parameters/{PARAM_KEY}", json={"value": "high"})
+    assert r.status_code == 422
+    r = await client.put("/api/operator/parameters/not:a:knob", json={"value": 1})
+    assert r.status_code == 404
+    assert await operator.get_confidence_floor() == pytest.approx(0.8)  # refusals changed nothing
+
+
+async def test_parameter_rollback_conditional_claims(client):
+    h1 = await operator.set_parameter(PARAM_KEY, 0.8)
+    h2 = await operator.set_parameter(PARAM_KEY, 0.9)
+
+    # a superseded change refuses (byte-CAS: current value is h2's, not h1's)
+    r = await client.post(f"/api/operator/parameter-history/{h1['id']}/rollback")
+    assert r.status_code == 409 and "changed since" in r.json()["detail"]
+    assert await operator.get_confidence_floor() == pytest.approx(0.9)
+    row = await db.query_one("SELECT rolled_back_at FROM parameter_history WHERE id = ?", (h1["id"],))
+    assert row["rolled_back_at"] is None                         # the refused claim rolled back too
+
+    # the latest change rolls back; the revert is itself a history row
+    r = await client.post(f"/api/operator/parameter-history/{h2['id']}/rollback")
+    assert r.status_code == 200
+    rb = r.json()
+    assert rb["changed_by"] == f"rollback:{h2['id']}" and rb["rollback_of"] == h2["id"]
+    assert await operator.get_confidence_floor() == pytest.approx(0.8)
+
+    # a change rolls back exactly once (conditional claim on rolled_back_at)
+    r = await client.post(f"/api/operator/parameter-history/{h2['id']}/rollback")
+    assert r.status_code == 409 and "already rolled back" in r.json()["detail"]
+    r = await client.post("/api/operator/parameter-history/424242/rollback")
+    assert r.status_code == 404
+
+    # h1 is current again (0.8): rolling back the first-ever set unsets the key
+    r = await client.post(f"/api/operator/parameter-history/{h1['id']}/rollback")
+    assert r.status_code == 200
+    assert await operator.get_confidence_floor() == pytest.approx(0.7)   # built-in default
+    assert await db.query_one("SELECT * FROM admin_state WHERE key = ?", (PARAM_KEY,)) is None
+    assert (await db.query_one("SELECT COUNT(*) AS n FROM operator_effects "
+                               "WHERE subject_kind = 'parameter'"))["n"] == 4
+
+
+# ---- effect measurement --------------------------------------------------------
+
+async def test_effect_measurement_before_after_windows(client):
+    """A parameter change freezes the before window; measure_effects fills the
+    outcome once the after window elapses — exactly once (conditional claim)."""
+    await operator.open_action("failed_run", "task:em1", "Task failed: gamma three", "d")
+    await operator.route_actions(1)                              # one suggestion in the before window
+    await operator.set_parameter(PARAM_KEY, 0.8)
+
+    eff = await db.query_one("SELECT * FROM operator_effects")
+    assert eff["outcome"] is None
+    assert json.loads(eff["baseline"])["suggestions"] == 1
+
+    r = await client.post("/api/operator/effects/measure")       # window not elapsed yet
+    assert r.json() == {"measured": 0, "pending": 1}
+
+    await db.execute("UPDATE operator_effects SET baseline_at = ? WHERE id = ?",
+                     ("2026-01-01T00:00:00+00:00", eff["id"]))
+    r = await client.post("/api/operator/effects/measure")
+    assert r.json() == {"measured": 1, "pending": 0}
+
+    row = (await operator.list_effects("parameter"))[0]
+    assert row["measured_at"]
+    assert row["outcome"]["suggestions"] == 0                    # empty after-window (Jan)
+    assert row["outcome"]["deltas"]["suggestions"] == -1         # the queryable before/after delta
+
+    r = await client.post("/api/operator/effects/measure")       # measured exactly once
+    assert r.json() == {"measured": 0, "pending": 0}
+
+
+async def test_recipe_promote_and_retire_freeze_effect_baselines(client, monkeypatch):
+    """Direct (non-proposal) recipe promote/retire also open effect rows; the
+    idempotent re-promote and the lost retire claim do not spam new ones."""
+    d = await _approved_disposition(client, monkeypatch)
+    recipe = await operator.promote_disposition_to_recipe(d["id"])
+    effs = await operator.list_effects("recipe")
+    assert len(effs) == 1
+    assert effs[0]["subject_ref"] == f"recipe:{recipe['id']}"
+    assert effs[0]["baseline"] == {
+        "actions_opened": 1, "recipe_hits": 0, "hits_approved": 0, "model_suggestions": 1,
+    }
+
+    await operator.promote_disposition_to_recipe(d["id"])        # idempotent: no new row
+    assert len(await operator.list_effects("recipe")) == 1
+    assert await operator.retire_recipe(recipe["id"]) is True
+    assert len(await operator.list_effects("recipe")) == 2
+    assert await operator.retire_recipe(recipe["id"]) is False   # lost claim: no new row
+    assert len(await operator.list_effects("recipe")) == 2

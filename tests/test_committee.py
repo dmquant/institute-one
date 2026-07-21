@@ -7,6 +7,12 @@ including ordering, the 50-board cap, error/empty degradation and the
 explicit-value override; the once-per-ISO-week idempotent kickoff
 (run_committee_once, REVIEW-C5 M2); json_set variable writes preserving
 concurrently-landed keys (REVIEW-C5 P2).
+
+M8-012 additions: the durable committee bridge into the multi-agent
+group/run tables — the system-maintained 'committee' group, the
+open-at-kickoff record, and finalize (input snapshot = the frozen
+${WEEK_DISPUTES} digest, step task ids, structured step-map verdict,
+terminal status mapping, manual-run upsert).
 """
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import bus, db
-from app.institute import sessions, workflows
+from app.institute import multi_agent, sessions, workflows
 from app.institute.analysts import get_analyst
 
 REPO = Path(__file__).resolve().parent.parent
@@ -268,3 +274,99 @@ async def test_run_committee_once_reopens_after_failed_run():
     await _drain_drivers()
     # the retry completed -> the week is closed again
     assert await workflows.run_committee_once() is None
+
+
+# ---- durable committee group + run records (M8-012) ----------------------------
+
+
+async def test_ensure_committee_group_reconciles_from_workflow():
+    # no reconciled workflow yet -> no group, no crash
+    assert await multi_agent.ensure_committee_group() is None
+    await workflows.reconcile_from_disk()
+    group = await multi_agent.ensure_committee_group()
+    assert group is not None and group["id"] == "committee"
+    # members = the step analysts, first-appearance order
+    assert group["agents"] == [
+        "chief-strategist", "macro-analyst", "equity-analyst", "policy-analyst", "ops-editor",
+    ]
+    assert group["mode"] == "all"
+    # re-ensure is an upsert, not a duplicate
+    again = await multi_agent.ensure_committee_group()
+    assert again["id"] == group["id"] and again["created_at"] == group["created_at"]
+    assert len(await multi_agent.list_groups()) == 1
+
+
+async def test_committee_run_lands_durable_record_with_input_snapshot():
+    await _mk_board("人形机器人量产分歧", summaries=[(1, "completed", "正反 2:1")])
+    await workflows.reconcile_from_disk()
+    run_id = await workflows.run_committee_once()
+    assert run_id is not None
+
+    opened = await multi_agent.open_committee_run(run_id)
+    assert opened is not None
+    assert opened["workflow_run_id"] == run_id and opened["group_id"] == "committee"
+    # replaying the open is idempotent (uq_multi_agent_runs_workflow arbiter)
+    again = await multi_agent.open_committee_run(run_id)
+    assert again["id"] == opened["id"]
+
+    await _drain_drivers()
+    settled = await multi_agent.finalize_committee_run(run_id)
+    assert settled["status"] == "completed" and settled["finished_at"]
+    # the input snapshot is the frozen ${WEEK_DISPUTES} whiteboard digest
+    assert "人形机器人量产分歧" in settled["prompt"]
+    assert len(settled["task_ids"]) == 5                    # one per debate step
+    v = settled["verdict"]
+    assert v["kind"] == "committee" and v["workflow_status"] == "completed"
+    assert [s["step_id"] for s in v["steps"]] == [
+        "01-agenda", "02-round1", "03-round2", "04-round3", "05-verdict",
+    ]
+    assert all(s["status"] == "completed" and s["task_id"] for s in v["steps"])
+    assert v["summary"] == v["steps"][-1]["summary"]        # the 裁决 step's summary
+    # finalize replays idempotently (the claim already landed)
+    assert (await multi_agent.finalize_committee_run(run_id))["finished_at"] == settled["finished_at"]
+    # reachable through the generic run-record read (reconnect surface)
+    rec = await multi_agent.get_run_record(opened["id"])
+    assert rec["status"] == "completed" and rec["workflow_run_id"] == run_id
+
+
+async def test_finalize_committee_run_upserts_for_manual_runs():
+    """The manual escape hatch (POST /api/workflows/committee/run) bypasses
+    the kickoff hook — finalize must land the record on its own."""
+    await workflows.reconcile_from_disk()
+    run = await workflows.run_workflow_and_wait("committee", source="test")
+    assert run["status"] == "completed"
+    settled = await multi_agent.finalize_committee_run(run["id"])
+    assert settled is not None and settled["status"] == "completed"
+    assert settled["workflow_run_id"] == run["id"]
+    assert len(settled["task_ids"]) == 5
+
+
+async def test_finalize_committee_run_maps_terminal_states():
+    await workflows.reconcile_from_disk()
+    # unknown workflow run -> None, no record invented
+    assert await multi_agent.finalize_committee_run("zz-missing") is None
+
+    run_id = await workflows.run_committee_once()
+    await _drain_drivers()
+    await db.execute(
+        "UPDATE workflow_runs SET status = 'failed', error = 'boom step 02' WHERE id = ?",
+        (run_id,),
+    )
+    settled = await multi_agent.finalize_committee_run(run_id)
+    assert settled["status"] == "failed" and settled["error"] == "boom step 02"
+    assert settled["verdict"]["workflow_status"] == "failed"
+
+
+async def test_finalize_committee_run_still_running_keeps_record_open():
+    await workflows.reconcile_from_disk()
+    run_id = uuid.uuid4().hex[:12]
+    await db.execute(
+        "INSERT INTO workflow_runs (id, workflow_id, status, variables, source, started_at) "
+        "VALUES (?, 'committee', 'running', '{}', 'test', ?)",
+        (run_id, bus.now_iso()),
+    )
+    rec = await multi_agent.finalize_committee_run(run_id)
+    assert rec is not None and rec["status"] == "running"   # opened, not settled
+    assert rec["verdict"] is None
+    # settle-on-read delegates committee rows to finalize: still open, no wedge
+    assert (await multi_agent.get_run_record(rec["id"]))["status"] == "running"

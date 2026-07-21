@@ -53,6 +53,68 @@ def test_split_statements_matches_executescript_result():
     assert schema(split_conn)  # sanity: the chain actually built something
 
 
+def test_0042_adopts_unambiguous_r4_children_across_crash_windows():
+    """Upgrade compatibility: R4 stored lease/attempt but no child id.
+    0042 conservatively binds the sole child created inside that lease window,
+    for both marker+queued and completed-before-marker crash states."""
+    c = sqlite3.connect(":memory:")
+    for path in MIGRATIONS:
+        if path.name >= "0042_":
+            continue
+        c.executescript(path.read_text(encoding="utf-8"))
+
+    def source(source_id: str, *, marker: bool) -> None:
+        c.execute(
+            "INSERT INTO tasks "
+            "(id, requested_hand, prompt, status, source, error, workspace_dir, "
+            " timeout_s, fallback_chain, created_at, finished_at, "
+            " revival_lease_id, revival_leased_at, revival_attempts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                source_id, "echo", "retry", "rate_limited", "test",
+                "quota\n[rate-limit-revival:claimed]" if marker else "quota",
+                "/tmp/r5", 60, '["echo"]',
+                "2026-07-20T00:00:00+00:00", "2026-07-20T00:00:01+00:00",
+                f"lease-{source_id}", "2026-07-20T00:00:02+00:00", 1,
+            ),
+        )
+
+    def child(child_id: str, source_id: str, status: str) -> None:
+        c.execute(
+            "INSERT INTO tasks "
+            "(id, requested_hand, prompt, status, source, workspace_dir, timeout_s, "
+            " fallback_chain, lineage_root, created_at, finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                child_id, "echo", "retry", status, "test", "/tmp/r5", 60,
+                '["echo"]', source_id, "2026-07-20T00:00:03+00:00",
+                "2026-07-20T00:00:04+00:00" if status == "completed" else None,
+            ),
+        )
+
+    source("legacy-queued", marker=True)
+    child("legacy-child-q", "legacy-queued", "queued")
+    source("legacy-complete", marker=False)
+    child("legacy-child-c", "legacy-complete", "completed")
+
+    migration = next(p for p in MIGRATIONS if p.name.startswith("0042_"))
+    for stmt in db._split_statements(migration.read_text(encoding="utf-8")):
+        c.execute(stmt)
+
+    assert c.execute(
+        "SELECT revival_task_id FROM tasks WHERE id='legacy-queued'"
+    ).fetchone()[0] == "legacy-child-q"
+    assert c.execute(
+        "SELECT revived_from_task_id FROM tasks WHERE id='legacy-child-q'"
+    ).fetchone()[0] == "legacy-queued"
+    assert c.execute(
+        "SELECT revival_task_id FROM tasks WHERE id='legacy-complete'"
+    ).fetchone()[0] == "legacy-child-c"
+    assert c.execute(
+        "SELECT revived_from_task_id FROM tasks WHERE id='legacy-child-c'"
+    ).fetchone()[0] == "legacy-complete"
+
+
 def test_split_statements_semicolons_in_strings_and_comments():
     sql = (
         "-- comment; with semicolon\n"
@@ -108,6 +170,43 @@ async def test_replay_after_lost_ledger_row_all_files():
     await db.migrate(db.conn())
     rows = await db.query("SELECT name FROM schema_migrations ORDER BY name")
     assert [r["name"] for r in rows] == [p.name for p in MIGRATIONS]
+
+
+async def test_replay_lost_0028_ledger_preserves_later_task_columns_and_data():
+    """0028 rebuilds ``tasks`` to widen its status CHECK. If only its ledger
+    row is lost after 0039--0043, replay must not DROP the later protocol
+    columns (or their values) while those later files remain recorded."""
+    await db.execute(
+        "INSERT INTO tasks "
+        "(id, prompt, status, source, created_at, revival_lease_id, "
+        "revival_attempts, revival_task_id, mailbox_dispatch_id) "
+        "VALUES ('rebuild-proof', 'p', 'rate_limited', 'test', "
+        "'2026-07-21T00:00:00+00:00', 'lease-proof', 2, 'child-proof', 42)"
+    )
+    n = await db.execute(
+        "DELETE FROM schema_migrations WHERE name = '0028_task_overcommitted.sql'"
+    )
+    assert n == 1
+
+    await db.migrate(db.conn())
+
+    row = await db.query_one(
+        "SELECT revival_lease_id, revival_attempts, revival_task_id, "
+        "mailbox_dispatch_id FROM tasks WHERE id = 'rebuild-proof'"
+    )
+    assert row == {
+        "revival_lease_id": "lease-proof",
+        "revival_attempts": 2,
+        "revival_task_id": "child-proof",
+        "mailbox_dispatch_id": 42,
+    }
+    assert await db.query_one(
+        "SELECT name FROM schema_migrations "
+        "WHERE name = '0028_task_overcommitted.sql'"
+    ) is not None
+    assert await db.query_one(
+        "SELECT name FROM sqlite_master WHERE name = 'tasks_rebuild_0028'"
+    ) is None
 
 
 # ---- per-file atomicity: failure rolls back schema AND ledger ----------------

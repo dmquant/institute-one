@@ -1,0 +1,12 @@
+-- LOOP-P7: extraction-queue worker lease (the fact_cards.lease_id pattern,
+-- 0034).
+--
+-- fact_extract_queue rows were claimed pending→running and settled with
+-- status-only conditions: after the stale sweep re-opened a crashed row (and
+-- a new worker re-claimed it, making status 'running' again), the OLD
+-- worker's late done/failed write still matched "WHERE status='running'" and
+-- overwrote the new claim. The claim now writes a random lease_id; every
+-- running→terminal write carries "AND lease_id = ?", and the stale sweep
+-- clears the lease when it re-opens a row — the old worker's late write
+-- silently loses.
+ALTER TABLE fact_extract_queue ADD COLUMN lease_id TEXT;

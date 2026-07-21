@@ -2,6 +2,25 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-07-21 — North Star and bounded-autonomy closure (local acceptance batch)
+
+### Added
+- M9 operator surfaces and integrity loops: prompt overrides, graph properties, portfolios, favorites/insights, forecast evidence, and hardened factcheck workflows, with corresponding FastAPI, SPA, MCP, plugin, migration, and echo-hand test coverage.
+- M10 bounded-autonomy controls across executor, operator, factcheck, chain, research tree, scheduler, mailbox, paper book, vault projection, and backups. Poison work, retries, scans, queue claims, and model dispatches now have durable progress plus explicit ceilings.
+- Additive migrations 0026–0043, including durable factcheck/outbox leases, generation-aware verification binding, reciprocal revival task binding, and the mailbox dispatch protocol.
+
+### Changed
+- Boot recovery now reconciles executor orphans before task-aware factcheck, revival, and mailbox recovery, then starts the scheduler.
+- Event delivery can fan out an event row already committed with its domain transaction, preserving atomic durability without duplicate event inserts.
+- The live local database was backed up, reconciled through migration 0043, integrity-checked, and restarted only after confirming no running tasks. Formal M9/LOOP roadmap cards remain in review for operator acceptance.
+
+### Fixed
+- Closed all 15 R5 protocol findings (10 P1, 4 P2, 1 P3): stale verification reuse, cross-generation dispute delivery, alias-set truncation, revival crash windows/overcommit loss, mailbox reply loss/duplicate model calls/unbounded reclaim, stale `_inflight` veto, missing parameter effects, and the vault replace-to-ledger TOCTOU.
+- Restored migration 0034 to its applied immutable form and moved the later outbox lease additions into migration 0041, so fresh and upgraded databases follow the same additive path.
+- Made operator feed registration reconcile actual bus handlers and switched Sina Chinese payload decoding to GB18030, eliminating order-dependent Python 3.14 full-suite failures.
+- Closed the post-R5 independent-review findings: safe lost-ledger recovery for the historical 0028 `tasks` rebuild, structured cross-family property-period ordering, strict no-spend boot recovery while maintenance is paused, prompt-override cache pre-warm, and domain-level multi-agent roster/spawn failure guards.
+- Aligned the multi-agent SPA with the durable 200/202 API response shapes and made mutation bodies reject unknown fields; the final submission candidate verifies at 1156 passed / 2 intentional skips.
+
 ## 2026-07-03 — Thesis registry, security master, live Kanban, PR #1 review
 
 ### Added

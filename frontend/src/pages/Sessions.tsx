@@ -3,6 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   Session,
   getSession,
+  getAuthToken,
   listSessions,
   listWorkspaceFiles,
   readWorkspaceFile,
@@ -20,30 +21,81 @@ import {
   useLoad,
 } from "../ui";
 
-const KINDS = ["", "chat", "workflow", "whiteboard"];
+const KINDS = [
+  { value: "", label: "全部" },
+  { value: "chat", label: "chat" },
+  { value: "workflow", label: "workflow" },
+  { value: "whiteboard", label: "whiteboard" },
+];
+
+type SessionRow = Session & {
+  n_messages: number | null;
+};
+
+type SessionListData = {
+  rows: SessionRow[];
+  countErrors: number;
+};
+
+async function getSessionMessageCount(sessionId: string): Promise<number> {
+  const token = getAuthToken();
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
+  if (!response.ok) throw new Error(`消息列表请求失败（${response.status}）`);
+  if ((response.headers.get("content-type") ?? "").includes("text/html")) {
+    throw new Error("消息列表接口未部署");
+  }
+  const messages: unknown = await response.json();
+  if (!Array.isArray(messages)) throw new Error("消息列表响应格式错误");
+  return messages.length;
+}
+
+async function listSessionRows(kind: string): Promise<SessionListData> {
+  const rows = await listSessions(kind || undefined, 200);
+  const counts = await Promise.all(
+    rows.map(async (session) => {
+      try {
+        return await getSessionMessageCount(session.id);
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return {
+    rows: rows.map((session, i) => ({ ...session, n_messages: counts[i] })),
+    countErrors: counts.filter((count) => count === null).length,
+  };
+}
 
 export default function Sessions() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const [kind, setKind] = useState("");
-  const sessions = useLoad(() => listSessions(kind || undefined, 200), [kind], 30000);
+  const sessions = useLoad(() => listSessionRows(kind), [kind], 30000);
 
   return (
     <>
       <PageHead zh="会话" en="Sessions" />
 
       <div className="filter-bar">
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
-          {KINDS.map((k) => (
-            <option key={k} value={k}>
-              {k === "" ? "全部类型" : k}
-            </option>
+        <div className="feed-groups" style={{ marginBottom: 0 }} aria-label="按会话类型过滤">
+          {KINDS.map((item) => (
+            <button
+              key={item.value}
+              type="button"
+              className={`feed-group ${kind === item.value ? "sel" : ""}`}
+              aria-pressed={kind === item.value}
+              onClick={() => setKind(item.value)}
+            >
+              {item.label}
+            </button>
           ))}
-        </select>
+        </div>
         <button className="ghost" onClick={sessions.reload}>
           刷新
         </button>
-        <span className="faint">{sessions.data ? `${sessions.data.length} 个会话` : ""}</span>
+        <span className="faint">{sessions.data ? `${sessions.data.rows.length} 个会话` : ""}</span>
       </div>
 
       <div className="split">
@@ -52,17 +104,25 @@ export default function Sessions() {
             会话列表<span className="en">sessions</span>
           </h2>
           <ErrorNote error={sessions.error} />
+          <ErrorNote
+            error={
+              sessions.data && sessions.data.countErrors > 0
+                ? `${sessions.data.countErrors} 个会话的消息数暂时无法读取`
+                : null
+            }
+          />
           {sessions.loading && !sessions.data && <Loading />}
           <table className="data">
             <thead>
               <tr>
                 <th>标题</th>
                 <th>类型</th>
-                <th>更新</th>
+                <th>消息</th>
+                <th>最新活动</th>
               </tr>
             </thead>
             <tbody>
-              {(sessions.data ?? []).map((s) => (
+              {(sessions.data?.rows ?? []).map((s) => (
                 <tr
                   key={s.id}
                   className="clickable"
@@ -76,6 +136,7 @@ export default function Sessions() {
                   <td>
                     <StatusBadge status={s.kind} />
                   </td>
+                  <td className="mono">{s.n_messages ?? "—"}</td>
                   <td className="dim nowrap" title={fmtTime(s.updated_at)}>
                     {ago(s.updated_at)}
                   </td>
@@ -83,7 +144,7 @@ export default function Sessions() {
               ))}
             </tbody>
           </table>
-          {sessions.data?.length === 0 && <Empty text="还没有会话" />}
+          {sessions.data?.rows.length === 0 && <Empty text="还没有会话" />}
         </div>
 
         {sessionId ? (

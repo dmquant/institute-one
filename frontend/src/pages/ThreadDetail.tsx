@@ -35,7 +35,9 @@ export default function ThreadDetail() {
   };
 
   const t = thread.data;
-  const pendingDispatch = t?.messages.some((m) => m.kind === "dispatch" && m.status === "pending");
+  const dispatches = t?.messages.filter((m) => m.kind === "dispatch") ?? [];
+  const pendingDispatches = dispatches.filter((m) => m.status === "pending").length;
+  const latestDispatch = dispatches[dispatches.length - 1];
 
   return (
     <>
@@ -61,12 +63,24 @@ export default function ThreadDetail() {
               <dd>{analystName(t.analyst_id)}</dd>
               <dt>状态</dt>
               <dd>
-                <StatusBadge status={t.status} />
-                {pendingDispatch && (
-                  <span className="hand-cooldown" style={{ marginLeft: 10 }}>
-                    分析师撰写回复中…
-                  </span>
-                )}
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <StatusBadge status={t.status} />
+                  {pendingDispatches > 0 && (
+                    <span
+                      className="badge"
+                      style={{
+                        color: "var(--amber)",
+                        borderColor: "rgba(232, 179, 57, 0.55)",
+                        background: "rgba(232, 179, 57, 0.13)",
+                      }}
+                    >
+                      派发中{pendingDispatches > 1 ? ` ${pendingDispatches}` : ""}
+                    </span>
+                  )}
+                  {latestDispatch?.status === "failed" && (
+                    <span className="badge st-failed">最新派发失败</span>
+                  )}
+                </span>
               </dd>
               <dt>创建</dt>
               <dd>{fmtTime(t.created_at)}</dd>
@@ -109,18 +123,35 @@ export default function ThreadDetail() {
 
 function Message({ m, analystName }: { m: MailMessage; analystName: (id: string) => string }) {
   if (m.kind === "dispatch") {
+    const attentionStyle =
+      m.status === "pending"
+        ? {
+            color: "var(--amber)",
+            borderColor: "rgba(232, 179, 57, 0.6)",
+            background: "rgba(232, 179, 57, 0.1)",
+          }
+        : m.status === "failed"
+          ? {
+              color: "#ff8b9a",
+              borderColor: "rgba(240, 86, 106, 0.65)",
+              background: "rgba(240, 86, 106, 0.1)",
+            }
+          : undefined;
+
     return (
-      <div className="msg dispatch">
-        <span>
-          派发 {analystName(m.author)} · <StatusBadge status={m.status} />
+      <div className="msg dispatch" style={attentionStyle}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <strong>
+            {m.status === "pending" ? "正在派发" : m.status === "failed" ? "派发失败" : "派发完成"}
+          </strong>
+          <span>{analystName(m.author)}</span>
+          <StatusBadge status={m.status} />
           {m.task_id && (
-            <>
-              {" · "}
-              <Link className="mono" to={`/tasks?id=${m.task_id}`}>
-                task {m.task_id}
-              </Link>
-            </>
+            <Link className="mono" to={`/tasks?id=${m.task_id}`}>
+              task {m.task_id}
+            </Link>
           )}
+          <span className="faint">{fmtTime(m.created_at)}</span>
         </span>
       </div>
     );

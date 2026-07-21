@@ -3,10 +3,8 @@ import { Link } from "react-router-dom";
 import { ApiError, MultiAgentRun, listAnalysts, runMultiAgent } from "../api";
 import { Empty, ErrorNote, Loading, PageHead, StatusBadge, useLoad } from "../ui";
 
-// POST /api/multi-agent/run is card C5 (in flight). Until it lands the page
-// stays usable: 404/501 render the "未启用" notice instead of an error. An
-// unmounted router actually answers 405 today — the SPA catch-all is GET-only,
-// so a POST to an unrouted path hits FastAPI's method check (R-C7 / C7-M2).
+// The endpoint is deployed and durable. Keep a defensive 404/405/501 state so
+// an older checkout still renders a useful message instead of crashing.
 const MODES = [
   { value: "all", label: "全部返回 all" },
   { value: "first_success", label: "首个成功 first_success" },
@@ -47,7 +45,9 @@ export default function MultiAgent() {
     }
   };
 
-  const results = run?.results ?? [];
+  const pending = run && "task_ids" in run ? run : null;
+  const completed = run && "outputs" in run ? run : null;
+  const results = completed?.outputs ?? [];
 
   return (
     <>
@@ -98,7 +98,7 @@ export default function MultiAgent() {
       <ErrorNote error={err} />
       {unavailable && (
         <div className="card">
-          <Empty text="多智能体接口未启用（POST /api/multi-agent/run 尚未部署，卡片 C5 在建）" />
+          <Empty text="当前后端未挂载多智能体接口（POST /api/multi-agent/run）" />
         </div>
       )}
       {busy && (
@@ -109,40 +109,49 @@ export default function MultiAgent() {
 
       {run && (
         <>
-          {(run.mode || run.status || run.id) && (
-            <div className="form-row" style={{ marginBottom: 12, alignItems: "center" }}>
-              {run.status && <StatusBadge status={run.status} />}
-              {run.mode && <span className="dim mono">mode: {run.mode}</span>}
-              {run.id && <span className="faint mono">{run.id}</span>}
+          <div className="form-row" style={{ marginBottom: 12, alignItems: "center" }}>
+            <StatusBadge status={pending ? "running" : completed?.ok ? "completed" : "failed"} />
+            <span className="dim mono">mode: {run.mode}</span>
+            <span className="faint mono">run: {run.run_id}</span>
+          </div>
+
+          {pending ? (
+            <div className="card">
+              <h2>任务继续在后台运行<span className="en">accepted 202</span></h2>
+              <p className="dim">{pending.detail}</p>
+              <div className="stat-row">
+                {pending.task_ids.map((taskId, i) => (
+                  <Link className="mono" key={taskId} to={`/tasks?id=${taskId}`}>
+                    {pending.agents[i] ?? `智能体 ${i + 1}`} · {taskId} →
+                  </Link>
+                ))}
+              </div>
             </div>
-          )}
-          <div className="grid cols-2">
-            {results.map((r, i) => (
-              <div className="card" key={r.agent ?? r.analyst_id ?? i}>
-                <h2>
-                  {r.agent ?? r.analyst_id ?? `结果 ${i + 1}`}
-                  <span className="en">{r.hand ?? ""}</span>
-                  {r.status && (
+          ) : (
+            <div className="grid cols-2">
+              {results.map((r, i) => (
+                <div className="card" key={r.agent ?? i}>
+                  <h2>
+                    {r.agent || `结果 ${i + 1}`}
+                    <span className="en">{r.hand ?? ""}</span>
                     <span style={{ marginLeft: 10 }}>
                       <StatusBadge status={r.status} />
                     </span>
-                  )}
-                </h2>
-                {r.error && <ErrorNote error={r.error} />}
-                <pre style={{ maxHeight: 420, overflowY: "auto" }}>{r.output || "（无输出）"}</pre>
-                {r.task_id && (
+                  </h2>
+                  {r.error && <ErrorNote error={r.error} />}
+                  <pre style={{ maxHeight: 420, overflowY: "auto" }}>{r.output || "（无输出）"}</pre>
                   <Link className="mono faint" to={`/tasks?id=${r.task_id}`}>
                     任务 {r.task_id} →
                   </Link>
-                )}
-              </div>
-            ))}
-            {results.length === 0 && (
-              <div className="card">
-                <Empty text="接口返回了空结果" />
-              </div>
-            )}
-          </div>
+                </div>
+              ))}
+              {results.length === 0 && (
+                <div className="card">
+                  <Empty text="接口返回了空结果" />
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
     </>
