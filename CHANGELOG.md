@@ -19,7 +19,8 @@ Notable changes to institute-one, grouped by push batch (dates are SGT work date
 - Restored migration 0034 to its applied immutable form and moved the later outbox lease additions into migration 0041, so fresh and upgraded databases follow the same additive path.
 - Made operator feed registration reconcile actual bus handlers and switched Sina Chinese payload decoding to GB18030, eliminating order-dependent Python 3.14 full-suite failures.
 - Closed the post-R5 independent-review findings: safe lost-ledger recovery for the historical 0028 `tasks` rebuild, structured cross-family property-period ordering, strict no-spend boot recovery while maintenance is paused, prompt-override cache pre-warm, and domain-level multi-agent roster/spawn failure guards.
-- Aligned the multi-agent SPA with the durable 200/202 API response shapes and made mutation bodies reject unknown fields; the final submission candidate verifies at 1156 passed / 2 intentional skips.
+- Aligned the multi-agent SPA with the durable 200/202 API response shapes and made mutation bodies reject unknown fields.
+- Restored the literal `/api/theses/import-batches` read surface ahead of the path-like thesis catch-all, with stable pagination bounds, damaged-JSON fallback, and provenance credential/path redaction; the final submission candidate verifies at 1159 passed / 2 intentional skips.
 
 ## 2026-07-03 — Thesis registry, security master, live Kanban, PR #1 review
 

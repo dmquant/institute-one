@@ -38,12 +38,13 @@ Code-readiness verdict: **ACCEPT**. The M9 and LOOP cards intentionally remain i
 - Operator event-feed registration now reconciles the bus's actual handler set instead of trusting a stale module boolean. This fixes order-dependent suite failures after handler snapshots are restored (`test_register_is_idempotent_and_repairs_restored_handler_snapshot`).
 - Sina response decoding uses `gb18030`, a compatible superset for the upstream Chinese payloads, avoiding the Python 3.14 full-suite codec-order failure.
 - Migration 0034 was restored to its originally applied immutable contents; 0041 is the additive bridge for later factcheck outbox lease columns. Fresh installs and the existing live database now take the same schema path.
+- The live probe exposed a route-precedence hole: `/api/theses/import-batches` was consumed by `/{thesis_id:path}`. The literal route now precedes the catch-all, reads the real provenance table with stable bounds/order, fails safely on damaged JSON, and redacts local paths plus keyed or inline credential shapes.
 
 ## Verification
 
 ```text
 .venv/bin/python -m pytest tests -q
-1156 passed, 2 skipped
+1159 passed, 2 skipped
 
 .venv/bin/python -m compileall app -q
 OK
@@ -80,7 +81,9 @@ Remaining review notes are non-blocking performance/fairness debt: staged-proper
 
 - Pre-restart queue: `running_now=0`.
 - Consistent SQLite backup: `/private/tmp/institute-one-pre-r5.qHGejK/institute.db`; backup integrity `ok`, 836 task rows, 34 pre-R5 migration rows.
+- Final submission restart backup: `/private/tmp/institute-one-pre-92b06d5.p1qj14/institute.db`; 27M, backup integrity `ok`, 1059 task rows, 43 migration rows through 0043.
 - Live database integrity after restart: `ok`; migration ledger is continuous through `0043_mailbox_dispatch_protocol.sql`.
-- LaunchAgent `com.institute-one.server` restarted to PID 88883 on `127.0.0.1:8100`.
-- `/health`, `/api/meta`, `/api/tasks/queue`, `/api/contract`, and `/api/cron/health` returned successfully. The contract's four schema cross-checks are all `ok`; queue remained at `running_now=0`; the 24 scheduler jobs registered and post-restart jobs executed successfully.
+- LaunchAgent `com.institute-one.server` was finally restarted to PID 20512 on `127.0.0.1:8100`.
+- `/health`, `/api/meta`, `/api/tasks/queue`, `/api/contract`, `/api/cron/health`, `/api/theses?flat=true`, and `/api/theses/import-batches` returned successfully. The two thesis surfaces returned `[]` for the current empty dataset; the contract's four schema cross-checks are all `ok`; queue remained at `running_now=0`; all 24 scheduler jobs are registered with no latest failure.
+- Maintenance was restored to `paused=false`; a post-resume stability probe kept the service healthy and the queue empty.
 - No push was made. Formal M9/LOOP acceptance remains an operator decision.

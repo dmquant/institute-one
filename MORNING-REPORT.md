@@ -7,8 +7,8 @@
 北极星本轮可执行范围已收口：
 
 - **R5 最终协议审计闭环**：两份复核共发现 10 P1 / 4 P2 / 1 P3，15 项均已修复并由回归或故障注入测试锁定；当前判决 `ACCEPT`。
-- **权威全量**：续审修复后为 **1156 passed / 2 skipped**；backend `compileall`、frontend 16 项测试与 build、Obsidian plugin build 均通过。
-- **live 已对齐**：先确认 `running_now=0`，完成一致性 SQLite 备份，再将运行库从 0034 对齐到 0043 并重启 LaunchAgent。数据库完整性、API contract、队列和 24 个 cron 注册均已实查。
+- **权威全量**：续审与 live 缺口修复后为 **1159 passed / 2 skipped**；backend `compileall`、frontend 16 项测试与 build、Obsidian plugin build 均通过。
+- **live 已对齐**：先确认 `running_now=0`，完成一致性 SQLite 备份，再将运行库从 0034 对齐到 0043 并重启 LaunchAgent。数据库完整性、API contract、队列、24 个 cron 注册及 thesis import-batches 路由均已实查。
 - **安全边界**：仅做本地收口提交；不 push、不 restore/rebase，也不替 operator 将正式 roadmap 卡从 `review` 移到 `done`。
 
 ## 一、测试轨迹
@@ -19,7 +19,7 @@
 | R1 North Star 后 | 979 → 1003 passed |
 | loop-fix + R2/R3/R4 闭合后 | 1078 → 1096 → 1113 passed / 1 skipped |
 | R5 协议闭环与稳定化后 | 1148 passed / 2 skipped |
-| 独立续审与提交候选 | **1156 passed / 2 skipped** |
+| 独立续审与最终提交候选 | **1159 passed / 2 skipped** |
 
 两个 skip 都是显式 opt-in 的真实外部环境测试：
 
@@ -77,6 +77,7 @@ R5 的关键协议修复包括：
 - prompt override cache 在任何启动恢复前预热，active override 重启后的第一个 prompt 即生效；
 - multi-agent 在 API 与 domain 两层拒绝重复/超过 5 个 agents，所有 mutation body 禁止未知字段，spawn 中途失败保留可重连的 `run_id` / `task_ids`；SPA 同时对齐 200 completed 与 202 pending 两种响应；
 - Python 3.14 长测试进程中的 Sina mock payload 改用 canonical `gb18030`，消除 `gbk` alias 偶发 codec lookup 失败。
+- live 复核发现 `/api/theses/import-batches` 被 path-like thesis catch-all 吞掉；现已把静态路由置前，读取真实 provenance 表并对本机路径、凭据字段、内嵌 token/Bearer 与 URL userinfo 统一脱敏。
 
 ## 四、迁移与 live 对齐
 
@@ -89,11 +90,13 @@ R5 的关键协议修复包括：
 live 操作证据：
 
 - 重启前 `/api/tasks/queue`：`running_now=0`；
-- SQLite 一致性备份：`/private/tmp/institute-one-pre-r5.qHGejK/institute.db`，完整性 `ok`，包含 836 条 task、34 条旧 migration ledger；
+- 迁移前 SQLite 一致性备份：`/private/tmp/institute-one-pre-r5.qHGejK/institute.db`，完整性 `ok`，包含 836 条 task、34 条旧 migration ledger；
+- 最终提交重启前备份：`/private/tmp/institute-one-pre-92b06d5.p1qj14/institute.db`，27M，完整性 `ok`，包含 1059 条 task、43 条 migration ledger，最新为 0043；
 - 重启后 live `PRAGMA integrity_check`：`ok`；migration ledger 已到 `0043_mailbox_dispatch_protocol.sql`；
-- LaunchAgent `com.institute-one.server`：PID 88883，监听 `127.0.0.1:8100`；
-- `/health`、`/api/meta`、`/api/tasks/queue`、`/api/contract`、`/api/cron/health` 均返回成功；contract 四项 schema cross-check 全为 `ok`，队列仍为 `running_now=0`；
-- 启动日志显示 24 个 scheduler job 注册完成，重启后的定时任务执行成功，未见迁移或调度错误。
+- LaunchAgent `com.institute-one.server`：最终 PID 20512，监听 `127.0.0.1:8100`；
+- `/health`、`/api/meta`、`/api/tasks/queue`、`/api/contract`、`/api/cron/health`、`/api/theses?flat=true` 与 `/api/theses/import-batches` 均返回成功；后两者在当前空数据状态都返回 `[]`；
+- contract 四项 schema cross-check 全为 `ok`；队列最终为 `running_now=0`（957 completed / 90 failed / 9 overcommitted / 3 expired）；
+- 24 个 scheduler job 全部注册，最新状态无 failed；维护开关已恢复为 `paused=false`，恢复后复查服务与队列稳定。
 
 ## 五、仍需你决定的边界
 
