@@ -95,8 +95,8 @@ live 操作证据：
 - 重启后 live `PRAGMA integrity_check`：`ok`；migration ledger 已到 `0043_mailbox_dispatch_protocol.sql`；
 - LaunchAgent `com.institute-one.server`：最终 PID 20512，监听 `127.0.0.1:8100`；
 - `/health`、`/api/meta`、`/api/tasks/queue`、`/api/contract`、`/api/cron/health`、`/api/theses?flat=true` 与 `/api/theses/import-batches` 均返回成功；后两者在当前空数据状态都返回 `[]`；
-- contract 四项 schema cross-check 全为 `ok`；队列最终为 `running_now=0`（957 completed / 90 failed / 9 overcommitted / 3 expired）；
-- 24 个 scheduler job 全部注册，最新状态无 failed；维护开关已恢复为 `paused=false`，恢复后复查服务与队列稳定。
+- contract 四项 schema cross-check 全为 `ok`；队列最终为 `running_now=0`（959 completed / 90 failed / 9 overcommitted / 3 expired）；
+- 24 个 scheduler job 全部注册，最新状态无 failed；维护开关已恢复为 `paused=false`。恢复后自然触发的两个 whiteboard codex 任务均以 exit 0 完成，未改动项目仓库，队列重新排空并保持健康。
 
 ## 五、仍需你决定的边界
 

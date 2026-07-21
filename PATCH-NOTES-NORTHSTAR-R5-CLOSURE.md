@@ -85,5 +85,5 @@ Remaining review notes are non-blocking performance/fairness debt: staged-proper
 - Live database integrity after restart: `ok`; migration ledger is continuous through `0043_mailbox_dispatch_protocol.sql`.
 - LaunchAgent `com.institute-one.server` was finally restarted to PID 20512 on `127.0.0.1:8100`.
 - `/health`, `/api/meta`, `/api/tasks/queue`, `/api/contract`, `/api/cron/health`, `/api/theses?flat=true`, and `/api/theses/import-batches` returned successfully. The two thesis surfaces returned `[]` for the current empty dataset; the contract's four schema cross-checks are all `ok`; queue remained at `running_now=0`; all 24 scheduler jobs are registered with no latest failure.
-- Maintenance was restored to `paused=false`; a post-resume stability probe kept the service healthy and the queue empty.
+- Maintenance was restored to `paused=false`. Two naturally scheduled whiteboard Codex tasks then completed with exit code 0 without touching the repository; the queue drained back to `running_now=0` (959 completed) and the service remained healthy.
 - No push was made. Formal M9/LOOP acceptance remains an operator decision.
