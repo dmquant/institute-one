@@ -370,6 +370,56 @@ async def test_api_roundtrip():
         assert (await client.get("/api/theses/ai/gpu")).json()["status"] == "active"
 
 
+async def test_import_batches_static_route_precedes_path_thesis_route():
+    from app.main import create_app
+
+    await db.execute(
+        "INSERT INTO market_thesis_imports "
+        "(id, schema, generated_at, mode, status, manifest_json, warnings_json, imported_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (
+            "import-batch-1",
+            "researchos.market_thesis_export.bundle.v1",
+            "2026-07-01T01:45:20.376Z",
+            "dry_run",
+            "completed",
+            '{"stats":{"thesisCount":0}}',
+            '["fixture warning"]',
+            "2026-07-21T12:00:00+00:00",
+        ),
+    )
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r = await client.get("/api/theses/import-batches", params={"limit": 1})
+        assert r.status_code == 200
+        assert r.json() == [{
+            "id": "import-batch-1",
+            "schema": "researchos.market_thesis_export.bundle.v1",
+            "generated_at": "2026-07-01T01:45:20.376Z",
+            "source_schema": None,
+            "source_generated_at": None,
+            "source_first_date": None,
+            "source_last_date": None,
+            "thesis_count": 0,
+            "lane_count": 0,
+            "stock_count": 0,
+            "edge_count": 0,
+            "thesis_stock_edge_count": 0,
+            "bundle_sha256": None,
+            "idempotency_key": None,
+            "mode": "dry_run",
+            "status": "completed",
+            "error": None,
+            "imported_at": "2026-07-21T12:00:00+00:00",
+            "finished_at": None,
+            "manifest": {"stats": {"thesisCount": 0}},
+            "warnings": ["fixture warning"],
+        }]
+        assert (await client.get("/api/theses/import-batches", params={"limit": 0})).status_code == 422
+        assert (await client.get("/api/theses/import-batches", params={"limit": 201})).status_code == 422
+
+
 async def test_update_null_and_falsy_inputs():
     # NOT NULL columns reject explicit nulls with a readable error, never a
     # raw IntegrityError (ThesisPatch types them str|None, so nulls do arrive)

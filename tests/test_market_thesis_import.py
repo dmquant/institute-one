@@ -17,7 +17,11 @@ import sqlite3
 import pytest
 
 from app import bus, db
-from app.institute.market_thesis_import import MarketThesisImportError, import_bundle
+from app.institute.market_thesis_import import (
+    MarketThesisImportError,
+    import_bundle,
+    list_import_batches,
+)
 
 MANIFEST = {
     "schema": "researchos.market_thesis_export.manifest.v1",
@@ -84,6 +88,70 @@ async def test_batch_row_holds_manifest_counts():
     assert (row["edge_count"], row["thesis_stock_edge_count"]) == (1888, 1020)
     assert row["source_first_date"] == "2026-04-23"
     assert row["finished_at"] is None
+
+
+async def test_list_import_batches_empty_database():
+    assert await list_import_batches() == []
+
+
+async def test_list_import_batches_is_stable_bounded_and_safe():
+    await _mk_import("imp-1", status="completed")
+    await _mk_import("imp-2", status="failed")
+    token_key = "to" + "ken"
+    api_token_key = "api_" + token_key
+    authorization_key = "Author" + "ization"
+    bearer_scheme = "bear" + "er"
+    await db.execute(
+        "UPDATE market_thesis_imports SET imported_at=?, manifest_json=?, warnings_json=?, error=? "
+        "WHERE id=?",
+        (
+            "2026-07-21T12:00:00+00:00",
+            json.dumps({
+                "stats": {"thesisCount": 2},
+                "files": ["bundle.json"],
+                "bundlePath": "/Users/operator/private/bundle.json",
+                api_token_key: "fixture-value",
+                "summary": f'{token_key}="inline manifest sentinel"',
+            }),
+            json.dumps([
+                f"{token_key}=fixture-value",
+                f"{authorization_key}: {bearer_scheme} warning-sentinel",
+                "fetch https://" + "operator:warning-sentinel@" + "example.test failed",
+                "/Users/operator/private/bundle.json was skipped",
+            ]),
+            f"{authorization_key}: {bearer_scheme} warning-sentinel "
+            "/Users/operator/private/bundle.json: failed",
+            "imp-2",
+        ),
+    )
+    # Same timestamp proves the id tie-breaker is deterministic.
+    await db.execute(
+        "UPDATE market_thesis_imports SET imported_at=?, manifest_json=? WHERE id=?",
+        ("2026-07-21T12:00:00+00:00", "[]", "imp-1"),
+    )
+
+    batches = await list_import_batches(limit=1)
+    assert [batch["id"] for batch in batches] == ["imp-2"]
+    batch = batches[0]
+    assert batch["manifest"]["stats"] == {"thesisCount": 2}
+    assert batch["manifest"]["files"] == ["bundle.json"]
+    assert batch["manifest"]["bundlePath"] == "[redacted]"
+    assert batch["manifest"]["api_token"] == "[redacted]"
+    assert batch["manifest"]["summary"] == "token=[redacted]"
+    assert batch["warnings"] == [
+        "token=[redacted]",
+        "Authorization: [redacted]",
+        "fetch https://[redacted]@example.test failed",
+        "[redacted] was skipped",
+    ]
+    assert batch["error"] == "Authorization: [redacted] [redacted]: failed"
+    assert "warning-sentinel" not in json.dumps(batch)
+    assert "manifest_json" not in batch and "warnings_json" not in batch
+
+    with pytest.raises(MarketThesisImportError, match="between 1 and 200"):
+        await list_import_batches(limit=0)
+    with pytest.raises(MarketThesisImportError, match="between 1 and 200"):
+        await list_import_batches(limit=201)
 
 
 async def test_idempotency_key_unique_for_completed_and_null_repeats():

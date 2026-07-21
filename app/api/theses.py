@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..institute import theses
+from ..institute import market_thesis_import, theses
 
 router = APIRouter(prefix="/api/theses", tags=["theses"])
 
@@ -112,6 +112,20 @@ async def list_theses(
 @router.post("")
 async def create_thesis(body: ThesisCreate):
     return await _call(theses.create_thesis, body.model_dump(exclude_unset=True))
+
+
+# This literal route must stay before ``/{thesis_id:path}``: Starlette resolves
+# matching routes in registration order and thesis ids are allowed to contain
+# slashes, so the catch-all would otherwise swallow ``import-batches``.
+@router.get("/import-batches")
+async def list_import_batches(
+    limit: int = Query(
+        market_thesis_import.IMPORT_BATCH_DEFAULT_LIMIT,
+        ge=1,
+        le=market_thesis_import.IMPORT_BATCH_MAX_LIMIT,
+    ),
+):
+    return await market_thesis_import.list_import_batches(limit)
 
 
 # ids are path-like ("ai/gpu"), so the param must swallow slashes

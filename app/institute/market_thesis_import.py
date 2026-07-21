@@ -86,6 +86,27 @@ _RESERVED_SUFFIXES = ("SH", "SZ", "BJ", "HK", "US")
 _WEIGHT_SCALE = 3.0  # tracks_stock weight ceiling observed in the bundle (core=3)
 _BUCKETS = {"core", "watch", "peer", "hedge"}  # CHECK set on thesis_security_edges
 
+IMPORT_BATCH_DEFAULT_LIMIT = 50
+IMPORT_BATCH_MAX_LIMIT = 200
+_REDACTED = "[redacted]"
+_SENSITIVE_MANIFEST_KEYS = (
+    "password", "passwd", "secret", "token", "credential", "authorization",
+    "apikey", "accesskey", "privatekey", "bundlepath", "localpath",
+)
+_SENSITIVE_INLINE_RE = re.compile(
+    r"(?i)\b(password|passwd|secret|token|credential|authorization|"
+    r"api[_-]?key|access[_-]?key|private[_-]?key)\b(\s*[:=]\s*)"
+    r"(?:(?:Bearer|Basic)\s+)?"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,&;)\]}]+)"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._~+/=-]+)")
+_URL_USERINFO_RE = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/@\s]+@"
+)
+_LOCAL_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:/])(?:file://|~/|/|[A-Za-z]:[\\/])[^\s,;:)\]}]+"
+)
+
 # bundle keys that map onto real columns; everything else -> metadata_json
 _LANE_MAPPED = {"id", "lane", "laneEn", "href", "firstSeen", "lastSeen"}
 _THESIS_MAPPED = {"id", "title", "titleEn", "laneId", "coreView", "direction",
@@ -133,6 +154,74 @@ def _tally(entries: list[dict[str, Any]]) -> dict[str, int]:
     for e in entries:
         out[e["status"]] += 1
     return out
+
+
+def _safe_json(text: str | None, fallback: Any, expected: type) -> Any:
+    """Decode provenance JSON without letting one damaged row break the list."""
+    try:
+        value = json.loads(text) if text else fallback
+    except (TypeError, ValueError):
+        return fallback
+    return value if isinstance(value, expected) else fallback
+
+
+def _public_provenance_value(value: Any, *, key: str = "") -> Any:
+    """Remove credentials and machine-local paths from persisted manifests.
+
+    The importer intentionally stores the source manifest for auditability, but
+    that JSON is an open object.  Treat it as untrusted at the API boundary: a
+    future exporter may add a local path or credential-shaped field that does
+    not belong in a read endpoint.
+    """
+    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+    if any(part in normalized for part in _SENSITIVE_MANIFEST_KEYS):
+        return _REDACTED
+    if isinstance(value, dict):
+        return {
+            str(child_key): _public_provenance_value(child, key=str(child_key))
+            for child_key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_public_provenance_value(child) for child in value]
+    if isinstance(value, str):
+        redacted = _URL_USERINFO_RE.sub(
+            lambda match: f"{match.group(1)}{_REDACTED}@", value
+        )
+        redacted = _SENSITIVE_INLINE_RE.sub(r"\1\2" + _REDACTED, redacted)
+        redacted = _BEARER_RE.sub("Bearer " + _REDACTED, redacted)
+        return _LOCAL_PATH_RE.sub(_REDACTED, redacted)
+    return value
+
+
+async def list_import_batches(
+    limit: int = IMPORT_BATCH_DEFAULT_LIMIT,
+) -> list[dict[str, Any]]:
+    """Return recent importer provenance without bundle contents or local paths."""
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise MarketThesisImportError("limit must be an integer")
+    if not 1 <= limit <= IMPORT_BATCH_MAX_LIMIT:
+        raise MarketThesisImportError(
+            f"limit must be between 1 and {IMPORT_BATCH_MAX_LIMIT}"
+        )
+
+    rows = await db.query(
+        "SELECT id, schema, generated_at, source_schema, source_generated_at, "
+        "source_first_date, source_last_date, thesis_count, lane_count, stock_count, "
+        "edge_count, thesis_stock_edge_count, bundle_sha256, idempotency_key, mode, "
+        "status, manifest_json, warnings_json, error, imported_at, finished_at "
+        "FROM market_thesis_imports ORDER BY imported_at DESC, id DESC LIMIT ?",
+        (limit,),
+    )
+    batches: list[dict[str, Any]] = []
+    for row in rows:
+        batch = dict(row)
+        manifest = _safe_json(batch.pop("manifest_json", None), {}, dict)
+        warnings = _safe_json(batch.pop("warnings_json", None), [], list)
+        batch["manifest"] = _public_provenance_value(manifest)
+        batch["warnings"] = _public_provenance_value(warnings)
+        batch["error"] = _public_provenance_value(batch.get("error"))
+        batches.append(batch)
+    return batches
 
 
 async def _load_existing() -> dict[str, Any]:
