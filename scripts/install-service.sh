@@ -12,8 +12,6 @@ cd "$(dirname "$0")/.."
 LABEL="com.institute-one.server"
 REPO_DIR="$(pwd)"
 VENV_DIR="$REPO_DIR/.venv"
-PORT="${INSTITUTE_PORT:-8100}"
-LOG_DIR="$HOME/.institute-one/logs"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 TEMPLATE="$REPO_DIR/scripts/$LABEL.plist.template"
@@ -28,10 +26,16 @@ elif [ -n "${1:-}" ]; then
   exit 2
 fi
 
-if [ ! -x "$VENV_DIR/bin/uvicorn" ]; then
-  echo "error: $VENV_DIR/bin/uvicorn not found — run scripts/install.sh first" >&2
+if [ ! -x "$VENV_DIR/bin/python" ] || [ ! -x "$VENV_DIR/bin/uvicorn" ]; then
+  echo "error: project venv is incomplete — run scripts/install.sh first" >&2
   exit 1
 fi
+# Values are emitted with shlex.quote by a trusted project helper.
+eval "$("$VENV_DIR/bin/python" scripts/runtime-config.py)"
+HOME_DIR="$INSTITUTE_RUNTIME_HOME"
+HOST="$INSTITUTE_RUNTIME_HOST"
+PORT="$INSTITUTE_RUNTIME_PORT"
+LOG_DIR="$HOME_DIR/logs"
 
 mkdir -p "$LOG_DIR" "$AGENTS_DIR"
 
@@ -40,7 +44,9 @@ mkdir -p "$LOG_DIR" "$AGENTS_DIR"
 content="$(cat "$TEMPLATE")"
 content="${content//\{\{REPO_DIR\}\}/$REPO_DIR}"
 content="${content//\{\{VENV_DIR\}\}/$VENV_DIR}"
+content="${content//\{\{HOME_DIR\}\}/$HOME_DIR}"
 content="${content//\{\{LOG_DIR\}\}/$LOG_DIR}"
+content="${content//\{\{HOST\}\}/$HOST}"
 content="${content//\{\{PORT\}\}/$PORT}"
 content="${content//\{\{PATH\}\}/$SERVICE_PATH}"
 printf '%s\n' "$content" > "$PLIST"

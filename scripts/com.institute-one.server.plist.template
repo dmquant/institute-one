@@ -17,7 +17,7 @@
     <string>{{VENV_DIR}}/bin/uvicorn</string>
     <string>app.main:app</string>
     <string>--host</string>
-    <string>127.0.0.1</string>
+    <string>{{HOST}}</string>
     <string>--port</string>
     <string>{{PORT}}</string>
   </array>
@@ -57,6 +57,14 @@
   <dict>
     <key>PATH</key>
     <string>{{PATH}}</string>
+    <!-- Persist the exact non-secret Settings values used while rendering.
+         launchd does not inherit the installer's shell environment. -->
+    <key>INSTITUTE_HOME</key>
+    <string>{{HOME_DIR}}</string>
+    <key>INSTITUTE_HOST</key>
+    <string>{{HOST}}</string>
+    <key>INSTITUTE_PORT</key>
+    <string>{{PORT}}</string>
   </dict>
 
   <key>ProcessType</key>

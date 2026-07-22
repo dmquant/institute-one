@@ -9,8 +9,15 @@
 # launchd-managed servers keep no pidfile — stop those via
 # scripts/uninstall-service.sh or launchctl bootout.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
-PIDFILE="$HOME/.institute-one/server.pid"
+if [ ! -x .venv/bin/python ]; then
+  echo "error: project venv is missing — cannot safely resolve the configured pidfile" >&2
+  exit 1
+fi
+# Values are emitted with shlex.quote by a trusted project helper.
+eval "$(.venv/bin/python scripts/runtime-config.py)"
+PIDFILE="$INSTITUTE_RUNTIME_HOME/server.pid"
 PATTERN="uvicorn.*app\.main:app"
 
 if [ ! -f "$PIDFILE" ]; then
