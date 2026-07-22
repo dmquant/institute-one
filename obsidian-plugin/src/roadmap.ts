@@ -1148,6 +1148,9 @@ const RELEASE_GATES = [
 	{ name: "Release A", description: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
 	{ name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
 	{ name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] },
+	{ name: "Release D", description: "Post-Audit Hardening", prefixes: ["M8"] },
+	{ name: "Release E", description: "North Star R1", prefixes: ["M9"] },
+	{ name: "Release F", description: "Bounded-Autonomy Loop", prefixes: ["M10"] },
 ];
 
 function localReleaseGates(cards: RoadmapCard[]): RoadmapReleaseGate[] {

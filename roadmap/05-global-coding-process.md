@@ -126,6 +126,20 @@ requires:
 
 The portal should calculate readiness rather than requiring a manually updated status paragraph.
 
+Current release projection:
+
+| Gate | Phase tokens | Scope |
+|---|---|---|
+| Release A | M0–M3 | Thesis registry and forecastable research |
+| Release B | M4–M6 | Market data and forecast ledger |
+| Release C | M7 | Roadmap control plane |
+| Release D | M8 | Post-audit hardening |
+| Release E | M9 | North Star R1 |
+| Release F | M10 | Bounded-Autonomy Loop |
+
+A gate is ready only when every scoped card is done and every scoped card has
+pass evidence. Import status alone is not operator acceptance.
+
 ## Learning Loop
 
 After each milestone:

@@ -8,7 +8,7 @@ How to use: pick an unchecked item (respect the dependency arrows in §0), paste
 
 Status: ☑ done · ◔ partial · ☐ open. Effort: S < half a day · M ≈ a day · L ≈ days (with an AI agent doing the typing).
 
-Execution tracking: day-to-day work now also flows through the roadmap control plane in [`roadmap/`](./roadmap/) — `roadmap/backlog.json` is the execution-level card board (phases M0–M7; every non-trivial change goes design → card → session → diff → verification → review → release gate → done), viewable as a Kanban in the Obsidian plugin ("Institute: 打开路线图"). This file remains the long-horizon feature map toward the proposal; the two coexist.
+Execution tracking: day-to-day work now also flows through the roadmap control plane in [`roadmap/`](./roadmap/) — SQLite rows are operator truth and `roadmap/backlog.json` is the reviewed seed/export board across phases M0–M10. Every non-trivial change goes design → card → session → diff → verification → review → release gate → done, viewable as a Kanban in the Obsidian plugin ("Institute: 打开路线图"). This file remains the long-horizon feature map toward the proposal; the two coexist.
 
 ---
 
@@ -99,7 +99,7 @@ Findings from a code audit on 2026-06-11. The three P1s can silently halt the pi
 
 - ☑ **sqlite-vec + bge-m3 plumbing** (M). Ollama `/api/embeddings` with `bge-m3` (1024-d); `vec_search` virtual table + `vector_chunks` metadata (additive migration); embed text artifacts at archive time; **graceful degradation**: Ollama down → every similarity gate returns "not duplicate / fresh" and search falls back to FTS5 (the proposal's documented best-effort posture).
   > *Prompt:* Add embeddings to institute-one per ROADMAP Phase 1a: app/institute/vectors.py wrapping Ollama bge-m3 (settings.ollama_host, new enable flag), sqlite-vec virtual table vec_search(embedding float[1024]) + vector_chunks metadata table in a new migration (additive!). Hook archive.snapshot_session to chunk+embed .md files (asyncio.to_thread, never fail the snapshot). Upgrade GET /api/archive/search (and add POST /api/search per proposal §9): cosine top-k via vec_search with FTS5 fallback when Ollama is unreachable. Add sqlite-vec to pyproject. Tests: fake embedder fixture; search returns semantic match; degradation path returns FTS5 results.
-- ☑ **Whiteboard similarity gate + diversity pick** (M). Before kickoff: cosine vs recent boards — ≥0.85/14d skip, ≥0.65/30d augment the prompt with "BUILD ON prior work"; topic pick gets a diversity penalty instead of pure max-score. Thresholds as config rows, with a one-off distribution sanity check against ~50 known pairs (proposal §6.3). (Gate + config thresholds shipped; the ~50-known-pair distribution sanity check against real bge-m3 has not been run — thresholds are uncalibrated defaults.) **[R1 Real bge-m3 calibration executed in R1 (INSTITUTE_CALIBRATION_REAL=1, 7 passed) — thresholds validated against the live model.]**
+- ◔ **Whiteboard similarity gate + diversity pick** (M). Before kickoff: cosine vs recent boards — ≥0.85/14d skip, ≥0.65/30d augment the prompt with "BUILD ON prior work"; topic pick gets a diversity penalty instead of pure max-score. Gate logic and configurable defaults have shipped, but the required ~50-known-pair distribution run against real bge-m3 is still outstanding; `INSTITUTE_CALIBRATION_REAL=1` therefore remains an explicit operator acceptance gate.
 - ☑ **Topic-category weights** (S). `topic_category_weights` + category rotation guard in kickoff (proposal §10).
 
 ## Phase 1b — Market data

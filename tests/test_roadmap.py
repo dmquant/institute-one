@@ -3,6 +3,7 @@ decisions, card create/claim, checklist/dependency CRUD, export, agent
 prompts, the process overview, and the API surface."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -18,6 +19,9 @@ SEED = json.loads(BACKLOG.read_text(encoding="utf-8"))
 N_CARDS = len(SEED["cards"])
 # the seed is a living board — assert against its current M7-001 status, not a snapshot
 M7_STATUS = next(c for c in SEED["cards"] if c["id"] == "M7-001").get("status", "inbox")
+RELEASE_GATE_NAMES = {
+    "Release A", "Release B", "Release C", "Release D", "Release E", "Release F",
+}
 
 
 def _seed_gate(*prefixes: str) -> tuple[int, int]:
@@ -87,6 +91,129 @@ async def test_import_is_idempotent_and_updates_changed_fields(tmp_path):
     assert forced[0].payload == {"from": "ready", "to": "parked"}
 
 
+async def test_import_dry_run_plans_without_writes_or_events(tmp_path):
+    initial = {
+        "cards": [
+            {
+                "id": "PLAN-A", "title": "before", "status": "ready",
+                "acceptance": ["base"],
+            },
+            {
+                "id": "PLAN-B", "title": "dep target", "status": "ready",
+                "acceptance": ["ready"],
+            },
+        ],
+    }
+    initial_path = tmp_path / "initial.json"
+    initial_path.write_text(json.dumps(initial), encoding="utf-8")
+    await roadmap.import_backlog(initial_path)
+    await roadmap.add_checklist_item("PLAN-A", "acceptance", "manual-only")
+    await roadmap.create_card({"id": "LIVE-ONLY", "title": "operator card"})
+
+    desired = {
+        "cards": [
+            {
+                "id": "PLAN-A", "title": "after", "status": "done",
+                "acceptance": ["base", "seed-added"], "dependencies": ["PLAN-B"],
+            },
+            {
+                "id": "PLAN-B", "title": "dep target", "status": "ready",
+                "acceptance": ["ready"],
+            },
+            {
+                "id": "PLAN-C", "title": "new finished card", "status": "done",
+                "acceptance": ["new card"],
+            },
+        ],
+    }
+    desired_path = tmp_path / "desired.json"
+    desired_path.write_text(json.dumps(desired), encoding="utf-8")
+
+    before_events = (await db.query_one("SELECT COUNT(*) AS n FROM roadmap_events"))["n"]
+    before_bus = len(await bus.replay(0))
+    before_cards = await roadmap.list_cards()
+    plan = await roadmap.import_backlog(
+        desired_path, dry_run=True, new_card_status_policy="inbox"
+    )
+
+    assert plan["dry_run"] is True
+    assert plan["new_card_status_policy"] == "inbox"
+    assert (plan["created"], plan["updated"], plan["unchanged"], plan["total"]) == (1, 1, 1, 3)
+    assert plan["created_cards"] == [{
+        "card_id": "PLAN-C", "seed_status": "done", "applied_status": "inbox",
+    }]
+    assert plan["status_drift"] == [{
+        "card_id": "PLAN-A", "live_status": "ready", "seed_status": "done",
+        "action": "preserve_live",
+    }]
+    assert plan["live_only"] == [{
+        "card_id": "LIVE-ONLY", "title": "operator card", "status": "inbox",
+    }]
+    assert plan["dependency_changes"] == [{
+        "card_id": "PLAN-A", "added": ["PLAN-B"], "removed": [],
+    }]
+    checklist = {change["card_id"]: change for change in plan["checklist_changes"]}
+    assert checklist["PLAN-A"] == {
+        "card_id": "PLAN-A", "added": ["seed-added"],
+        "preserved_live_only": ["manual-only"],
+    }
+    assert checklist["PLAN-C"]["added"] == ["new card"]
+    assert {item["card_id"] for item in plan["updated_cards"]} == {"PLAN-A"}
+    assert set(plan["updated_cards"][0]["fields"]) == {
+        "title", "acceptance", "dependencies",
+    }
+
+    # Dry-run means no cards, child rows, audit rows, or in-memory bus events.
+    assert await roadmap.list_cards() == before_cards
+    assert await roadmap.get_card("PLAN-C") is None
+    assert (await db.query_one("SELECT COUNT(*) AS n FROM roadmap_events"))["n"] == before_events
+    assert len(await bus.replay(0)) == before_bus
+
+    applied = await roadmap.import_backlog(
+        desired_path, new_card_status_policy="inbox"
+    )
+    assert applied == {"created": 1, "updated": 1, "unchanged": 1, "total": 3}
+    assert (await roadmap.get_card("PLAN-C"))["status"] == "inbox"
+    assert (await roadmap.get_card("PLAN-A"))["status"] == "ready"  # local status still wins
+
+
+async def test_import_rejects_self_dependency_and_cycles_atomically(tmp_path):
+    self_seed = tmp_path / "self.json"
+    self_seed.write_text(json.dumps({"cards": [
+        {"id": "SELF", "title": "self", "dependencies": ["SELF"]},
+    ]}), encoding="utf-8")
+    with pytest.raises(roadmap.RoadmapError, match="cannot depend on itself"):
+        await roadmap.import_backlog(self_seed, dry_run=True)
+    with pytest.raises(roadmap.RoadmapError, match="cannot depend on itself"):
+        await roadmap.import_backlog(self_seed)
+
+    cycle_seed = tmp_path / "cycle.json"
+    cycle_seed.write_text(json.dumps({"cards": [
+        {"id": "CYCLE-A", "title": "a", "dependencies": ["CYCLE-B"]},
+        {"id": "CYCLE-B", "title": "b", "dependencies": ["CYCLE-A"]},
+    ]}), encoding="utf-8")
+    with pytest.raises(roadmap.RoadmapError, match=r"dependency cycle: .*CYCLE"):
+        await roadmap.import_backlog(cycle_seed)
+
+    assert await roadmap.list_cards() == []
+    assert (await db.query_one("SELECT COUNT(*) AS n FROM roadmap_events"))["n"] == 0
+    assert await bus.replay(0) == []
+
+
+async def test_import_new_card_status_policy_validation_and_seed_default(tmp_path):
+    seed = tmp_path / "status.json"
+    seed.write_text(json.dumps({"cards": [
+        {"id": "STATUS-DONE", "title": "done in seed", "status": "done"},
+    ]}), encoding="utf-8")
+
+    # Compatible default keeps the seed state for a freshly built board.
+    await roadmap.import_backlog(seed)
+    assert (await roadmap.get_card("STATUS-DONE"))["status"] == "done"
+
+    with pytest.raises(roadmap.RoadmapError, match="new card status policy"):
+        await roadmap.import_backlog(seed, new_card_status_policy="unsafe")
+
+
 # ---- (b) unknown dependency ids --------------------------------------------
 
 async def test_unknown_dependency_ids_are_rejected(tmp_path):
@@ -140,6 +267,51 @@ async def test_reimport_reconciles_dropped_dependencies(tmp_path):
 
     card = await roadmap.get_card("M7-003")
     assert card["dependencies"] == []  # stale dep no longer blocks move-to-done
+
+
+async def test_import_dry_run_is_zero_write_zero_event_and_inbox_policy_stages_new_cards(tmp_path):
+    plan = await roadmap.import_backlog(dry_run=True, new_card_status_policy="inbox")
+    assert plan["dry_run"] is True
+    assert plan["created"] == N_CARDS
+    assert plan["updated"] == 0
+    assert plan["unchanged"] == 0
+    assert await roadmap.list_cards() == []
+    assert await bus.replay(0, types=["roadmap.import.completed"]) == []
+    assert await bus.replay(0, types=["roadmap.import.status_forced"]) == []
+
+    data = _seed_copy()
+    data["cards"].append({
+        "id": "M7-TMPQ", "title": "temp staged import card",
+        "phase": "M7 Roadmap Control Plane", "status": "done", "acceptance": ["captured by inbox staging"],
+    })
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    res = await roadmap.import_backlog(seed, new_card_status_policy="inbox")
+    assert res == {"created": N_CARDS + 1, "updated": 0, "unchanged": 0, "total": N_CARDS + 1}
+    staged = await roadmap.get_card("M7-TMPQ")
+    assert staged is not None
+    assert staged["status"] == "inbox"  # import did NOT bypass move/evidence gates
+    assert staged["completed_at"] is None
+    assert len(await bus.replay(0, types=["roadmap.import.completed"])) == 1
+
+
+async def test_release_gates_extend_through_m10():
+    await roadmap.import_backlog()
+    gates = {g["name"]: g for g in await roadmap.release_gates()}
+    assert set(gates) == {"Release A", "Release B", "Release C", "Release D", "Release E", "Release F"}
+    for name, prefixes in {
+        "Release D": ("M8",),
+        "Release E": ("M9",),
+        "Release F": ("M10",),
+    }.items():
+        total, done = _seed_gate(*prefixes)
+        assert gates[name]["prefixes"] == list(prefixes)
+        assert (gates[name]["total"], gates[name]["done"]) == (total, done)
+        assert gates[name]["remaining"] == sorted(
+            c["id"] for c in SEED["cards"]
+            if c.get("phase", "").split(" ")[0] in prefixes and c.get("status") != "done"
+        )
 
 
 # ---- (c) move rules ----------------------------------------------------------
@@ -820,6 +992,164 @@ async def test_export_roundtrip_is_idempotent_and_rebuilds():
     )
 
 
+# ---- (l) retry-safe create mutations (M7-010) -------------------------------
+
+async def test_concurrent_idempotent_card_create_has_one_winner():
+    request = {"title": "concurrent retry", "acceptance": ["one card"]}
+    first, second = await asyncio.gather(
+        roadmap.create_card(request, idempotency_key="concurrent-key"),
+        roadmap.create_card(request, idempotency_key="concurrent-key"),
+    )
+    assert first == second
+    assert (await db.query_one(
+        "SELECT COUNT(*) AS n FROM roadmap_cards WHERE title = 'concurrent retry'"
+    ))["n"] == 1
+    events = await bus.replay(0, types=["roadmap.card.created"])
+    assert len(events) == 1
+
+async def test_idempotency_record_and_create_mutation_are_atomic(monkeypatch):
+    async def fail_store(*_args, **_kwargs):
+        raise RuntimeError("simulated ledger write failure")
+
+    monkeypatch.setattr(roadmap, "_store_idempotency_result", fail_store)
+    with pytest.raises(RuntimeError, match="ledger write failure"):
+        await roadmap.create_card(
+            {"id": "IDEM-ROLLBACK", "title": "must roll back"},
+            idempotency_key="atomic-key",
+        )
+
+    # The resource insert happened before the injected failure, but both are
+    # inside one transaction: no card, checklist, ledger row, or event survives.
+    assert await roadmap.get_card("IDEM-ROLLBACK") is None
+    assert (await db.query_one(
+        "SELECT COUNT(*) AS n FROM roadmap_idempotency_keys"
+    ))["n"] == 0
+    assert (await db.query_one(
+        "SELECT COUNT(*) AS n FROM roadmap_events"
+    ))["n"] == 0
+
+
+async def test_api_create_idempotency_replay_conflict_and_scope_isolation():
+    from app.main import create_app
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Parent fixtures are ordinary creates; all seven create-style roadmap
+        # endpoints below reuse one key to prove route isolation.
+        for card_id in ("IDEM-P1", "IDEM-P2"):
+            response = await client.post(
+                "/api/roadmap/cards", json={"id": card_id, "title": card_id}
+            )
+            assert response.status_code == 200
+
+        # Generated-id card create: exact replay returns the original serialized
+        # response, not a second card and not the resource's later edited state.
+        retry_headers = {"Idempotency-Key": "card-retry"}
+        create_body = {"title": "original title", "acceptance": ["works"]}
+        first = await client.post(
+            "/api/roadmap/cards", json=create_body, headers=retry_headers
+        )
+        replay = await client.post(
+            "/api/roadmap/cards", json=create_body, headers=retry_headers
+        )
+        assert first.status_code == replay.status_code == 200
+        assert replay.json() == first.json()
+        generated_id = first.json()["id"]
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_cards WHERE title = 'original title'"
+        ))["n"] == 1
+        assert (await client.patch(
+            f"/api/roadmap/cards/{generated_id}", json={"title": "edited later"}
+        )).status_code == 200
+        replay_after_edit = await client.post(
+            "/api/roadmap/cards", json=create_body, headers=retry_headers
+        )
+        assert replay_after_edit.json() == first.json()
+        assert replay_after_edit.json()["title"] == "original title"
+
+        conflict = await client.post(
+            "/api/roadmap/cards", json={"title": "different request"},
+            headers=retry_headers,
+        )
+        assert conflict.status_code == 409
+        assert "different request" in conflict.json()["detail"]
+
+        shared = {"Idempotency-Key": "shared-across-routes"}
+
+        async def post_twice(path: str, payload: dict) -> dict:
+            one = await client.post(path, json=payload, headers=shared)
+            two = await client.post(path, json=payload, headers=shared)
+            assert one.status_code == two.status_code == 200, (path, one.text, two.text)
+            assert two.json() == one.json()
+            return one.json()
+
+        evidence = await post_twice(
+            "/api/roadmap/cards/IDEM-P1/evidence",
+            {"kind": "test", "title": "pytest", "status": "pass"},
+        )
+        checklist = await post_twice(
+            "/api/roadmap/cards/IDEM-P1/checklists",
+            {"kind": "acceptance", "text": "one item"},
+        )
+        dependency = await post_twice(
+            "/api/roadmap/cards/IDEM-P1/dependencies",
+            {"depends_on_id": "IDEM-P2"},
+        )
+        decision = await post_twice(
+            "/api/roadmap/decisions",
+            {"card_id": "IDEM-P1", "title": "choose", "question": "A or B?"},
+        )
+        session = await post_twice(
+            "/api/roadmap/cards/IDEM-P1/sessions",
+            {"actor": "codex", "goal": "test retries"},
+        )
+        command = await post_twice(
+            f"/api/roadmap/sessions/{session['id']}/commands",
+            {
+                "command_label": "pytest", "command_text": "pytest -q",
+                "exit_code": 0, "as_evidence": True,
+            },
+        )
+        assert command["evidence_id"]
+
+        # Same route + same key is also isolated by parent resource.
+        other_parent = await client.post(
+            "/api/roadmap/cards/IDEM-P2/evidence",
+            json={"kind": "doc", "title": "different parent"}, headers=shared,
+        )
+        assert other_parent.status_code == 200
+        assert other_parent.json()["id"] != evidence["id"]
+
+        # Every keyed resource was created once; replay did not duplicate rows.
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_checklists WHERE id = ?", (checklist["id"],)
+        ))["n"] == 1
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_dependencies WHERE id = ?", (dependency["id"],)
+        ))["n"] == 1
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_decisions WHERE id = ?", (decision["id"],)
+        ))["n"] == 1
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_coding_sessions WHERE id = ?", (session["id"],)
+        ))["n"] == 1
+        assert (await db.query_one(
+            "SELECT COUNT(*) AS n FROM roadmap_session_commands WHERE id = ?", (command["id"],)
+        ))["n"] == 1
+
+        # Invalid keys are rejected before mutation.
+        empty = await client.post(
+            "/api/roadmap/cards", json={"title": "empty key"},
+            headers={"Idempotency-Key": "   "},
+        )
+        assert empty.status_code == 400
+        too_long = await client.post(
+            "/api/roadmap/cards", json={"title": "long key"},
+            headers={"Idempotency-Key": "x" * 201},
+        )
+        assert too_long.status_code == 400
+
+
 # ---- (l) agent prompt (M7-007) ----------------------------------------------------
 
 async def test_agent_prompt_is_deterministic_and_complete():
@@ -914,7 +1244,7 @@ async def test_process_overview_aggregates_sessions_decisions_gates_blocked(tmp_
 
     # release gates: shape + counts scoped by milestone prefix
     gates = {g["gate"]: g for g in view["release_gates"]}
-    assert set(gates) == {"Release A", "Release B", "Release C"}
+    assert set(gates) == RELEASE_GATE_NAMES
     gate_c = gates["Release C"]
     assert set(gate_c) == {
         "gate", "description", "prefixes", "cards_total", "cards_done",
@@ -962,6 +1292,19 @@ async def test_api_roundtrip_and_release_gates():
         # the import endpoint only reads seeds inside the repository
         r = await client.post("/api/roadmap/import", json={"path": "/etc/hosts"})
         assert r.status_code == 400
+
+        # The HTTP dry-run exposes the policy and full plan without seeding the DB.
+        r = await client.post("/api/roadmap/import", json={
+            "dry_run": True, "new_card_status_policy": "inbox",
+        })
+        assert r.status_code == 200
+        assert r.json()["dry_run"] is True
+        assert r.json()["new_card_status_policy"] == "inbox"
+        assert r.json()["created"] == N_CARDS
+        assert await roadmap.list_cards() == []
+        assert (await client.post(
+            "/api/roadmap/import", json={"new_card_status_policy": "unsafe"},
+        )).status_code == 422
 
         r = await client.post("/api/roadmap/import", json={})
         assert r.status_code == 200
@@ -1032,7 +1375,7 @@ async def test_api_roundtrip_and_release_gates():
         r = await client.get("/api/roadmap/release-gates")
         assert r.status_code == 200
         gates = {g["name"]: g for g in r.json()}
-        assert set(gates) == {"Release A", "Release B", "Release C"}
+        assert set(gates) == RELEASE_GATE_NAMES
         assert gates["Release A"]["prefixes"] == ["M0", "M1", "M2", "M3"]
         # counts come from the living seed, not a snapshot of board statuses
         total_a, done_a = _seed_gate("M0", "M1", "M2", "M3")
@@ -1047,6 +1390,15 @@ async def test_api_roundtrip_and_release_gates():
             if c.get("phase", "").split(" ")[0] == "M7" and c.get("status") == "done"
         }
         assert gates["Release C"]["done"] == len(done_ids | {"M7-003"})
+        assert gates["Release D"]["prefixes"] == ["M8"]
+        assert gates["Release E"]["prefixes"] == ["M9"]
+        assert gates["Release F"]["prefixes"] == ["M10"]
+        assert gates["Release D"]["description"] == "Post-Audit Hardening"
+        assert gates["Release E"]["description"] == "North Star R1"
+        assert gates["Release F"]["description"] == "Bounded-Autonomy Loop"
+        assert gates["Release D"]["total"] == _seed_gate("M8")[0]
+        assert gates["Release E"]["total"] == _seed_gate("M9")[0]
+        assert gates["Release F"]["total"] == _seed_gate("M10")[0]
 
 
 async def test_api_prompt_and_process_endpoints():
@@ -1073,7 +1425,7 @@ async def test_api_prompt_and_process_endpoints():
         assert r.status_code == 200
         view = r.json()
         assert set(view) == {"active_sessions", "open_decisions", "release_gates", "blocked_cards"}
-        assert {g["gate"] for g in view["release_gates"]} == {"Release A", "Release B", "Release C"}
+        assert {g["gate"] for g in view["release_gates"]} == RELEASE_GATE_NAMES
         for gate in view["release_gates"]:
             assert gate["cards_total"] >= gate["cards_done"]
             assert isinstance(gate["blockers"], list)

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
@@ -25,6 +25,8 @@ async def _call(fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) ->
 class ImportBody(BaseModel):
     path: str | None = None  # defaults to roadmap/backlog.json in the repo
     force: bool = False      # apply seed status over local status
+    dry_run: bool = False    # return the reconciliation plan; zero writes/events
+    new_card_status_policy: Literal["seed", "inbox"] = "seed"
 
 
 class CardCreate(BaseModel):
@@ -175,8 +177,15 @@ async def card_prompt(card_id: str):
 
 
 @router.post("/cards")
-async def create_card(body: CardCreate):
-    return await _call(roadmap.create_card, body.model_dump(exclude_unset=True))
+async def create_card(
+    body: CardCreate,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    return await _call(
+        roadmap.create_card,
+        body.model_dump(exclude_unset=True),
+        idempotency_key=idempotency_key,
+    )
 
 
 @router.post("/cards/{card_id}/claim")
@@ -201,7 +210,13 @@ async def import_backlog(body: ImportBody):
         if not resolved.is_relative_to(root):
             raise HTTPException(400, "import path must live inside the repository")
         path = str(resolved)
-    return await _call(roadmap.import_backlog, path, force=body.force)
+    return await _call(
+        roadmap.import_backlog,
+        path,
+        force=body.force,
+        dry_run=body.dry_run,
+        new_card_status_policy=body.new_card_status_policy,
+    )
 
 
 @router.patch("/cards/{card_id}")
@@ -225,10 +240,15 @@ async def move_card(card_id: str, body: MoveBody):
 
 
 @router.post("/cards/{card_id}/evidence")
-async def add_evidence(card_id: str, body: EvidenceBody):
+async def add_evidence(
+    card_id: str,
+    body: EvidenceBody,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     evidence = await _call(
         roadmap.add_evidence, card_id, body.kind, body.title,
         body=body.body, status=body.status, artifact_ref=body.artifact_ref,
+        idempotency_key=idempotency_key,
     )
     if evidence is None:
         raise HTTPException(404, "roadmap card not found")
@@ -238,9 +258,14 @@ async def add_evidence(card_id: str, body: EvidenceBody):
 # ---- checklists ------------------------------------------------------------------
 
 @router.post("/cards/{card_id}/checklists")
-async def add_checklist_item(card_id: str, body: ChecklistCreate):
+async def add_checklist_item(
+    card_id: str,
+    body: ChecklistCreate,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     item = await _call(
-        roadmap.add_checklist_item, card_id, body.kind, body.text, sort_order=body.sort_order
+        roadmap.add_checklist_item, card_id, body.kind, body.text,
+        sort_order=body.sort_order, idempotency_key=idempotency_key,
     )
     if item is None:
         raise HTTPException(404, "roadmap card not found")
@@ -266,8 +291,15 @@ async def delete_checklist_item(item_id: str):
 # ---- dependencies ------------------------------------------------------------------
 
 @router.post("/cards/{card_id}/dependencies")
-async def add_dependency(card_id: str, body: DependencyBody):
-    dep = await _call(roadmap.add_dependency, card_id, body.depends_on_id, relation=body.relation)
+async def add_dependency(
+    card_id: str,
+    body: DependencyBody,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    dep = await _call(
+        roadmap.add_dependency, card_id, body.depends_on_id,
+        relation=body.relation, idempotency_key=idempotency_key,
+    )
     if dep is None:
         raise HTTPException(404, "roadmap card not found")
     return dep
@@ -284,9 +316,13 @@ async def remove_dependency(dep_id: str):
 # ---- decisions ------------------------------------------------------------------
 
 @router.post("/decisions")
-async def open_decision(body: DecisionCreate):
+async def open_decision(
+    body: DecisionCreate,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     return await _call(
-        roadmap.open_decision, body.title, body.question, card_id=body.card_id, options=body.options
+        roadmap.open_decision, body.title, body.question,
+        card_id=body.card_id, options=body.options, idempotency_key=idempotency_key,
     )
 
 
@@ -314,9 +350,14 @@ async def update_decision(decision_id: str, body: DecisionPatch):
 # ---- coding sessions -----------------------------------------------------------
 
 @router.post("/cards/{card_id}/sessions")
-async def create_session(card_id: str, body: SessionCreate):
+async def create_session(
+    card_id: str,
+    body: SessionCreate,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     sess = await _call(
-        roadmap.create_session, card_id, body.actor, body.goal, planned_files=body.planned_files
+        roadmap.create_session, card_id, body.actor, body.goal,
+        planned_files=body.planned_files, idempotency_key=idempotency_key,
     )
     if sess is None:
         raise HTTPException(404, "roadmap card not found")
@@ -345,10 +386,15 @@ async def update_session(session_id: str, body: SessionPatch):
 
 
 @router.post("/sessions/{session_id}/commands")
-async def append_command(session_id: str, body: CommandBody):
+async def append_command(
+    session_id: str,
+    body: CommandBody,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
     cmd = await _call(
         roadmap.append_command, session_id, body.command_label, body.command_text,
-        exit_code=body.exit_code, output_excerpt=body.output_excerpt, as_evidence=body.as_evidence,
+        exit_code=body.exit_code, output_excerpt=body.output_excerpt,
+        as_evidence=body.as_evidence, idempotency_key=idempotency_key,
     )
     if cmd is None:
         raise HTTPException(404, "roadmap session not found")

@@ -2397,6 +2397,43 @@ var backlog_default = {
       ]
     },
     {
+      id: "M7-011",
+      title: "Safe roadmap reconciliation and operator acceptance",
+      type: "feature",
+      phase: "M7 Roadmap Control Plane",
+      status: "review",
+      priority: "P1",
+      risk: "high",
+      summary: "Plan and apply backlog reconciliation without bypassing lifecycle gates, extend release projections through M10, and record durable operator acceptance evidence while the service is offline.",
+      design_links: [
+        "roadmap/02-data-model.md",
+        "roadmap/05-global-coding-process.md"
+      ],
+      expected_files: [
+        "app/institute/roadmap.py",
+        "app/api/roadmap.py",
+        "obsidian-plugin/src/roadmap.ts",
+        "tests/test_roadmap.py",
+        "roadmap/operator-acceptance-2026-07-21.md"
+      ],
+      dependencies: [
+        "M7-001",
+        "M7-006",
+        "M7-008"
+      ],
+      acceptance: [
+        "operator can preview a seed reconciliation with zero database writes or events",
+        "new seed cards can be staged in inbox so done and review gates are not bypassed",
+        "self-referential or cyclic seed dependencies are rejected before any write",
+        "release projections cover M8, M9, and M10 in backend and offline plugin views",
+        "live rows and the repo backlog are reconciled with checklist and pass evidence for every accepted card"
+      ],
+      verification: [
+        ".venv/bin/python -m pytest tests/test_roadmap.py -q",
+        "cd obsidian-plugin && npm run build"
+      ]
+    },
+    {
       id: "M8-001",
       title: "Compare CHECK/REFERENCES in ADD COLUMN crash-recovery guard",
       type: "feature",
@@ -4384,7 +4421,10 @@ function hasOpenDeps(card, byId) {
 var RELEASE_GATES = [
   { name: "Release A", description: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
   { name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
-  { name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] }
+  { name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] },
+  { name: "Release D", description: "Post-Audit Hardening", prefixes: ["M8"] },
+  { name: "Release E", description: "North Star Systems", prefixes: ["M9"] },
+  { name: "Release F", description: "Bounded Autonomy", prefixes: ["M10"] }
 ];
 function localReleaseGates(cards) {
   return RELEASE_GATES.map((gate) => {

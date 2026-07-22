@@ -28,26 +28,32 @@ The card is not just a ticket. It is the control record for the coding process. 
 
 ## Execution Map
 
-Seed backlog: 16 cards across phases M0–M7 (8 done · 2 in review · 6 inbox as of 2026-07-03). Card statuses live in [backlog.json](backlog.json); with the roadmap API (M7-001) done and the plugin wired to it (M7-003, in review), Kanban drag-moves persist server-side when the backend is up, falling back to bundled-seed + local overrides offline.
+The seed now spans M0–M10. SQLite rows are the authoritative operator state;
+[backlog.json](backlog.json) is the reviewed seed/export artifact, so this page
+does not duplicate a card count that can drift. Use `GET /api/roadmap/cards` and
+`GET /api/roadmap/process` for the durable status, and preview repo-to-database
+changes with `POST /api/roadmap/import` plus `{"dry_run": true}` before applying
+them. The plugin persists moves through the API when available and uses the
+bundled seed only as an offline fallback.
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ Research hand policy<br/>codex+agy round-robin · 2/2 done"]
-    M1["M1 ◔ Thesis registry<br/>3/4 done — bundle import in review"]
-    M2["M2 ☑ Securities & stock map<br/>.SH/.SZ/.BJ security master"]
-    M3["M3 ☐ Thesis-aware research queue"]
-    M4["M4 ☐ Market data & PIT store"]
-    M5["M5 ☐ Forecast ledger"]
-    M6["M6 ☐ Alpha & paper book<br/>cards TBD"]
-    M7["M7 ◔ Roadmap control plane<br/>API + Kanban ✅ · sessions in review"]
+    M0["M0 Research hand policy"]
+    M1["M1 Thesis registry"]
+    M2["M2 Securities & stock map"]
+    M3["M3 Thesis-aware research"]
+    M4["M4 Market data"]
+    M5["M5 Forecast ledger"]
+    M7["M7 Roadmap control plane"]
+    M8["M8 Post-audit hardening"]
+    M9["M9 North Star systems"]
+    M10["M10 Bounded autonomy"]
     M0 --> M1 --> M2
-    M2 -. "unlocks bundle import (M1-003)" .-> M1
     M1 & M2 --> M3
-    M2 --> M4 --> M5 --> M6
+    M2 --> M4 --> M5
     M1 --> M5
+    M7 --> M8 --> M9 --> M10
 ```
-
-Note: the Kanban board UI (card M7-003) shipped in `obsidian-plugin/src/roadmap.ts` ahead of its seed status — the seed still lists it as inbox because status flips wait on the M7-001 import.
 
 ## Reading Order
 
@@ -90,4 +96,7 @@ The first implementation should support:
 - manual status changes;
 - JSON export.
 
-Later versions can add automatic test status, git diff summaries, AI-generated task decomposition, and release dashboards.
+The current implementation also includes durable evidence, coding sessions,
+decisions, deterministic prompts, process/release projections, and safe seed
+reconciliation. Future additions should enter through a roadmap card instead
+of being described here as if already accepted.

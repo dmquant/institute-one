@@ -134,7 +134,7 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # 停止
 tail -f ~/.institute-one/logs/server.log   # 日志
-.venv/bin/python -m pytest tests -q        # 39 个测试，跑在 echo 手上
+.venv/bin/python -m pytest tests -q        # 全量测试，外部模型手在测试中禁用
 ```
 
 - **暂停一切新开工**：把 `admin_state` 的 `maintenance` 设为 `{"paused": true}` —— 开板/扫队任务跳过，进行中的自然收尾。
@@ -148,24 +148,27 @@ tail -f ~/.institute-one/logs/server.log   # 日志
 
 v0.1 只是 [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md) 完整单机研究所设计的 MVP 切片（约 25%）。其余部分已经全部规划、落地核实，并且**专门写成可由你 + AI 编程 agent 自行实现的形态**：**[`ROADMAP.md`](./ROADMAP.md)** 把每个剩余特性拆成自包含的里程碑——标注它实现提案的哪一节、从哪个前身项目移植、要动哪些文件，关键项还附带可直接粘贴给 Claude Code / Codex / Gemini 的提示词。选一个未勾选项，让 agent 开工，审查 diff，保持 `pytest -q` 全绿，打勾。
 
-此外，[`roadmap/`](./roadmap/) 里还有一个执行层的**路线图控制平面**：设计文档加一块机器可读的卡片看板（`backlog.json`，阶段 M0–M7），所有非平凡改动都按 设计 → 卡片 → 编码会话 → diff → 验证 → 评审 → 发布门禁 → 完成 的流程推进。Obsidian 插件会把它渲染成路线图看板视图（命令 *Institute: 打开路线图*），并可将看板导出为 Markdown 笔记。`ROADMAP.md` 仍是长线特性地图；`roadmap/` 负责单张卡片的落地执行。
+此外，[`roadmap/`](./roadmap/) 里还有一个执行层的**路线图控制平面**：设计文档加一块机器可读的卡片看板（`backlog.json`，阶段 M0–M10），所有非平凡改动都按 设计 → 卡片 → 编码会话 → diff → 验证 → 评审 → 发布门禁 → 完成 的流程推进。SQLite 行是 operator 真相，仓库 JSON 是经过评审的 seed/export artifact；`POST /api/roadmap/import` 可在应用前预览 reconciliation。Obsidian 插件会渲染同一块看板（命令 *Institute: 打开路线图*），并可导出 Markdown。`ROADMAP.md` 仍是长线特性地图；`roadmap/` 负责单张卡片的落地执行。
 
-当前执行进度（状态取自 `backlog.json`，2026-07-03——16 张种子卡片中 8 张完成 · 2 张评审中 · 6 张待定）：
+当前执行阶段（实时数量以 `GET /api/roadmap/process` 为准，不在 README 里复制易漂移的快照）：
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ 研究手策略<br/>codex+agy 轮转"]
-    M1["M1 ◔ 论点注册表<br/>3/4 完成 · 数据导入评审中"]
-    M2["M2 ☑ 证券主档与股票映射<br/>.SH/.SZ/.BJ 主档"]
-    M3["M3 ☐ 论点感知研究队列"]
-    M4["M4 ☐ 行情数据与 PIT 存储"]
-    M5["M5 ☐ 预测台账"]
-    M6["M6 ☐ Alpha 与纸面账本"]
-    M7["M7 ◔ 控制平面<br/>API + 看板 ✅ · 会话追踪评审中"]
+    M0["M0 研究手策略"]
+    M1["M1 论点注册表"]
+    M2["M2 证券主档"]
+    M3["M3 论点感知研究"]
+    M4["M4 行情数据"]
+    M5["M5 预测台账"]
+    M7["M7 控制平面"]
+    M8["M8 审计后加固"]
+    M9["M9 北极星系统"]
+    M10["M10 有界自治"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
-    M2 --> M4 --> M5 --> M6
+    M2 --> M4 --> M5
     M1 --> M5
+    M7 --> M8 --> M9 --> M10
 ```
 
 通往完整提案的长线依赖图：

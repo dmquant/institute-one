@@ -152,24 +152,27 @@ tail -f ~/.institute-one/logs/server.log   # logs
 
 v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md). The rest is mapped, grounded, and **written to be built by you with an AI coding agent**: **[`ROADMAP.md`](./ROADMAP.md)** breaks every remaining feature into self-contained milestones — each grounded in the proposal section it implements, the legacy source it ports from, and the files to touch; keystone items carry a ready-to-paste prompt for Claude Code / Codex / Gemini. Pick a box, prompt your agent, review the diff, keep `pytest -q` green, tick it off.
 
-There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M7), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. The Obsidian plugin renders it as a roadmap Kanban view (command *Institute: 打开路线图*) and can export the board as a Markdown note. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
+There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M10), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. SQLite rows are the operator truth; the repo JSON is a reviewed seed/export artifact, and `POST /api/roadmap/import` can preview reconciliation before applying it. The Obsidian plugin renders the same board (command *Institute: 打开路线图*) and can export it as Markdown. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
 
-The execution track so far (statuses from `backlog.json`, 2026-07-03 — 8 done · 2 in review · 6 inbox of 16 seed cards):
+Current execution families (live counts come from `GET /api/roadmap/process`, not this README):
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ Research hands<br/>codex+agy round-robin"]
-    M1["M1 ◔ Thesis registry<br/>3/4 done · bundle import in review"]
-    M2["M2 ☑ Securities & stock map<br/>.SH/.SZ/.BJ master"]
-    M3["M3 ☐ Thesis-aware research"]
-    M4["M4 ☐ Market data & PIT store"]
-    M5["M5 ☐ Forecast ledger"]
-    M6["M6 ☐ Alpha & paper book"]
-    M7["M7 ◔ Control plane<br/>API + Kanban ✅ · sessions in review"]
+    M0["M0 Research hands"]
+    M1["M1 Thesis registry"]
+    M2["M2 Securities map"]
+    M3["M3 Thesis-aware research"]
+    M4["M4 Market data"]
+    M5["M5 Forecast ledger"]
+    M7["M7 Control plane"]
+    M8["M8 Post-audit hardening"]
+    M9["M9 North Star systems"]
+    M10["M10 Bounded autonomy"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
-    M2 --> M4 --> M5 --> M6
+    M2 --> M4 --> M5
     M1 --> M5
+    M7 --> M8 --> M9 --> M10
 ```
 
 And the long-horizon dependency map to the full proposal:
