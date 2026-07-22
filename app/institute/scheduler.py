@@ -27,6 +27,9 @@ from .prompts import now_sgt, work_date
 log = logging.getLogger("institute.scheduler")
 
 _scheduler: AsyncIOScheduler | None = None
+# Publicly tracked scheduler executions. The metered wrapper owns this set, so
+# shutdown never needs to inspect APScheduler's private executor/future fields.
+_inflight_job_tasks: set[asyncio.Task[Any]] = set()
 
 RATE_LIMIT_REVIVAL_LIMIT = 3
 # Candidate-scan bound (P11g): never pull the whole rate_limited backlog into
@@ -132,6 +135,9 @@ def metered(name: str, *, gated: bool = False) -> Callable[[Callable[..., Awaita
     def deco(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[None]]:
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> None:
+            task = asyncio.current_task()
+            if task is not None:
+                _inflight_job_tasks.add(task)
             fired_at = bus.now_iso()
             try:
                 if gated and await get_maintenance():
@@ -159,6 +165,9 @@ def metered(name: str, *, gated: bool = False) -> Callable[[Callable[..., Awaita
                 await _record_metric(name, fired_at, duration_ms=int(dt * 1000), ok=True)
             except Exception:  # noqa: BLE001 - scheduler jobs must never raise
                 log.exception("job %s failed", name)
+            finally:
+                if task is not None:
+                    _inflight_job_tasks.discard(task)
         wrapper.job_name = name  # type: ignore[attr-defined] - introspection for tests/ops
         wrapper.gated = gated  # type: ignore[attr-defined]
         return wrapper
@@ -716,7 +725,7 @@ def start() -> None:
     cron(_daily_job, "daily-report", settings.daily_time)
     cron(_analyst_dailies_job, "analyst-dailies", settings.analyst_daily_time)
     cron(_memory_compact_job, "memory-compact", settings.memory_compact_time)
-    cron(_scorecard_job, "hand-scorecard", "00:05")
+    cron(_scorecard_job, "hand-scorecard", settings.scorecard_time)
     cron(_operator_selfimprove_job, "operator-selfimprove", "00:15")  # after scorecard, before market open
     cron(_committee_job, "committee", settings.committee_time, day_of_week="fri")
     cron(_paper_mtm_job, "paper-mtm", "00:00")   # 00:00 SGT，ROADMAP 原文
@@ -775,26 +784,12 @@ def job_registry() -> list[dict[str, Any]]:
 
 
 def inflight_jobs() -> set[asyncio.Task]:
-    """Snapshot in-flight job tasks. Call BEFORE shutdown() (it clears them).
+    """Snapshot live metered job tasks without APScheduler internals.
 
-    ``shutdown(wait=False)`` cancels the AsyncIOExecutor's pending futures but
-    never awaits them AND clears the set — callers (main's shutdown drain) need
-    this snapshot to await their cancellation before db.close(). This is the
-    ONE place that touches APScheduler private internals (``_executors`` /
-    ``_pending_futures``); if they drift on an upgrade, degrade to an empty
-    set — jobs are still cancelled by shutdown, just not awaited.
+    Call before ``shutdown()`` so the lifespan drain can await cancellation
+    before closing SQLite. A copy keeps callers from mutating the registry.
     """
-    tasks: set[asyncio.Task] = set()
-    if _scheduler is None:
-        return tasks
-    try:
-        for ex in _scheduler._executors.values():
-            for f in getattr(ex, "_pending_futures", ()):
-                if isinstance(f, asyncio.Task) and not f.done():
-                    tasks.add(f)
-    except Exception:  # noqa: BLE001 - internals drift must not break shutdown
-        log.exception("could not snapshot in-flight scheduler jobs")
-    return tasks
+    return {task for task in _inflight_job_tasks if not task.done()}
 
 
 def shutdown() -> None:

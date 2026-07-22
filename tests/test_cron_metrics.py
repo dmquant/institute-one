@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from httpx import ASGITransport, AsyncClient
 
 from app import db
+from app.config import get_settings
 from app.institute import scheduler
 
 # The complete gate decision table — MUST stay in sync with
@@ -161,9 +162,10 @@ async def test_job_registry_definition_surface_without_scheduler():
         assert r["trigger"] is None and r["next_run_time"] is None
 
 
-async def test_job_registry_live_scheduler_marks_all_jobs_registered():
+async def test_job_registry_live_scheduler_marks_all_jobs_registered(monkeypatch):
     """S4-P0-03 proof: with the scheduler actually started, all 24 jobs are
     registered with a real trigger and a computed next run time."""
+    monkeypatch.setattr(get_settings(), "scorecard_time", "03:17")
     scheduler.start()
     try:
         reg = scheduler.job_registry()
@@ -172,6 +174,8 @@ async def test_job_registry_live_scheduler_marks_all_jobs_registered():
             assert r["registered"] is True
             assert r["trigger"]  # e.g. "cron[hour='8', minute='30']" / "interval[0:01:00]"
             assert r["next_run_time"]  # ISO timestamp
+        scorecard = next(r for r in reg if r["name"] == "hand-scorecard")
+        assert "hour='3'" in scorecard["trigger"] and "minute='17'" in scorecard["trigger"]
     finally:
         scheduler.shutdown()
 

@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     briefing_time: str = "08:30"        # 晨会简报
     daily_time: str = "23:00"           # 每日日报
     analyst_daily_time: str = "19:00"   # 分析师观察日报（跟进项喂白板与信箱）
+    scorecard_time: str = "00:05"       # previous-day hand quality settlement
     memory_compact_time: str = "23:30"  # 常备记忆压缩（analyst memory nightly compact）
     committee_time: str = "20:00"       # 每周委员会（仅周五触发；"" 禁用）
     whiteboard_kickoff_minutes: int = 60   # try to open a new board every N minutes

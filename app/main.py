@@ -29,10 +29,9 @@ SHUTDOWN_DRAIN_TIMEOUT_S = 15.0
 def _scheduler_inflight() -> set[asyncio.Task]:
     """Snapshot APScheduler's in-flight job tasks (must run BEFORE shutdown).
 
-    Delegates to ``scheduler.inflight_jobs()`` — the one place that touches
-    APScheduler private internals — so the drain can await job cancellation
-    before ``db.close()``. The outer try/except keeps shutdown alive even if
-    the accessor itself breaks (import-time drift, unexpected errors).
+    Delegates to the scheduler's public metered-task registry so the drain can
+    await job cancellation before ``db.close()``. The outer try/except keeps
+    shutdown alive even if the accessor itself breaks unexpectedly.
     """
     from .institute import scheduler as sched
 

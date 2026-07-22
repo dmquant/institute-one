@@ -182,22 +182,18 @@ async def test_drain_second_sweep_catches_work_spawned_during_cancel():
 
 
 async def test_scheduler_inflight_snapshot_and_drain(monkeypatch):
-    """The pre-shutdown snapshot picks in-flight scheduler job tasks out of
-    APScheduler's executor internals; the drain then awaits their cancel."""
+    """The public metered-task registry feeds the shutdown drain."""
     assert _scheduler_inflight() == set()  # no scheduler in tests
 
+    started = asyncio.Event()
+
+    @scheduler_mod.metered("fake-scheduler-job")
     async def _hang():
+        started.set()
         await asyncio.sleep(3600)
 
     job = asyncio.create_task(_hang(), name="fake-scheduler-job")
-
-    class FakeExecutor:
-        _pending_futures = {job}
-
-    class FakeScheduler:
-        _executors = {"default": FakeExecutor()}
-
-    monkeypatch.setattr(scheduler_mod, "_scheduler", FakeScheduler())
+    await started.wait()
     snap = _scheduler_inflight()
     assert snap == {job}
 
@@ -206,35 +202,23 @@ async def test_scheduler_inflight_snapshot_and_drain(monkeypatch):
 
 
 async def test_inflight_jobs_public_accessor(monkeypatch):
-    """scheduler.inflight_jobs(): filters done tasks, degrades to an empty set
-    on APScheduler internals drift instead of breaking shutdown."""
+    """scheduler.inflight_jobs() tracks wrappers and returns a safe copy."""
     assert scheduler_mod.inflight_jobs() == set()  # no scheduler running
 
+    started = asyncio.Event()
+
+    @scheduler_mod.metered("live-job")
     async def _hang():
+        started.set()
         await asyncio.sleep(3600)
 
     live = asyncio.create_task(_hang(), name="live-job")
-    done = asyncio.create_task(asyncio.sleep(0), name="done-job")
-    await done
-
-    class FakeExecutor:
-        _pending_futures = {live, done, "not-a-task"}
-
-    class FakeScheduler:
-        _executors = {"default": FakeExecutor()}
-
-    monkeypatch.setattr(scheduler_mod, "_scheduler", FakeScheduler())
-    assert scheduler_mod.inflight_jobs() == {live}  # done + non-task filtered
-
-    # internals drift (e.g. a 4.x rename): degrade to empty, never raise
-    class DriftedScheduler:
-        @property
-        def _executors(self):
-            raise AttributeError("gone in this APScheduler version")
-
-    monkeypatch.setattr(scheduler_mod, "_scheduler", DriftedScheduler())
-    assert scheduler_mod.inflight_jobs() == set()
-    assert _scheduler_inflight() == set()  # main-side wrapper stays quiet too
+    await started.wait()
+    snapshot = scheduler_mod.inflight_jobs()
+    assert snapshot == {live}
+    snapshot.clear()
+    assert scheduler_mod.inflight_jobs() == {live}
 
     live.cancel()
     await asyncio.gather(live, return_exceptions=True)
+    assert scheduler_mod.inflight_jobs() == set()
