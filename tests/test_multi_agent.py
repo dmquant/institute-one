@@ -75,6 +75,22 @@ async def test_fan_out_one_task_per_agent_in_order():
     assert {r["id"] for r in rows} == {t.id for t in tasks}
 
 
+async def test_majority_fan_out_injects_protocol_but_echo_does_not_cast_itself():
+    tasks = await multi_agent.fan_out(
+        ["macro-analyst", "equity-analyst"], "请选择看多或看空", mode="majority_vote",
+        timeout_s=60,
+    )
+    assert all(multi_agent.MAJORITY_BALLOT_PROTOCOL_MARKER in t.prompt for t in tasks)
+    # Echo mirrors the production prompt. The inline protocol example must not
+    # be mistaken for a model ballot, and free text must fail closed.
+    result = multi_agent.join(tasks, "majority_vote")
+    assert result["ok"] is False and result["votes"] == 0
+    assert result["valid_ballots"] == 0 and result["invalid_ballots"] == 2
+    assert {o["ballot_error"] for o in result["outputs"]} == {
+        "missing_structured_verdict"
+    }
+
+
 async def test_spawn_wait_split_timeout_never_cancels(monkeypatch):
     """REVIEW-C5 M1 semantics: spawn returns while execution is in flight;
     a wait timeout raises but the tasks keep running and land terminal."""
@@ -124,21 +140,24 @@ def test_join_first_success_mode():
 
 def test_join_majority_vote_mode():
     win = multi_agent.join(
-        [_task("a", output="看多"), _task("b", output="看多 "), _task("c", output="看空")],
+        [_task("a", output="依据 A。\nVERDICT: 看多"),
+         _task("b", output="依据 B。\nVERDICT: 看多 "),
+         _task("c", output="依据 C。\nVERDICT: 看空")],
         "majority_vote",
     )
     assert win["ok"] is True and win["output"] == "看多" and win["votes"] == 2
 
-    # exact-match only: prose that differs by one char never converges
+    # exact-match only: structured labels that differ by one char do not converge
     split = multi_agent.join(
-        [_task("a", output="看多，因为流动性"), _task("b", output="看多，因为盈利"), _task("c", output="看多")],
+        [_task("a", output="VERDICT: 看多"), _task("b", output="VERDICT: 看多。"),
+         _task("c", output="VERDICT: 偏多")],
         "majority_vote",
     )
     assert split["ok"] is False and split["output"] is None and split["votes"] == 1
 
     # failures count against the quorum: 2 identical of 4 is not a majority
     quorum = multi_agent.join(
-        [_task("a", output="X"), _task("b", output="X"),
+        [_task("a", output="VERDICT: X"), _task("b", output="VERDICT: X"),
          _task("c", status="failed"), _task("d", status="failed")],
         "majority_vote",
     )
@@ -271,13 +290,16 @@ async def test_api_202_when_wait_budget_elapses_tasks_keep_running(monkeypatch):
 # ---- structured ballots (M8-012) --------------------------------------------------
 
 
-def test_extract_ballot_verdict_line_and_fallback():
+def test_extract_ballot_requires_valid_verdict_line():
     assert multi_agent.extract_ballot("论证很长……\nVERDICT: 看多\n") == "看多"
     # the LAST verdict line wins; case-insensitive; full-width colon accepted
     assert multi_agent.extract_ballot("verdict: 初判\n中间推理\nVERDICT：看空") == "看空"
-    # no verdict line -> the whole stripped text (pre-M8-012 behaviour)
-    assert multi_agent.extract_ballot("  没有裁决行  ") == "没有裁决行"
-    assert multi_agent.extract_ballot("") == ""
+    assert multi_agent.extract_ballot("  没有裁决行  ") is None
+    assert multi_agent.extract_ballot("") is None
+    assert multi_agent.extract_ballot("VERDICT:   \n") is None
+    assert multi_agent.extract_ballot(
+        "VERDICT: " + "X" * (multi_agent.MAJORITY_BALLOT_MAX_CHARS + 1)
+    ) is None
 
 
 def test_join_majority_vote_structured_ballots():
@@ -300,7 +322,25 @@ def test_join_majority_vote_failed_task_ballot_is_null():
         "majority_vote",
     )
     assert r["outputs"][0]["ballot"] == "X" and r["outputs"][1]["ballot"] is None
+    assert r["outputs"][1]["ballot_status"] == "not_counted"
+    assert r["outputs"][1]["ballot_error"] == "task_not_completed"
     assert r["ok"] is False and r["ballots"] == [{"ballot": "X", "votes": 1}]
+
+
+def test_join_majority_vote_free_text_is_invalid_and_not_counted():
+    """Identical essays cannot manufacture a majority without VERDICT lines."""
+    r = multi_agent.join(
+        [_task("a", output="看多，因为流动性改善"),
+         _task("b", output="看多，因为流动性改善"),
+         _task("c", output="反方论证\nVERDICT: 看空")],
+        "majority_vote",
+    )
+    assert r["ok"] is False and r["output"] is None and r["votes"] == 1
+    assert r["valid_ballots"] == 1 and r["invalid_ballots"] == 2
+    assert r["ballots"] == [{"ballot": "看空", "votes": 1}]
+    assert [o["ballot"] for o in r["outputs"]] == [None, None, "看空"]
+    assert [o["ballot_status"] for o in r["outputs"]] == ["invalid", "invalid", "valid"]
+    assert r["outputs"][0]["ballot_error"] == "missing_structured_verdict"
 
 
 # ---- durable groups (M8-012) --------------------------------------------------------
@@ -545,6 +585,33 @@ async def test_api_run_persists_record_and_reconnect_read():
 
         assert (await client.get("/api/multi-agent/runs/nope")).status_code == 404
         assert (await client.get("/api/multi-agent/runs", params={"status": "bogus"})).status_code == 400
+
+
+async def test_api_majority_missing_verdict_is_explainable_invalid_ballot():
+    """The production API prompt has the contract, while a non-compliant hand
+    degrades to zero valid votes instead of electing duplicated free text."""
+    async with AsyncClient(transport=ASGITransport(app=_make_app()), base_url="http://test") as client:
+        response = await client.post("/api/multi-agent/run", json={
+            "agents": ["macro-analyst", "equity-analyst"],
+            "prompt": "请选择看多或看空", "mode": "majority_vote",
+        })
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is False and body["votes"] == 0
+        assert body["valid_ballots"] == 0 and body["invalid_ballots"] == 2
+        assert all(o["ballot"] is None and o["ballot_status"] == "invalid" for o in body["outputs"])
+        assert all(o["ballot_error"] == "missing_structured_verdict" for o in body["outputs"])
+
+        task = await executor.get_task(body["outputs"][0]["task_id"])
+        assert task is not None
+        assert multi_agent.MAJORITY_BALLOT_PROTOCOL_MARKER in task.prompt
+
+        reconnect = (await client.get(f"/api/multi-agent/runs/{body['run_id']}")).json()
+        assert reconnect["prompt"] == "请选择看多或看空"  # caller input snapshot stays clean
+        verdict = reconnect["verdict"]
+        assert verdict["ok"] is False
+        assert verdict["valid_ballots"] == 0 and verdict["invalid_ballots"] == 2
+        assert verdict["outputs"][0]["ballot_error"] == "missing_structured_verdict"
 
 
 async def test_api_202_reconnect_settles_on_read(monkeypatch):

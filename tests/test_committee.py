@@ -53,6 +53,26 @@ def test_committee_json_declares_week_disputes():
         assert step["output_file"] and step["timeout_s"]
 
 
+def test_committee_verdict_prompt_requires_stable_structured_verdict():
+    data = json.loads(COMMITTEE_JSON.read_text(encoding="utf-8"))
+    debate_steps = [
+        step for step in data["steps"] if step["id"] in {"02-round1", "03-round2", "04-round3"}
+    ]
+    assert len(debate_steps) == 3
+    for step in debate_steps:
+        assert multi_agent.MAJORITY_BALLOT_PROTOCOL_MARKER in step["prompt"]
+        assert "VERDICT: <正方|反方>" in step["prompt"]
+        assert "最后一行必须且只能" in step["prompt"]
+
+    verdict = next(step for step in data["steps"] if step["id"] == "05-verdict")
+    prompt = verdict["prompt"]
+    assert multi_agent.MAJORITY_BALLOT_PROTOCOL_MARKER in prompt
+    assert "VERDICT: <正方|反方|未达成裁决>" in prompt
+    assert "最后一行必须且只能" in prompt
+    assert "不得从自由文本推断或代为补票" in prompt
+    assert all(label in prompt for label in ("正方", "反方", "未达成裁决"))
+
+
 async def test_committee_reconciles_from_disk():
     n = await workflows.reconcile_from_disk()
     assert n >= 1

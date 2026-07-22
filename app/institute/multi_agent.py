@@ -38,6 +38,32 @@ log = logging.getLogger("institute.multi_agent")
 JOIN_MODES = ("all", "first_success", "majority_vote", "best_effort")
 MAX_AGENTS = 5
 
+# Majority votes fail closed unless an agent emits the protocol line. Keep the
+# example inline (not at the beginning of a line): the built-in echo hand
+# mirrors prompts verbatim and must not cast the instruction itself as a vote.
+MAJORITY_BALLOT_PROTOCOL_MARKER = "[STRUCTURED_MAJORITY_BALLOT_V1]"
+MAJORITY_BALLOT_MAX_CHARS = 200
+MAJORITY_BALLOT_INSTRUCTION = f"""\
+{MAJORITY_BALLOT_PROTOCOL_MARKER}
+【结构化多数票协议】先完成分析，再在最终答复的最后一行按 `VERDICT: <投票标签>` 投票。
+- 必须恰好给出一条 VERDICT 行；不要把解释、置信度或标点附在投票标签后。
+- 优先逐字复用题目给出的候选项或立场名称，不得自行改写同义词；题目未给候选项时，标签应是简短、稳定、单行的明确结论。
+- 缺失、空白或超过 {MAJORITY_BALLOT_MAX_CHARS} 个字符的 VERDICT 将被判为无效票且不计入多数。\
+"""
+
+
+def with_majority_ballot_protocol(prompt: str) -> str:
+    """Append the versioned majority-ballot contract exactly once.
+
+    The caller's input snapshot remains unchanged in ``multi_agent_runs``;
+    executor task rows retain this exact production prompt for audit.
+    """
+    # Do not trust a caller-supplied marker by itself: only a complete suffix
+    # proves the contract is already present.
+    if prompt.rstrip().endswith(MAJORITY_BALLOT_INSTRUCTION):
+        return prompt
+    return f"{prompt.rstrip()}\n\n{MAJORITY_BALLOT_INSTRUCTION}"
+
 
 def _roster(agents: Sequence[str]) -> list[Analyst]:
     """Resolve agent ids against the roster; ValueError BEFORE anything spawns."""
@@ -62,6 +88,7 @@ async def spawn_fan_out(
     *,
     hand: str | None = None,
     timeout_s: int = 1800,
+    mode: str = "all",
 ) -> list[str]:
     """Spawn one executor task per agent; return the task ids immediately.
 
@@ -78,12 +105,15 @@ async def spawn_fan_out(
     Hand/model failures never propagate: the executor folds them into the
     task row (status failed/expired/rate_limited).
     """
+    if mode not in JOIN_MODES:
+        raise ValueError(f"unknown join mode {mode!r} (expected one of: {', '.join(JOIN_MODES)})")
     roster = _roster(agents)
     settings = get_settings()
     return [
         await executor.spawn(
             hand or analyst.hand or settings.default_hand,
-            build_analyst_prompt(analyst, prompt),
+            with_majority_ballot_protocol(build_analyst_prompt(analyst, prompt))
+            if mode == "majority_vote" else build_analyst_prompt(analyst, prompt),
             source="multi_agent",
             model=analyst.model,
             timeout_s=timeout_s,
@@ -134,6 +164,7 @@ async def fan_out(
     *,
     hand: str | None = None,
     timeout_s: int = 1800,
+    mode: str = "all",
 ) -> list[executor.Task]:
     """Run one prompt across several analysts in parallel; wait for them all.
 
@@ -144,23 +175,59 @@ async def fan_out(
     distinct hands genuinely overlap. Returns finished Task rows in agents
     order.
     """
-    return await wait_fan_out(await spawn_fan_out(agents, prompt, hand=hand, timeout_s=timeout_s))
+    return await wait_fan_out(await spawn_fan_out(
+        agents, prompt, hand=hand, timeout_s=timeout_s, mode=mode,
+    ))
 
 
 # A structured ballot line: the model states its vote as `VERDICT: <token>`
 # (half- or full-width colon); the LAST such line wins (the final answer).
-_BALLOT_LINE = re.compile(r"^\s*VERDICT\s*[:：]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# Horizontal whitespace is deliberate: ``\s`` would cross line boundaries.
+_BALLOT_LINE = re.compile(
+    r"^[ \t]*VERDICT[ \t]*[:：][ \t]*(.*?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
-def extract_ballot(text: str) -> str:
-    """The structured ballot of one output: the last ``VERDICT: <token>`` line,
-    falling back to the whole stripped text when no such line exists (the
-    pre-M8-012 exact-match behaviour). Comparison stays EXACT (post-strip):
-    normalization beyond whitespace would guess at vote equivalence."""
+def _parse_ballot(text: str) -> tuple[str | None, str | None]:
+    """Return ``(ballot, error_code)`` under the fail-closed protocol."""
     matches = _BALLOT_LINE.findall(text or "")
-    if matches:
-        return matches[-1].strip()
-    return (text or "").strip()
+    if not matches:
+        return None, "missing_structured_verdict"
+    ballot = matches[-1].strip()
+    if not ballot:
+        return None, "empty_structured_verdict"
+    if len(ballot) > MAJORITY_BALLOT_MAX_CHARS:
+        return None, "structured_verdict_too_long"
+    return ballot, None
+
+
+def extract_ballot(text: str) -> str | None:
+    """Return the last valid ``VERDICT: <token>`` ballot, else ``None``.
+
+    Missing structure deliberately does *not* fall back to the whole response:
+    two duplicated essays must never manufacture a majority. Comparison stays
+    exact after edge-whitespace trimming; normalizing synonyms would guess at
+    vote equivalence.
+    """
+    return _parse_ballot(text)[0]
+
+
+def _annotate_ballot(projection: dict[str, Any], task: executor.Task) -> str | None:
+    """Attach an explainable ballot state and return a countable ballot."""
+    projection["ballot"] = None
+    if task.status != "completed":
+        projection["ballot_status"] = "not_counted"
+        projection["ballot_error"] = "task_not_completed"
+        return None
+    ballot, error = _parse_ballot(task.output or "")
+    projection["ballot"] = ballot
+    if error is not None:
+        projection["ballot_status"] = "invalid"
+        projection["ballot_error"] = error
+        return None
+    projection["ballot_status"] = "valid"
+    return ballot
 
 
 def join(tasks: Sequence[executor.Task], mode: str) -> dict[str, Any]:
@@ -172,15 +239,14 @@ def join(tasks: Sequence[executor.Task], mode: str) -> dict[str, Any]:
     - ``first_success``: output = the first completed task in fan-out order
       (fan_out already awaited everything, so "first" means submission order,
       not wall-clock finish order).
-    - ``majority_vote``: ballots are STRUCTURED (M8-012): each completed
-      output votes with its last ``VERDICT: <token>`` line when present,
-      else with its whole stripped text; only EXACT string equality counts
-      as the same vote. ok iff one ballot takes a strict majority (> half)
-      of ALL tasks — failures count against the quorum. Prompts that mandate
-      a closing VERDICT line get convergent votes despite free-form prose;
-      without the line, essays still virtually never match byte-for-byte —
-      ties and split votes yield ok=False. The result carries the full
-      ``ballots`` tally and each completed output's ``ballot``.
+    - ``majority_vote``: ballots are STRUCTURED (M8-012): only a completed
+      output's last valid ``VERDICT: <token>`` line is countable, and only
+      EXACT string equality counts as the same vote. Missing/malformed lines
+      fail closed as explicit invalid ballots; free-form output is never a
+      vote. ok iff one ballot takes a strict majority (> half) of ALL tasks —
+      failures and invalid ballots count against the quorum. The result keeps
+      the valid ``ballots`` tally, valid/invalid counts, and each output's
+      ballot status/error for an explainable degradation.
     - ``best_effort``: never fails the join on individual errors; ok iff at
       least one task completed, and everything usable is in ``outputs``.
 
@@ -206,14 +272,17 @@ def join(tasks: Sequence[executor.Task], mode: str) -> dict[str, Any]:
             result["output"] = completed[0].output or ""
     elif mode == "majority_vote":
         tally: dict[str, int] = {}
+        invalid_ballots = 0
         for proj, t in zip(outputs, tasks):
-            if t.status != "completed":
-                proj["ballot"] = None
+            ballot = _annotate_ballot(proj, t)
+            if ballot is None:
+                if t.status == "completed":
+                    invalid_ballots += 1
                 continue
-            ballot = extract_ballot(t.output or "")
-            proj["ballot"] = ballot
             tally[ballot] = tally.get(ballot, 0) + 1
         result["votes"] = 0
+        result["valid_ballots"] = sum(tally.values())
+        result["invalid_ballots"] = invalid_ballots
         # structured tally, strongest first (stable sort keeps first-seen
         # order among equal counts — matching the max() election below)
         result["ballots"] = [
@@ -430,6 +499,10 @@ def verdict_record(agents: Sequence[str], result: dict[str, Any]) -> dict[str, A
             item["error"] = str(proj["error"])[:VERDICT_ERROR_CAP]
         if "ballot" in proj:
             item["ballot"] = proj["ballot"]
+        if "ballot_status" in proj:
+            item["ballot_status"] = proj["ballot_status"]
+        if "ballot_error" in proj:
+            item["ballot_error"] = proj["ballot_error"]
         outputs.append(item)
     record: dict[str, Any] = {
         "kind": "fan_out", "mode": result.get("mode"), "ok": bool(result.get("ok")),
@@ -440,6 +513,8 @@ def verdict_record(agents: Sequence[str], result: dict[str, Any]) -> dict[str, A
     if "votes" in result:
         record["votes"] = result["votes"]
         record["ballots"] = result.get("ballots") or []
+        record["valid_ballots"] = result.get("valid_ballots", 0)
+        record["invalid_ballots"] = result.get("invalid_ballots", 0)
     return record
 
 
@@ -477,9 +552,12 @@ async def start_run(
     task_ids: list[str] = []
     try:
         for analyst in roster:
+            full_prompt = build_analyst_prompt(analyst, prompt)
+            if mode == "majority_vote":
+                full_prompt = with_majority_ballot_protocol(full_prompt)
             task_ids.append(await executor.spawn(
                 hand or analyst.hand or settings.default_hand,
-                build_analyst_prompt(analyst, prompt),
+                full_prompt,
                 source=source,
                 model=analyst.model,
                 timeout_s=timeout_s,
@@ -622,7 +700,12 @@ async def run_outputs(run: dict[str, Any]) -> list[dict[str, Any]]:
             "error": t.error if t else "task row missing",
         }
         if run.get("mode") == "majority_vote":
-            item["ballot"] = extract_ballot(t.output or "") if t and t.status == "completed" else None
+            if t is None:
+                item["ballot"] = None
+                item["ballot_status"] = "not_counted"
+                item["ballot_error"] = "task_not_completed"
+            else:
+                _annotate_ballot(item, t)
         out.append(item)
     return out
 
