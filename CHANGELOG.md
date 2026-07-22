@@ -2,6 +2,24 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-07-22 — Post-audit optimization sweep (worktree close-out, hygiene, calibration)
+
+### Added
+- Roadmap operator acceptance protocol (M7-011): audited seed reconciliation with dry-run preview, idempotent create mutations (migration 0044 `roadmap_idempotency_keys`), the offline `scripts/apply-roadmap-acceptance.py` batch tool with backup/maintenance/empty-queue preconditions, release-gate projections through M10, and SPA controls for operator self-improvement proposals (approve/reject/parameter PUT with 409 recovery).
+- Structured fail-closed majority ballots for multi-agent `majority_vote` and the committee workflow: only an exact final `VERDICT:` line counts, invalid ballots are explicit and count against the quorum.
+- Ruff lint configuration in `pyproject.toml` (correctness-focused select, dev extra) — `ruff check app tests scripts` is clean; a Dashboard SPA smoke test joins the vitest suite (4 files / 19 tests).
+- Chain `REPROJECT_KINDS` now covers the footer-bearing factcheck / paper-book-journal / research_tree / committee notes, closing the historical-backfill gap left by the vault-projection extension.
+
+### Changed
+- Real bge-m3 calibration executed against local Ollama (`INSTITUTE_CALIBRATION_REAL=1`): 50+ known-pair corpus, tier separation and the classifier matrix all passed — the last ◔ item in ROADMAP Phase 1a; formal M8-004 acceptance stays with the operator.
+- Service scripts hardened: settings come from `scripts/runtime-config.py` (same pydantic-settings path as the app), `start.sh` gained bounded log rotation and a health-checked startup, scheduler in-flight jobs are tracked through a public metered registry instead of APScheduler internals, and the scorecard time is configurable (`INSTITUTE_SCORECARD_TIME`).
+- Repository hygiene: 105 historical `PATCH-NOTES-*` / `REVIEW-*` / `ROUND*-AUDIT-*` reports moved to `docs/history/`; `.kiro/`, `.claude/`, `.ruff_cache/` and the per-task `implementation-notes.md` are gitignored.
+
+### Fixed
+- Echo hand refuses `WRITE_FILE` paths that escape the workspace (absolute, `..`, resolved-symlink escapes), with an all-or-nothing preflight.
+- The operator vault-conflict sweep's final fresh recheck now runs off the event loop while holding the writer coordination lock.
+- Board audit: the live SQLite roadmap board and `roadmap/backlog.json` verified drift-free (55 seed cards; live adds two parked M7 cards only).
+
 ## 2026-07-21 — North Star and bounded-autonomy closure (local acceptance batch)
 
 ### Added
