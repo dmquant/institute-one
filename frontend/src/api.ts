@@ -541,6 +541,56 @@ export interface OperatorTriage {
   };
 }
 
+export type OperatorProposalStatus = "proposed" | "approved" | "rejected";
+export type OperatorProposalKind = "promote_recipe" | "retire_recipe" | "set_parameter";
+
+/** operator_proposals row. GET /api/operator/proposals decodes params JSON. */
+export interface OperatorProposal {
+  id: number;
+  kind: OperatorProposalKind;
+  title: string;
+  rationale: string;
+  params: Record<string, unknown>;
+  dedupe_ref: string;
+  observation_id: number | null;
+  recipe_id: number | null;
+  action_id: number | null;
+  status: OperatorProposalStatus;
+  decided_at: string | null;
+  decided_note: string | null;
+  applied: number; // 0 | 1
+  created_at: string;
+}
+
+/** Decision endpoints return the direct DB row, whose params field remains
+ * encoded JSON (unlike the decoded list endpoint). */
+export type OperatorProposalDecision = Omit<OperatorProposal, "params"> & {
+  params: Record<string, unknown> | string;
+  applied_info?: Record<string, unknown>;
+};
+
+/** One whitelisted self-improvement parameter from GET /api/operator/parameters. */
+export interface OperatorParameter {
+  stored: unknown | null;
+  default: unknown;
+  set: boolean;
+}
+
+export type OperatorParameters = Record<string, OperatorParameter>;
+
+/** parameter_history row returned by direct parameter PUT. */
+export interface OperatorParameterChange {
+  id: number;
+  key: string;
+  old_value: string | null;
+  new_value: string | null;
+  changed_by: string;
+  proposal_id: number | null;
+  rollback_of: number | null;
+  rolled_back_at: string | null;
+  created_at: string;
+}
+
 // Multi-agent compare. POST /run returns either a settled verdict (200) or a
 // durable async handoff (202) whose tasks keep running and can be inspected.
 export interface MultiAgentOutput {
@@ -1132,4 +1182,23 @@ export const approveDisposition = (id: number, note = "") =>
   post<{ approved: number; action: OperatorAction }>(
     `/api/operator/dispositions/${id}/approve`,
     { note },
+  );
+export const listOperatorProposals = (
+  filters: { status?: OperatorProposalStatus; limit?: number } = {},
+) => req<{ proposals: OperatorProposal[]; count: number }>(
+  `/api/operator/proposals${qs(filters)}`,
+);
+export const approveOperatorProposal = (id: number, note = "") =>
+  post<OperatorProposalDecision>(
+    `/api/operator/proposals/${id}/approve`,
+    { note },
+  );
+export const rejectOperatorProposal = (id: number, note = "") =>
+  post<OperatorProposalDecision>(`/api/operator/proposals/${id}/reject`, { note });
+export const getOperatorParameters = () =>
+  req<{ parameters: OperatorParameters }>("/api/operator/parameters");
+export const putOperatorParameter = (key: string, value: unknown) =>
+  put<OperatorParameterChange>(
+    `/api/operator/parameters/${encodeURIComponent(key)}`,
+    { value },
   );

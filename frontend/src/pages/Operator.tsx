@@ -1,16 +1,24 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ApiError,
   OperatorAction,
   OperatorActionKind,
   OperatorActionStatus,
+  OperatorParameter,
+  OperatorParameters,
+  OperatorProposal,
   OperatorTriage,
   approveDisposition,
+  approveOperatorProposal,
+  getOperatorParameters,
   getOperatorTriage,
   listOperatorActions,
+  listOperatorProposals,
   patchOperatorAction,
+  putOperatorParameter,
   putFeatureSwitches,
+  rejectOperatorProposal,
 } from "../api";
 import { Empty, ErrorNote, Loading, PageHead, ago, fmtTime, useLoad } from "../ui";
 
@@ -78,10 +86,36 @@ export default function Operator() {
     [],
     30000,
   );
+  const proposals = useLoad<OperatorProposal[] | "disabled">(
+    () =>
+      listOperatorProposals().then(
+        (r) => r.proposals,
+        (e: unknown) => {
+          if (operatorDisabled(e)) return "disabled" as const;
+          throw e;
+        },
+      ),
+    [],
+    30000,
+  );
+  const parameters = useLoad<OperatorParameters | "disabled">(
+    () =>
+      getOperatorParameters().then(
+        (r) => r.parameters,
+        (e: unknown) => {
+          if (operatorDisabled(e)) return "disabled" as const;
+          throw e;
+        },
+      ),
+    [],
+    30000,
+  );
 
   const reloadAll = () => {
     triage.reload();
     actions.reload();
+    proposals.reload();
+    parameters.reload();
   };
 
   return (
@@ -101,6 +135,21 @@ export default function Operator() {
         />
       </div>
 
+      <div className="grid cols-2">
+        <ProposalInboxCard
+          proposals={proposals.data}
+          loading={proposals.loading}
+          error={proposals.error}
+          onChanged={reloadAll}
+        />
+        <ParametersCard
+          parameters={parameters.data}
+          loading={parameters.loading}
+          error={parameters.error}
+          onChanged={reloadAll}
+        />
+      </div>
+
       <KanbanCard
         actions={actions.data}
         loading={actions.loading}
@@ -108,6 +157,295 @@ export default function Operator() {
         onChanged={reloadAll}
       />
     </>
+  );
+}
+
+// ---- self-improvement proposals (explicit human approve/reject gate) --------
+
+const PROPOSAL_KIND_ZH: Record<string, string> = {
+  promote_recipe: "晋升处置配方",
+  retire_recipe: "退役处置配方",
+  set_parameter: "调整白名单参数",
+};
+
+const PROPOSAL_STATUS_ZH: Record<string, string> = {
+  proposed: "待决策",
+  approved: "已批准",
+  rejected: "已拒绝",
+};
+
+function ProposalInboxCard({
+  proposals,
+  loading,
+  error,
+  onChanged,
+}: {
+  proposals: OperatorProposal[] | "disabled" | null;
+  loading: boolean;
+  error: string | null;
+  onChanged: () => void;
+}) {
+  if (proposals === "disabled") {
+    return (
+      <div className="card">
+        <h2>
+          改进提案<span className="en">self-improvement proposals</span>
+        </h2>
+        <Empty text={DISABLED_TEXT} />
+      </div>
+    );
+  }
+
+  const ordered = [...(proposals ?? [])].sort(
+    (a, b) => Number(b.status === "proposed") - Number(a.status === "proposed") || b.id - a.id,
+  );
+  const pending = ordered.filter((p) => p.status === "proposed").length;
+
+  return (
+    <div className="card">
+      <h2>
+        改进提案<span className="en">human decision inbox · {pending} pending</span>
+      </h2>
+      <ErrorNote error={error} />
+      {loading && !proposals && <Loading />}
+      {proposals && ordered.length === 0 && <Empty text="暂无改进提案" />}
+      {proposals && ordered.map((proposal) => (
+        <ProposalRow key={proposal.id} proposal={proposal} onChanged={onChanged} />
+      ))}
+      <p className="faint" style={{ fontSize: 11.5, margin: "10px 0 0" }}>
+        批准会立即应用提案中的白名单参数或配方变更；拒绝不会应用任何变更。两者都是条件认领，状态已被他处决定时会返回
+        409 并自动刷新。
+      </p>
+    </div>
+  );
+}
+
+function ProposalRow({ proposal: p, onChanged }: { proposal: OperatorProposal; onChanged: () => void }) {
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const decide = async (decision: "approve" | "reject") => {
+    const verb = decision === "approve" ? "批准并立即应用" : "拒绝且不应用";
+    if (!window.confirm(`确认${verb}提案 #${p.id}「${p.title}」？`)) return;
+    setBusy(decision);
+    setError(null);
+    try {
+      if (decision === "approve") await approveOperatorProposal(p.id, note);
+      else await rejectOperatorProposal(p.id, note);
+      setNote("");
+      onChanged();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (e instanceof ApiError && e.status === 409) {
+        setError(`状态冲突：${message}（已刷新最新状态）`);
+        onChanged();
+      } else {
+        setError(message);
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="op-card" style={{ borderLeftColor: p.status === "proposed" ? "var(--amber)" : undefined }}>
+      <div className="head">
+        <span className="badge" title={p.kind}>{PROPOSAL_KIND_ZH[p.kind] ?? p.kind}</span>
+        <span
+          className="badge"
+          style={p.status === "approved" ? { color: "var(--green)" } : p.status === "rejected" ? { color: "var(--red)" } : { color: "var(--amber)" }}
+          title={p.status}
+        >
+          {PROPOSAL_STATUS_ZH[p.status] ?? p.status}
+        </span>
+        <span className="faint mono" style={{ marginLeft: "auto", fontSize: 11 }} title={fmtTime(p.created_at)}>
+          #{p.id} · {ago(p.created_at)}
+        </span>
+      </div>
+      <div className="title">{p.title}</div>
+      {p.rationale && <div className="dim" style={{ marginTop: 5 }}>{p.rationale}</div>}
+      <details className="detail">
+        <summary>参数与来源</summary>
+        <pre>{JSON.stringify({ params: p.params, observation_id: p.observation_id, recipe_id: p.recipe_id }, null, 2)}</pre>
+      </details>
+      {p.status !== "proposed" && (
+        <div className="faint" style={{ fontSize: 11.5, marginTop: 6 }}>
+          {p.decided_at ? fmtTime(p.decided_at) : "已决策"} · {p.applied === 1 ? "已应用" : "未应用"}
+          {p.decided_note ? ` · ${p.decided_note}` : ""}
+        </div>
+      )}
+      {error && <div className="error-note" style={{ fontSize: 11.5, padding: "5px 8px" }}>⚠ {error}</div>}
+      {p.status === "proposed" && (
+        <div className="actions">
+          <input
+            aria-label={`提案 #${p.id} 决策备注`}
+            className="grow"
+            maxLength={1000}
+            placeholder="决策备注（可选）"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            disabled={busy !== null}
+          />
+          <button
+            aria-label={`批准并应用提案 #${p.id}`}
+            disabled={busy !== null}
+            onClick={() => void decide("approve")}
+          >
+            {busy === "approve" ? "应用中…" : "批准并应用"}
+          </button>
+          <button
+            aria-label={`拒绝提案 #${p.id}`}
+            className="danger"
+            disabled={busy !== null}
+            onClick={() => void decide("reject")}
+          >
+            {busy === "reject" ? "拒绝中…" : "拒绝"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- whitelisted parameters (direct human edit, backend byte-CAS) -----------
+
+function jsonValue(value: unknown): string {
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? "" : encoded;
+}
+
+function ParametersCard({
+  parameters,
+  loading,
+  error,
+  onChanged,
+}: {
+  parameters: OperatorParameters | "disabled" | null;
+  loading: boolean;
+  error: string | null;
+  onChanged: () => void;
+}) {
+  if (parameters === "disabled") {
+    return (
+      <div className="card">
+        <h2>
+          可调参数<span className="en">whitelisted parameters</span>
+        </h2>
+        <Empty text={DISABLED_TEXT} />
+      </div>
+    );
+  }
+  const entries = Object.entries(parameters ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  return (
+    <div className="card">
+      <h2>
+        可调参数<span className="en">whitelisted · CAS protected</span>
+      </h2>
+      <ErrorNote error={error} />
+      {loading && !parameters && <Loading />}
+      {parameters && entries.length === 0 && <Empty text="当前没有白名单参数" />}
+      {parameters && entries.map(([key, parameter]) => (
+        <ParameterRow key={key} name={key} parameter={parameter} onChanged={onChanged} />
+      ))}
+      <p className="faint" style={{ fontSize: 11.5, margin: "10px 0 0" }}>
+        这里只能修改后端白名单中的参数。值按 JSON 解析（数字可直接填写）；每次写入都会记录参数历史和效果基线。并发修改会被
+        CAS 拒绝并重新加载，不会静默覆盖。
+      </p>
+    </div>
+  );
+}
+
+function ParameterRow({
+  name,
+  parameter,
+  onChanged,
+}: {
+  name: string;
+  parameter: OperatorParameter;
+  onChanged: () => void;
+}) {
+  const effective = parameter.set ? parameter.stored : parameter.default;
+  const [draft, setDraft] = useState(() => jsonValue(effective));
+  const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  // Polls may refresh the server value; preserve a local edit until it is
+  // either saved or explicitly discarded by a 409 conflict.
+  useEffect(() => {
+    if (!dirtyRef.current) setDraft(jsonValue(parameter.set ? parameter.stored : parameter.default));
+  }, [parameter]);
+
+  const edit = (value: string) => {
+    setDraft(value);
+    setDirty(true);
+    dirtyRef.current = true;
+    setError(null);
+    setNote(null);
+  };
+
+  const save = async () => {
+    let value: unknown;
+    try {
+      value = JSON.parse(draft);
+    } catch {
+      setError("请输入合法 JSON 值，例如 0.8、true 或 \"文本\"");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      await putOperatorParameter(name, value);
+      dirtyRef.current = false;
+      setDirty(false);
+      setDraft(jsonValue(value));
+      setNote("已保存并记录效果基线");
+      onChanged();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (e instanceof ApiError && e.status === 409) {
+        dirtyRef.current = false;
+        setDirty(false);
+        setError(`参数已被他处修改：${message}（已重新加载，请按最新值重做）`);
+        onChanged();
+      } else {
+        setError(message);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="op-card" style={{ borderLeftColor: "var(--blue)" }}>
+      <div className="mono" style={{ fontWeight: 600, wordBreak: "break-all" }}>{name}</div>
+      <div className="faint" style={{ fontSize: 11.5, margin: "4px 0 7px" }}>
+        当前 <span className="mono">{jsonValue(effective)}</span>
+        {parameter.set ? "（显式设置）" : `（默认值，尚未设置）`}
+      </div>
+      {note && <div className="ok-note" style={{ fontSize: 11.5, padding: "5px 8px" }}>{note}</div>}
+      {error && <div className="error-note" style={{ fontSize: 11.5, padding: "5px 8px" }}>⚠ {error}</div>}
+      <div className="form-row" style={{ alignItems: "center" }}>
+        <input
+          aria-label={`参数 ${name}`}
+          className="grow mono"
+          value={draft}
+          onChange={(e) => edit(e.target.value)}
+          disabled={busy}
+        />
+        <button
+          aria-label={`保存参数 ${name}`}
+          disabled={busy || !dirty}
+          onClick={() => void save()}
+        >
+          {busy ? "保存中…" : dirty ? "保存" : "已同步"}
+        </button>
+      </div>
+    </div>
   );
 }
 
