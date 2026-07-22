@@ -8,7 +8,12 @@ obsidian-plugin/node_modules/
 # NOTE: obsidian-plugin/main.js IS committed on purpose — Obsidian plugins are
 # distributed as manifest.json + main.js, so users can install without a Node build.
 .pytest_cache/
+.ruff_cache/
+.kiro/
+.claude/
 *.egg-info/
 .DS_Store
+# per-task agent running log; its own header says it must never be committed
+implementation-notes.md
 design/
 market-thesis-data/
