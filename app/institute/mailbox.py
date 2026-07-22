@@ -14,7 +14,6 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from .. import bus, db
@@ -475,7 +474,7 @@ async def _reconcile_bound_dispatch(
         return
     if status == "queued" or (active is not None and not active.done()):
         try:
-            result = await _drive_bound_task(task["id"])
+            await _drive_bound_task(task["id"])
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - durable task remains for sweep/boot

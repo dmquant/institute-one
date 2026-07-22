@@ -643,7 +643,7 @@ def _period_parts(as_of: str) -> tuple[str, tuple[int, int, int, int]]:
     if match:
         year, month, day = (int(part) for part in match.groups())
         try:
-            parsed = datetime(year, month, day)
+            datetime(year, month, day)  # validates the calendar date
         except ValueError as exc:
             raise ChainError(f"unsupported property as_of period: {raw!r}") from exc
         return f"{year:04d}-{month:02d}-{day:02d}", (year, month, day, 3)

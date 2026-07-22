@@ -73,7 +73,7 @@ async def _get_run(run_id: Any) -> Any | None:
             res = await res
         if res is not None:
             return res
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional domain accessor; row fallback below
         log.debug("workflows.get_run unavailable; falling back to direct query", exc_info=True)
     return await db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (str(run_id),))
 
@@ -90,7 +90,7 @@ async def _get_board(board_id: str) -> Any | None:
             res = await res
         if res is not None:
             return res
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional domain accessor; row fallback below
         log.debug("whiteboard.get_board unavailable; falling back to direct query", exc_info=True)
     row = await db.query_one("SELECT * FROM whiteboard_boards WHERE id = ?", (board_id,))
     if row is None:

@@ -200,7 +200,7 @@ async def _t_whiteboard_get_board(args: dict) -> Any:
         if inspect.isawaitable(res):
             res = await res
         board = _jsonable(res)
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional domain accessor; row fallback below
         log.debug("whiteboard.get_board unavailable; using direct query", exc_info=True)
     if board is None:
         row = await db.query_one("SELECT * FROM whiteboard_boards WHERE id = ?", (board_id,))

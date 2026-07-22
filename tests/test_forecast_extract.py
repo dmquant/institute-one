@@ -586,7 +586,7 @@ async def test_id_collision_with_unrelated_forecast_fails_loud(monkeypatch):
     leaves an item row misattributing the foreign forecast."""
     await _seed_universe()
     await _mk_thesis()
-    foreign = await forecasts.create_forecast({
+    await forecasts.create_forecast({
         "thesis_id": "t-macro", "security_id": "NVDA.US", "claim": "无关的人工预测",
         "direction": "short", "horizon_days": 365,
         "settlement_rule": {"type": "absolute_move", "threshold": 0.05},

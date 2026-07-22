@@ -5,8 +5,6 @@ import asyncio
 import sqlite3
 import time
 
-import pytest
-
 from app import bus, db
 from app.hands.base import Hand, HandResult
 from app.hands.registry import get_registry
