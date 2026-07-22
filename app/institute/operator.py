@@ -524,7 +524,12 @@ async def sweep_vault_conflicts() -> dict[str, Any]:
                             (rel,))
                         if fresh is None:
                             continue  # row deleted since the snapshot
-                        state = _classify_vault_row(writer.root, fresh)
+                        # This fresh read can hash a whole file/region just like
+                        # the initial scan. Keep it off the event loop while the
+                        # coordination lock closes the writer TOCTOU window.
+                        state = await asyncio.to_thread(
+                            _classify_vault_row, writer.root, fresh,
+                        )
                         if state not in ("conflict", "drifted"):
                             continue  # the writer caught up; scan verdict is history
                         if state == "drifted" and _changed_within_grace(

@@ -1,7 +1,7 @@
 """Embeddings substrate (Phase 1a): Ollama bge-m3 → sqlite-vec, degrade-first.
 
-Degradation contract — which on this machine is the DEFAULT reality (no
-ollama binary installed; sqlite-vec is an optional dependency):
+Degradation contract — vectors remain optional even when an Ollama binary or
+model is installed; sqlite-vec is also an optional dependency:
 
 - ``embed()`` returns ``None`` when vectors are disabled, Ollama is
   unreachable/times out, or the reply is malformed. It never raises. After a

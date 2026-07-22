@@ -86,14 +86,45 @@ class EchoHand(Hand):
     hand_type = "cli"
 
     async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None) -> HandResult:
-        artifacts: list[str] = []
+        def refuse_path(name: str, reason: str) -> HandResult:
+            out = f"[echo] refused WRITE_FILE {name!r}: {reason}"
+            if on_chunk:
+                on_chunk({"type": "stderr", "text": out})
+            return HandResult(output=out, exit_code=2)
+
+        try:
+            workspace_root = workspace.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return refuse_path(str(workspace), "workspace cannot be resolved")
+
+        # Preflight every directive before creating anything. This prevents a
+        # prompt containing one valid target followed by an unsafe target from
+        # leaving a partially written workspace.
+        planned: list[tuple[Path, str]] = []
         for line in prompt.splitlines():
-            if line.startswith("WRITE_FILE: "):
-                fname = line.split("WRITE_FILE: ", 1)[1].strip()
-                target = workspace / fname
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(prompt, encoding="utf-8")
-                artifacts.append(fname)
+            if not line.startswith("WRITE_FILE: "):
+                continue
+            name = line.split("WRITE_FILE: ", 1)[1].strip()
+            relative = Path(name)
+            if not name:
+                return refuse_path(name, "path is empty")
+            if relative.is_absolute():
+                return refuse_path(name, "absolute paths are not allowed")
+            if ".." in relative.parts:
+                return refuse_path(name, "parent traversal is not allowed")
+            try:
+                target = (workspace / relative).resolve(strict=False)
+            except (OSError, RuntimeError):
+                return refuse_path(name, "path cannot be resolved")
+            if target == workspace_root or not target.is_relative_to(workspace_root):
+                return refuse_path(name, "path escapes the workspace")
+            planned.append((target, target.relative_to(workspace_root).as_posix()))
+
+        artifacts: list[str] = []
+        for target, artifact in planned:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(prompt, encoding="utf-8")
+            artifacts.append(artifact)
         out = f"[echo] {prompt[:4000]}"
         if on_chunk:
             on_chunk({"type": "stdout", "text": out})

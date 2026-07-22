@@ -421,6 +421,7 @@ async def test_sweep_scan_runs_off_the_event_loop(clean_vault_dir, monkeypatch):
     a big vault scan. The classification now runs in a worker thread — a
     deliberately slowed read must leave the loop breathing."""
     import asyncio
+    import threading
     import time
 
     writer = get_writer()
@@ -432,8 +433,11 @@ async def test_sweep_scan_runs_off_the_event_loop(clean_vault_dir, monkeypatch):
     _age_file(p)
 
     real_read = operator._read_exact
+    event_loop_thread = threading.get_ident()
+    read_threads = []
 
     def slow_read(path):
+        read_threads.append(threading.get_ident())
         time.sleep(0.4)  # a big vault, compressed into one slow region read
         return real_read(path)
 
@@ -455,6 +459,8 @@ async def test_sweep_scan_runs_off_the_event_loop(clean_vault_dir, monkeypatch):
     assert "error" not in res
     assert res["doctor"]["drifted"] == 1      # counts still authoritative
     assert res["opened"] == 1                 # ...and the action still opens
+    assert len(read_threads) >= 2               # initial scan + final fresh recheck
+    assert all(tid != event_loop_thread for tid in read_threads)
     # blocked-loop behaviour yields ~0 ticks during the 0.4s read; a threaded
     # scan yields ~40 — a generous threshold keeps the test load-tolerant
     assert ticks >= 5
