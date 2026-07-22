@@ -1985,6 +1985,35 @@ async def test_reproject_kind_filter_cap_and_footer_refresh():
     assert "## Entities\n[[比亚迪]]" in briefing
 
 
+async def test_reproject_backfills_new_exporter_kinds():
+    """The four footer-bearing kinds added by the vault-projection extension
+    (factcheck / paper-book-journal / research_tree / committee) are inside the
+    historical backfill channel: pre-existing file-mode notes gain the footer."""
+    writer = get_writer()
+    rels = [
+        await _mk_old_note("Inbox/Disputed Claims.md", "宁德时代产能论断存疑。",
+                           kind="factcheck", artifact_id="factcheck-disputes"),
+        await _mk_old_note("Book/journal/2026-07-01.md", "平仓宁德时代多头仓位。",
+                           kind="paper-book-journal", artifact_id="2026-07-01"),
+        await _mk_old_note("Research/固态电池/tree.md", "L0 宁德时代固态电池进度。",
+                           kind="research_tree", artifact_id="research-tree:固态电池"),
+        await _mk_old_note("Committee/2026-07-01 委员会裁决.md", "裁决围绕宁德时代展开。",
+                           kind="committee", artifact_id="cmt-1"),
+    ]
+    await chain.create_node("宁德时代", "company")   # node arrives AFTER the exports
+
+    res = await chain.reproject_footers()
+    assert res["reprojected"] == 4 and res["conflicts"] == 0
+    for rel in rels:
+        text = (writer.root / rel).read_text(encoding="utf-8")
+        assert "## Entities\n[[宁德时代]]" in text, rel
+        assert text.count("## Entities") == 1, rel
+
+    # each new kind is individually addressable through the kind filter
+    for kind in ("factcheck", "paper-book-journal", "research_tree", "committee"):
+        assert (await chain.reproject_footers(kind=kind))["reprojected"] == 0
+
+
 async def test_reproject_api_and_validation(client):
     with pytest.raises(chain.ChainError, match="unknown reproject kind"):
         await chain.reproject_footers(kind="chain-node")       # entity notes are not sources

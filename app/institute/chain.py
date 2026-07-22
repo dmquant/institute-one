@@ -2492,7 +2492,13 @@ async def entity_footer(text: str) -> str:
 # the ledger (human edits, conflict rows) are counted and left untouched —
 # a maintenance sweep must never manufacture conflict siblings.
 
-REPROJECT_KINDS = ("research", "briefing", "daily", "whiteboard", "analyst-daily", "memory")
+REPROJECT_KINDS = (
+    "research", "briefing", "daily", "whiteboard", "analyst-daily", "memory",
+    # footer-bearing kinds added by the vault-projection extension (2026-07-20):
+    # all four are file-mode notes, so the generic sha/frontmatter round-trip
+    # in _reproject_one applies unchanged. Twins ride briefing/daily above.
+    "factcheck", "paper-book-journal", "research_tree", "committee",
+)
 
 _FOOTER_HEADING = "## Entities\n"
 _PARSE_FAIL: Any = object()
