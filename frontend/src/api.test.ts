@@ -2,9 +2,9 @@
 // malformed-frame tolerance and the no-done EOF reject. Fetch is faked with
 // a FakeStream body so byte boundaries are fully scripted.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { askStream } from "./api";
+import { ApiError, askStream, getHealth } from "./api";
 import type { AskStreamFrame } from "./api";
-import { FakeStream, streamResponse } from "./test-helpers";
+import { FakeStream, jsonResponse, streamResponse } from "./test-helpers";
 
 let stream: FakeStream;
 
@@ -93,5 +93,38 @@ describe("askStream NDJSON parsing", () => {
     stream.close();
     await rejection;
     expect(frames).toEqual([{ type: "stdout", text: "partial" }]);
+  });
+});
+
+describe("req 15s timeout", () => {
+  it("a wedged backend rejects as ApiError(408) instead of spinning forever", async () => {
+    vi.useFakeTimers();
+    try {
+      // fetch that never answers but honors abort like a real one
+      vi.stubGlobal(
+        "fetch",
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("The operation was aborted.", "AbortError")),
+            );
+          }),
+      );
+      const pending = getHealth();
+      const rejection = expect(pending).rejects.toMatchObject({
+        status: 408,
+        message: expect.stringContaining("超时"),
+      });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await rejection;
+      await expect(pending).rejects.toBeInstanceOf(ApiError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fast responses are unaffected by the timer", async () => {
+    vi.stubGlobal("fetch", async () => jsonResponse({ status: "ok" }));
+    await expect(getHealth()).resolves.toEqual({ status: "ok" });
   });
 });

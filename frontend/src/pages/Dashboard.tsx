@@ -1,17 +1,15 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
-  AUTH_TOKEN_KEY,
   clearHandCooldown,
   getAdminState,
-  getForecast,
+  getForecastStats,
   getMeta,
   getOperatorTriage,
+  getVectorHealth,
   isMaintenancePaused,
-  listForecasts,
   listTasks,
   setMaintenance,
-  type Forecast,
 } from "../api";
 import { EventFeed } from "../events";
 import { useSSE } from "../useSSE";
@@ -37,25 +35,6 @@ const STATUS_ORDER = [
   "cancelled",
   "expired",
 ];
-const FORECAST_SAMPLE_LIMIT = 500;
-
-interface ForecastHitRate {
-  hits: number;
-  misses: number;
-  partial: number;
-  listed: number;
-  capped: boolean;
-}
-
-interface VectorHealth {
-  enabled: boolean;
-  reason: string;
-  extension_available: boolean;
-  ollama_reachable: boolean | null;
-  model_available: boolean | null;
-  current_model: string;
-  chunk_counts: Record<string, number>;
-}
 
 const VECTOR_REASON_ZH: Record<string, string> = {
   healthy: "健康",
@@ -66,48 +45,6 @@ const VECTOR_REASON_ZH: Record<string, string> = {
   vector_error: "向量服务异常",
 };
 
-async function loadForecastHitRate(): Promise<ForecastHitRate> {
-  const settled = await listForecasts("settled", undefined, FORECAST_SAMPLE_LIMIT);
-  const details: Forecast[] = [];
-  for (let i = 0; i < settled.length; i += 25) {
-    const batch = settled.slice(i, i + 25);
-    details.push(
-      ...(await Promise.all(batch.map((forecast) => forecast.settlement ? forecast : getForecast(forecast.id)))),
-    );
-  }
-  const hits = details.filter((forecast) => forecast.settlement?.verdict === "hit").length;
-  const misses = details.filter((forecast) => forecast.settlement?.verdict === "miss").length;
-  const partial = details.filter((forecast) => forecast.settlement?.verdict === "partial").length;
-  return {
-    hits,
-    misses,
-    partial,
-    listed: settled.length,
-    capped: settled.length === FORECAST_SAMPLE_LIMIT,
-  };
-}
-
-async function loadVectorHealth(): Promise<VectorHealth> {
-  const headers = new Headers();
-  const token = window.localStorage.getItem(AUTH_TOKEN_KEY)?.trim() ?? "";
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch("/api/vectors/health", { headers });
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const body = (await response.json()) as { detail?: unknown };
-      if (typeof body.detail === "string") detail = body.detail;
-    } catch {
-      // Non-JSON errors keep the HTTP status text.
-    }
-    throw new Error(detail);
-  }
-  if ((response.headers.get("content-type") ?? "").includes("text/html")) {
-    throw new Error("向量健康接口未部署（返回了 SPA 页面）");
-  }
-  return (await response.json()) as VectorHealth;
-}
-
 export default function Dashboard() {
   const now = useNow(1000);
   const { events, connected, lastEvent } = useSSE({ max: 60 });
@@ -115,8 +52,8 @@ export default function Dashboard() {
   const todays = useLoad(() => listTasks({ limit: 30 }), [lastEvent?.id ?? 0], 30000);
   const admin = useLoad(getAdminState, [], 30000);
   const triage = useLoad(getOperatorTriage, [], 30000);
-  const forecastHitRate = useLoad(loadForecastHitRate, [], 300000);
-  const vectors = useLoad(loadVectorHealth, [], 30000);
+  const forecastHitRate = useLoad(getForecastStats, [], 300000);
+  const vectors = useLoad(getVectorHealth, [], 30000);
   const [resumeErr, setResumeErr] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
 
@@ -212,7 +149,7 @@ export default function Dashboard() {
                 {forecastHitRate.data
                   ? `${forecastHitRate.data.hits}/${decisiveForecasts} hit/miss${
                       forecastHitRate.data.partial ? ` · partial ${forecastHitRate.data.partial}` : ""
-                    }${forecastHitRate.data.capped ? ` · 最近 ${forecastHitRate.data.listed} 条` : ""}`
+                    }`
                   : "hit / (hit + miss)"}
               </span>
             </div>

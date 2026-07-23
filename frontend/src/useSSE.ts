@@ -86,13 +86,122 @@ function ensureTail(): Promise<void> {
   return walk;
 }
 
+// ---- shared unfiltered stream ---------------------------------------------
+// All UNFILTERED hooks share ONE /api/events/stream connection (12+ hooks
+// mount across the app; one stream each would multiply the server's replay
+// and live-queue bookkeeping by the hook count). Every data frame fans out
+// to all subscribers as a catch-up wake-up — frames are never consumed as
+// data (see the header), so sharing the wake-up signal changes nothing about
+// the delivery guarantee: catchUp stays per-instance and each cursor still
+// walks the durable log at its own pace. Filtered hooks keep their own typed
+// stream — their ?types= filter is server-side and the unfiltered-only stall
+// watchdog must never apply to them. The shared stream lives while ≥1
+// subscriber is mounted; the last unsubscribe aborts it and cancels any
+// pending retry.
+interface StreamSubscriber {
+  wake: () => void; // a data frame arrived: run one catch-up round
+  getCursor: () => number; // reconnect ?since= hint (never data — an undershoot is harmless)
+  onConnected: (connected: boolean) => void;
+}
+
+const sharedStream = {
+  subs: new Set<StreamSubscriber>(),
+  ctrl: null as AbortController | null,
+  retryTimer: undefined as number | undefined,
+  live: false, // the stream fetch is open and being read
+  lastActivity: 0, // Date.now() of the last stream bytes (data OR heartbeat)
+};
+
+async function sharedConnect(): Promise<void> {
+  if (sharedStream.subs.size === 0) return;
+  const ctrl = new AbortController();
+  sharedStream.ctrl = ctrl;
+  // ?since= only trims the server-side replay; frames are never consumed as
+  // data, so the replay cap / handshake race cannot lose anything here. The
+  // lowest subscriber cursor is the safe hint — an undershoot only means the
+  // server replays a few extra (discarded) frames.
+  let since: number | null = null;
+  for (const sub of sharedStream.subs) {
+    const c = sub.getCursor();
+    since = since === null ? c : Math.min(since, c);
+  }
+  try {
+    const res = await fetch(`/api/events/stream?since=${since ?? 0}`, {
+      signal: ctrl.signal,
+      headers: { Accept: "text/event-stream" },
+    });
+    if (!res.ok || !res.body) throw new Error(`stream http ${res.status}`);
+    sharedStream.live = true;
+    sharedStream.lastActivity = Date.now();
+    for (const sub of sharedStream.subs) {
+      sub.onConnected(true);
+      sub.wake(); // (re)connect ⇒ we may have been blind for a while: reconcile now
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let sawData = false;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sharedStream.lastActivity = Date.now();
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        let line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line === "") {
+          // frame boundary: a data-bearing frame means new events exist —
+          // wake every subscriber's catch-up loop (the frame body itself is
+          // discarded)
+          if (sawData) {
+            sawData = false;
+            for (const sub of sharedStream.subs) sub.wake();
+          }
+          continue;
+        }
+        if (line.startsWith(":")) continue; // heartbeat comment — liveness only
+        if (line.startsWith("data:")) sawData = true;
+        // id:/event: lines carry nothing the catch-up loop needs
+      }
+    }
+    throw new Error("stream ended"); // server closed: fall through to retry
+  } catch {
+    if (sharedStream.ctrl !== ctrl) return; // superseded connection: leave state alone
+    sharedStream.live = false;
+    for (const sub of sharedStream.subs) sub.onConnected(false);
+    if (sharedStream.subs.size > 0) {
+      sharedStream.retryTimer = window.setTimeout(() => void sharedConnect(), RETRY_MS);
+    }
+  }
+}
+
+function subscribeSharedStream(sub: StreamSubscriber): () => void {
+  const first = sharedStream.subs.size === 0;
+  sharedStream.subs.add(sub);
+  if (first) void sharedConnect();
+  else if (sharedStream.live) sub.onConnected(true); // joining an already-live stream
+  return () => {
+    sharedStream.subs.delete(sub);
+    if (sharedStream.subs.size === 0) {
+      // last subscriber gone: stop the stream and any pending reconnect
+      if (sharedStream.retryTimer !== undefined) window.clearTimeout(sharedStream.retryTimer);
+      sharedStream.ctrl?.abort();
+    }
+  };
+}
+
 /**
  * Live event feed backed by the durable cursor endpoint, with the SSE stream
  * as a push trigger and auto-reconnect. Post-mount events are delivered
  * exactly once and in id order (timing notes above). Unfiltered hooks seed
- * `events` with the most recent history at mount; filtered hooks start empty
- * at the log tail (every current filtered caller is a max=1 reload trigger).
- * `types` are prefixes, filtered server-side (LIKE / startswith).
+ * `events` with the most recent history at mount and ride ONE module-level
+ * shared stream (fan-out wake-ups); filtered hooks start empty at the log
+ * tail on their own typed stream (every current filtered caller is a max=1
+ * reload trigger). `types` are prefixes, filtered server-side
+ * (LIKE / startswith).
  */
 export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: BusEvent) => void } = {}): SSEState {
   const { types, max = 200 } = opts;
@@ -115,8 +224,7 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
     let ctrl: AbortController | null = null;
     let applying = false; // a catch-up round is in flight
     let dirty = false; // a trigger arrived mid-round: run one more round
-    let streamLive = false; // current stream fetch is open and being read
-    let lastActivity = 0; // Date.now() of the last stream bytes (data OR heartbeat)
+    let unsubscribeStream: (() => void) | null = null; // unfiltered hooks only
 
     // Mount: land the cursor on the log tail and (unfiltered) render recent
     // history. History does not fire onEvent — the live contract starts at
@@ -186,6 +294,8 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
       }
     };
 
+    // Filtered hooks only: unfiltered hooks share the module-level stream
+    // (subscribeSharedStream below) instead of opening one connection each.
     const connect = async () => {
       if (closed) return;
       ctrl = new AbortController();
@@ -199,8 +309,6 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
           headers: { Accept: "text/event-stream" },
         });
         if (!res.ok || !res.body) throw new Error(`stream http ${res.status}`);
-        streamLive = true;
-        lastActivity = Date.now();
         setConnected(true);
         // (re)connect ⇒ we may have been blind for a while: reconcile now
         void catchUp();
@@ -212,7 +320,6 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          lastActivity = Date.now();
           buf += decoder.decode(value, { stream: true });
           let nl: number;
           while ((nl = buf.indexOf("\n")) !== -1) {
@@ -236,7 +343,6 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
         throw new Error("stream ended"); // server closed: fall through to retry
       } catch {
         if (closed) return;
-        streamLive = false;
         setConnected(false);
         retryTimer = window.setTimeout(() => void connect(), RETRY_MS);
       }
@@ -251,19 +357,30 @@ export function useSSE(opts: { types?: string[]; max?: number; onEvent?: (e: Bus
     //    event, so a filtered stream can legitimately stay silent for long
     //    stretches while non-matching events flow; silence there proves
     //    nothing (its freshness is covered by the reconcile poll anyway).
+    //    The unfiltered stream is the module-level shared one — any mounted
+    //    subscriber may run the check (aborting a dead stream is a no-op).
     const interval = window.setInterval(() => {
       void catchUp();
-      if (!typesKey && streamLive && Date.now() - lastActivity > STALL_MS) {
-        ctrl?.abort(); // read() rejects ⇒ reconnect in RETRY_MS
+      if (!typesKey && sharedStream.live && Date.now() - sharedStream.lastActivity > STALL_MS) {
+        sharedStream.ctrl?.abort(); // read() rejects ⇒ reconnect in RETRY_MS
       }
     }, RECONCILE_MS);
     void catchUp(); // bootstrap: seed history, land the cursor on the tail
-    void connect();
+    if (typesKey) {
+      void connect();
+    } else {
+      unsubscribeStream = subscribeSharedStream({
+        wake: () => void catchUp(),
+        getCursor: () => cursor,
+        onConnected: setConnected,
+      });
+    }
     return () => {
       closed = true;
       window.clearInterval(interval);
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       ctrl?.abort();
+      unsubscribeStream?.();
     };
   }, [typesKey, max]);
 

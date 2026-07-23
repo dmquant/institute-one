@@ -3,8 +3,9 @@
 // no network, no EventSource, no testing-library.
 //
 // Module isolation: useSSE keeps module-level shared state by design
-// (shared.tail / shared.ring / walk), so every test loads a fresh module
-// graph via vi.resetModules() + dynamic imports. react and react-dom are
+// (shared.tail / shared.ring / walk / the shared unfiltered stream), so
+// every test loads a fresh module graph via vi.resetModules() + dynamic
+// imports. react and react-dom are
 // re-imported per generation too — the hook and the renderer must come from
 // the SAME React instance or hooks explode with "invalid hook call".
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -271,14 +272,18 @@ describe("useSSE cursor state machine", () => {
     expect(eventsSince.filter((s) => s < 250)).toEqual([0]); // ONE whole-log walk, shared by all mounts
 
     seed(10, 251);
-    streams[0].push("data: wake\n\n"); // wake A only: its applyBatch feeds the shared ring
+    streams[0].push("data: wake\n\n"); // ONE shared stream: its fan-out wakes every unfiltered feed
     await flush(w);
     const c = renderFeed(w, { max: 500 });
     await flush(w);
+    expect(streams).toHaveLength(1); // a, b and c all ride the module-level shared stream
     expect(c.state.events).toHaveLength(200); // still capped after the push
     expect(c.state.events[0].id).toBe(260);
     expect(c.state.events[199].id).toBe(61); // 51..60 evicted by the new batch
-    expect(b.state.events[0].id).toBe(250); // B holds its own cursor: un-woken, unchanged
+    // the fan-out woke B too: its own catch-up walked the log to the same
+    // tail (per-instance cursor semantics unchanged — monotone, no loss)
+    expect(b.state.events[0].id).toBe(260);
+    expect(b.state.events).toHaveLength(100); // …still trimmed to its own max
     a.unmount();
     b.unmount();
     c.unmount();

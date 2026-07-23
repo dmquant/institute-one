@@ -91,6 +91,13 @@ export default function Workflows() {
   );
 }
 
+// Server-side lazy variables (app/institute/workflows.py _drive): computed
+// at run time when a step prompt references them and no explicit value was
+// passed. Rendering an input for them — and thereby submitting an empty
+// string — would count as an explicit value and suppress that lazy
+// computation, so they stay out of the form.
+const LAZY_VARIABLES = new Set(["DATA_BUNDLE", "WEEK_DISPUTES"]);
+
 function WorkflowCard({ wf, onStarted }: { wf: Workflow; onStarted: (runId: string) => void }) {
   const [vars, setVars] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
@@ -100,7 +107,10 @@ function WorkflowCard({ wf, onStarted }: { wf: Workflow; onStarted: (runId: stri
     setBusy(true);
     setErr(null);
     try {
-      const r = await runWorkflow(wf.id, Object.keys(vars).length > 0 ? vars : undefined);
+      // an empty input means "not provided": sending "" would count as an
+      // explicit value on the run and suppress server-side defaults/lazy vars
+      const filled = Object.fromEntries(Object.entries(vars).filter(([, value]) => value !== ""));
+      const r = await runWorkflow(wf.id, Object.keys(filled).length > 0 ? filled : undefined);
       onStarted(r.run_id);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -108,6 +118,8 @@ function WorkflowCard({ wf, onStarted }: { wf: Workflow; onStarted: (runId: stri
       setBusy(false);
     }
   };
+
+  const visibleVariables = wf.variables.filter((v) => !LAZY_VARIABLES.has(v));
 
   return (
     <div className="card">
@@ -119,9 +131,9 @@ function WorkflowCard({ wf, onStarted }: { wf: Workflow; onStarted: (runId: stri
       <div className="dim" style={{ fontSize: 12, marginBottom: 8 }}>
         {wf.steps.length} 个步骤：{wf.steps.map((s) => s.title ?? s.id).join(" → ")}
       </div>
-      {wf.variables.length > 0 && (
+      {visibleVariables.length > 0 && (
         <div className="form-row" style={{ marginBottom: 10 }}>
-          {wf.variables.map((v) => (
+          {visibleVariables.map((v) => (
             <label className="field grow" key={v}>
               <span className="lbl mono">{v}</span>
               <input

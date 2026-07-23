@@ -65,7 +65,9 @@ function installBackend(): void {
       return jsonResponse({ maintenance: JSON.stringify({ paused: true }) });
     }
     if (url.pathname === "/api/operator/triage") return jsonResponse(triage);
-    if (url.pathname === "/api/forecasts") return jsonResponse([]);
+    if (url.pathname === "/api/forecasts/stats") {
+      return jsonResponse({ hits: 0, misses: 0, partial: 0, settled: 0 });
+    }
     if (url.pathname === "/api/vectors/health") {
       return jsonResponse({
         enabled: false,

@@ -274,6 +274,10 @@ export interface ResearchItem {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  // structured-enqueue anchors (app/institute/research.py; null on plain
+  // topic rows)
+  thesis_id?: string | null;
+  security_id?: string | null;
 }
 
 export interface ResearchItemDetail extends ResearchItem {
@@ -314,6 +318,17 @@ export interface VaultStatus {
   vault_dir: string | null;
   counts: Record<string, number>;
   total: number;
+}
+
+/** GET /api/vectors/health — sqlite-vec + Ollama embedding pipeline status. */
+export interface VectorHealth {
+  enabled: boolean;
+  reason: string;
+  extension_available: boolean;
+  ollama_reachable: boolean | null;
+  model_available: boolean | null;
+  current_model: string;
+  chunk_counts: Record<string, number>;
 }
 
 export interface Health {
@@ -398,6 +413,14 @@ export interface HandStats {
   windows: Record<string, unknown>[];
 }
 
+/** GET /api/forecasts/stats — settled verdict counts, performance scope. */
+export interface ForecastStats {
+  hits: number;
+  misses: number;
+  partial: number;
+  settled: number;
+}
+
 /** Forecast row (app/institute/forecasts.py — SELECT * FROM forecasts). */
 export interface Forecast {
   id: string;
@@ -413,7 +436,9 @@ export interface Forecast {
   status: "open" | "settled" | "invalid";
   created_at: string;
   updated_at: string;
-  settlement?: ForecastSettlement | null; // GET /api/forecasts/{id} only
+  // full forecast_settlements row or null — inlined by BOTH the list and the
+  // detail endpoint (app/institute/forecasts.py list_forecasts / get_forecast)
+  settlement?: ForecastSettlement | null;
 }
 
 export interface ForecastSettlement {
@@ -770,35 +795,87 @@ export class ApiError extends Error {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/** 15s ceiling for plain (non-streaming) requests: a wedged local backend
+ * must fail the load instead of leaving every useLoad spinning forever. A
+ * caller-supplied signal is merged in — whichever abort fires first wins;
+ * caller aborts propagate unchanged, only OUR timeout surfaces as
+ * ApiError(408). Streaming consumers (askStream) deliberately do NOT use
+ * this — a total-request timeout would kill the long-lived NDJSON stream. */
+function requestTimeout(caller?: AbortSignal | null) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = window.setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, REQUEST_TIMEOUT_MS);
+  const onCallerAbort = () => ctrl.abort();
+  if (caller) {
+    if (caller.aborted) ctrl.abort();
+    else caller.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  return {
+    signal: ctrl.signal,
+    /** our timeout's abort → ApiError(408); anything else passes through */
+    mapError: (e: unknown): unknown => {
+      const aborted =
+        typeof e === "object" && e !== null && (e as { name?: unknown }).name === "AbortError";
+      return timedOut && aborted
+        ? new ApiError(408, `请求超时（${REQUEST_TIMEOUT_MS / 1000}s）：后端无响应`)
+        : e;
+    },
+    done: () => {
+      window.clearTimeout(timer);
+      caller?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, {
-    ...init,
-    headers: withAuthHeaders(init?.headers),
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      if (body && typeof body.detail === "string") detail = body.detail;
-    } catch {
-      /* not json */
+  const timeout = requestTimeout(init?.signal);
+  try {
+    const res = await fetch(BASE + path, {
+      ...init,
+      signal: timeout.signal,
+      headers: withAuthHeaders(init?.headers),
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        if (body && typeof body.detail === "string") detail = body.detail;
+      } catch {
+        /* not json */
+      }
+      throw new ApiError(res.status, detail);
     }
-    throw new ApiError(res.status, detail);
+    // The SPA GET catch-all serves index.html for ANY unmatched path, /api/*
+    // included — an unmounted API router answers 200 text/html, not 404. Map
+    // that to a 404 so "接口未启用" fallbacks fire instead of a JSON parse error.
+    const ct = res.headers.get("content-type") ?? "";
+    if (ct.includes("text/html")) {
+      throw new ApiError(404, "接口未部署（请求被 SPA fallback 接住，返回了 HTML）");
+    }
+    return (await res.json()) as T;
+  } catch (e) {
+    throw timeout.mapError(e);
+  } finally {
+    timeout.done();
   }
-  // The SPA GET catch-all serves index.html for ANY unmatched path, /api/*
-  // included — an unmounted API router answers 200 text/html, not 404. Map
-  // that to a 404 so "接口未启用" fallbacks fire instead of a JSON parse error.
-  const ct = res.headers.get("content-type") ?? "";
-  if (ct.includes("text/html")) {
-    throw new ApiError(404, "接口未部署（请求被 SPA fallback 接住，返回了 HTML）");
-  }
-  return (await res.json()) as T;
 }
 
 async function reqText(path: string): Promise<string> {
-  const res = await fetch(BASE + path, { headers: withAuthHeaders() });
-  if (!res.ok) throw new ApiError(res.status, res.statusText);
-  return await res.text();
+  const timeout = requestTimeout(null);
+  try {
+    const res = await fetch(BASE + path, { headers: withAuthHeaders(), signal: timeout.signal });
+    if (!res.ok) throw new ApiError(res.status, res.statusText);
+    return await res.text();
+  } catch (e) {
+    throw timeout.mapError(e);
+  } finally {
+    timeout.done();
+  }
 }
 
 function post<T>(path: string, body?: unknown): Promise<T> {
@@ -1042,9 +1119,15 @@ export const getHandStats = (hours = 24) => req<HandStats>(`/api/hands/stats${qs
 export const getVaultStatus = () => req<VaultStatus>("/api/vault/status");
 export const vaultDoctor = () => post<Record<string, unknown>>("/api/vault/doctor");
 
+// vectors
+export const getVectorHealth = () => req<VectorHealth>("/api/vectors/health");
+
 // forecasts
 export const listForecasts = (status?: string, thesis_id?: string, limit = 100) =>
   req<Forecast[]>(`/api/forecasts${qs({ status, thesis_id, limit })}`);
+/** GET /api/forecasts/stats — settled verdict counts over the performance
+ * scope (backfill excluded), aggregated server-side in one query. */
+export const getForecastStats = () => req<ForecastStats>("/api/forecasts/stats");
 export const getForecast = (id: string) => req<Forecast>(`/api/forecasts/${id}`);
 export const settleForecast = (id: string) =>
   post<Forecast>(`/api/forecasts/${encodeURIComponent(id)}/settle`);

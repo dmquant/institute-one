@@ -96,7 +96,18 @@ export function EventFeed({ events, emptyText = "等待事件中…" }: { events
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
   }, [events]);
 
-  const shown = group ? events.filter((e) => eventGroup(e.type) === group) : events;
+  const shown = useMemo(
+    () => (group ? events.filter((e) => eventGroup(e.type) === group) : events),
+    [events, group],
+  );
+
+  // JSON.stringify per row is the hot path of every SSE refresh — memoize the
+  // previews alongside the filter so a group toggle doesn't re-stringify.
+  const previews = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const e of shown) map.set(e.id, payloadPreview(e.payload));
+    return map;
+  }, [shown]);
 
   return (
     <>
@@ -120,7 +131,7 @@ export function EventFeed({ events, emptyText = "等待事件中…" }: { events
       <div className="feed">
         {shown.map((e) => {
           const label = EVENT_LABELS[e.type];
-          const preview = payloadPreview(e.payload);
+          const preview = previews.get(e.id) ?? "";
           return (
             <div className="feed-item" key={e.id}>
               <span className="type" title={e.type}>

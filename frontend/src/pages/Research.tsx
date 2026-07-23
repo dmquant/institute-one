@@ -8,8 +8,6 @@ import {
   listResearchQueue,
   readWorkspaceFile,
   researchTick,
-  type ResearchItem,
-  type ResearchItemDetail,
 } from "../api";
 import { useSSE } from "../useSSE";
 import {
@@ -24,20 +22,12 @@ import {
   useLoad,
 } from "../ui";
 
-type ResearchAssociations = {
-  thesis_id?: string | null;
-  security_id?: string | null;
-};
-
-type LinkedResearchItem = ResearchItem & ResearchAssociations;
-type LinkedResearchItemDetail = ResearchItemDetail & ResearchAssociations;
-
 export default function Research() {
   const { itemId } = useParams();
   const navigate = useNavigate();
   const { lastEvent } = useSSE({ types: ["research", "workflow"], max: 1 });
   const queue = useLoad(
-    () => listResearchQueue(undefined, 100).then((items) => items as LinkedResearchItem[]),
+    () => listResearchQueue(undefined, 100),
     [lastEvent?.id ?? 0],
     20000,
   );
@@ -249,7 +239,7 @@ export default function Research() {
 function ItemDetail({ itemId, onClose }: { itemId: string; onClose: () => void }) {
   const { lastEvent } = useSSE({ types: ["research", "workflow", "task"], max: 1 });
   const item = useLoad(
-    () => getResearchItem(itemId).then((result) => result as LinkedResearchItemDetail),
+    () => getResearchItem(itemId),
     [itemId, lastEvent?.id ?? 0],
     15000,
   );
