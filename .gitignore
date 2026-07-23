@@ -11,6 +11,7 @@ obsidian-plugin/node_modules/
 .ruff_cache/
 .kiro/
 .claude/
+.qoder/
 *.egg-info/
 .DS_Store
 # per-task agent running log; its own header says it must never be committed

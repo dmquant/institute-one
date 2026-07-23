@@ -10,10 +10,12 @@
 - `./scripts/start.sh` / `./scripts/stop.sh`: run or stop the local server at `127.0.0.1:8100`.
 - `.venv/bin/python -m pytest tests -q`: run the pytest suite using the echo hand.
 - `.venv/bin/python -m compileall app -q`: quick backend syntax check.
+- `.venv/bin/ruff check app tests scripts`: Python linting (imports, syntax, common mistakes; uses pyproject.toml rules).
+- `cd frontend && npm run build`: type-check and build the SPA into `frontend/dist`. This is also the TypeScript type-check command.
 - `cd frontend && npm run dev`: start the Vite dev server.
-- `cd frontend && npm run build`: type-check and build the SPA into `frontend/dist`.
 - `cd obsidian-plugin && npm run dev`: rebuild the plugin in watch mode.
 - `cd obsidian-plugin && npm run build`: type-check and bundle the plugin. `obsidian-plugin/main.js` is a committed build artifact — rebuild and commit it together with `src/` changes.
+- `./scripts/install-hooks.sh` (opt-in): point `core.hooksPath` at the committed `scripts/git-hooks/` pre-commit gate (ruff + compileall on staged Python, `tsc` on staged SPA sources, stale-`main.js` check for plugin changes).
 
 ## Coding Style & Naming Conventions
 

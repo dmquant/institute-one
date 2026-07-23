@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Local pre-commit gate (opt-in: scripts/install-hooks.sh sets core.hooksPath).
+# Fast checks only — the full pytest suite stays a manual/CI-of-one step.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+staged() { git diff --cached --name-only --diff-filter=ACMR; }
+
+# Python: lint + syntax when any backend/tests/scripts file is staged
+if staged | grep -qE '^(app|tests|scripts)/.*\.py$'; then
+  if [ -x .venv/bin/ruff ]; then
+    .venv/bin/ruff check app tests scripts
+  else
+    echo "pre-commit: .venv/bin/ruff missing — run scripts/install.sh" >&2
+    exit 1
+  fi
+  .venv/bin/python -m compileall app -q
+fi
+
+# Frontend: type-check when SPA sources are staged (tsconfig has noEmit)
+if staged | grep -q '^frontend/src/' && [ -x frontend/node_modules/.bin/tsc ]; then
+  (cd frontend && node_modules/.bin/tsc)
+fi
+
+# obsidian-plugin/main.js is a committed build artifact: staging src/ changes
+# without a rebuilt main.js would ship a stale plugin (AGENTS.md rule)
+if staged | grep -q '^obsidian-plugin/src/' && ! staged | grep -q '^obsidian-plugin/main.js$'; then
+  echo "pre-commit: obsidian-plugin/src changed but main.js is not staged —" >&2
+  echo "  run 'cd obsidian-plugin && npm run build' and 'git add obsidian-plugin/main.js'" >&2
+  exit 1
+fi

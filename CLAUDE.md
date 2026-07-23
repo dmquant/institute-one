@@ -8,13 +8,16 @@ Single-node AI research institute: FastAPI + asyncio + SQLite, one process. AI a
 ./scripts/install.sh                         # bootstrap: venv (pip install -e ".[dev]") + npm deps
 .venv/bin/python -m pytest tests -q          # test suite (echo hand, no quota; asyncio_mode=auto — no marks needed)
 .venv/bin/python -m compileall app -q        # syntax check
+.venv/bin/ruff check app tests scripts       # Python linting (imports/syntax/common mistakes; uses pyproject.toml rules)
 ./scripts/start.sh | ./scripts/stop.sh       # server on 127.0.0.1:8100 (log: ~/.institute-one/logs/server.log)
 .venv/bin/python -m app.cli start|stop|status|doctor  # operator CLI; doctor = offline read-only health report (the `institute` console script appears after a re-`pip install -e`)
 ./scripts/install-service.sh [--activate]    # render the launchd plist (com.institute-one.server); --activate also bootstraps+enables
 ./scripts/uninstall-service.sh               # bootout the launchd job and remove the plist (plist kept if unload fails)
-cd frontend && npm run build                 # SPA → frontend/dist (server restart picks it up); npm run dev = Vite dev server
+cd frontend && npm run dev                   # Vite dev server (SPA only; not a type-check)
+cd frontend && npm run build                 # SPA → frontend/dist + TypeScript type-check (server restart picks it up)
 cd obsidian-plugin && npm run build          # plugin → main.js
 ./scripts/install-plugin.sh /path/to/Vault   # deploy plugin
+./scripts/install-hooks.sh                   # opt-in local pre-commit gate (ruff/compileall/tsc + plugin main.js sync check)
 ```
 
 **Before restarting the server**: check `curl -s localhost:8100/api/tasks/queue` — a restart orphans running CLI tasks. Restart only when queued+running is 0, or accept the orphan recovery.
@@ -94,4 +97,4 @@ cd obsidian-plugin && npm run build          # plugin → main.js
 - Managed regions (`write_note(..., region=True)`): only the text between `%% institute:begin %%`/`%% institute:end %%` markers is owned and replaced; hand-written text outside survives regeneration. Any marker damage/edit falls back to a conflict sibling (never clobber).
 - `obsidian-plugin/main.js` is a committed build artifact — after editing plugin src, `npm run build` and commit `main.js` with the `.ts` changes. The roadmap backend/API now persists live card state in SQLite; `roadmap/backlog.json` remains the seed/import/export artifact bundled by the plugin.
 - `design/` exists locally but is deliberately gitignored — roadmap cards link into it; read it for context, never commit it.
-- No linter/formatter is configured (Python or TS) — match surrounding style; the npm builds double as the TS type check.
+- Ruff is configured for Python (see `pyproject.toml`; `pip install -e ".[dev]"` provides `.venv/bin/ruff`) — no formatter, so match surrounding style; the npm builds double as the TS type check.
