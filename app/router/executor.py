@@ -4,6 +4,11 @@
 autonomous loops. Every invocation is a row in the ``tasks`` table (the audit
 spine). There is no queue service and no polling: dispatch is a function call
 under semaphores, completion is a function return plus a bus event.
+Rows that must pre-exist inside a caller's own transaction (pre-booked work:
+factcheck verification bookings, mailbox dispatches, canonical revival
+children) are INSERTed through ``book_prepared()`` — one canonical column
+list — then driven by ``submit_prepared()``, the same execution core and
+``_running`` registration entered one layer in.
 
 Concurrency: one global semaphore (settings.max_concurrent) plus one mutex per
 hand (a CLI binary runs at most one task at a time), acquired hand-mutex first
@@ -18,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,6 +31,7 @@ from .. import bus, db
 from ..config import get_settings
 from ..hands.base import OnChunk
 from ..hands.registry import get_registry
+from ..util import new_id
 
 log = logging.getLogger("institute.executor")
 
@@ -172,27 +177,71 @@ def compact_error(text: str, cap: int = 1000) -> str:
     return f"{text[:head_budget].rstrip()}\n…\n{text[-tail_budget:].lstrip()}"[:cap]
 
 
-def _queued_row_statement(
+def _prepared_row_statement(
     *, task_id: str, hand: str, prompt: str, source: str, model: str | None,
     session_id: str | None, parent_run_id: str | None, workspace: Path, timeout_s: int,
     fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
-    revived_from_task_id: str | None = None,
+    revived_from_task_id: str | None = None, mailbox_dispatch_id: int | None = None,
+    status: str = "queued", error: str | None = None,
+    now: str | None = None, finished_at: str | None = None,
 ) -> tuple[str, tuple[Any, ...]]:
-    # fallback_chain/lineage_root persist the caller's actual execution policy
-    # and retry ancestry (0024): the retry endpoint replays the STORED chain
-    # instead of re-deriving it from live settings, and the 0024 partial
-    # unique index on lineage_root arbitrates duplicate live retries — this
-    # INSERT raises IntegrityError when the lineage already has a live task.
+    # THE canonical tasks INSERT: ONE column list for every pre-booked row
+    # (submit/spawn, factcheck bookings, mailbox dispatches, canonical revival
+    # children, born-terminal overcommitted rows). Per-site extra columns are
+    # optional parameters, never a forked column list — a new tasks column is
+    # mirrored here once. fallback_chain/lineage_root persist the caller's
+    # actual execution policy and retry ancestry (0024): the retry endpoint
+    # replays the STORED chain instead of re-deriving it from live settings,
+    # and the 0024 partial unique index on lineage_root arbitrates duplicate
+    # live retries — this INSERT raises IntegrityError when the lineage
+    # already has a live task.
+    created = now or bus.now_iso()
     return (
         """INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source,
                               parent_run_id, workspace_dir, timeout_s, fallback_chain,
-                              lineage_root, revived_from_task_id, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (task_id, session_id, hand, model, prompt, "queued", source,
+                              lineage_root, revived_from_task_id, mailbox_dispatch_id,
+                              error, created_at, finished_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (task_id, session_id, hand, model, prompt, status, source,
          parent_run_id, str(workspace), timeout_s,
          None if fallback_chain is None else json.dumps(list(fallback_chain)),
-         lineage_root, revived_from_task_id, bus.now_iso()),
+         lineage_root, revived_from_task_id, mailbox_dispatch_id, error,
+         created, finished_at),
     )
+
+
+async def book_prepared(
+    *, task_id: str, hand: str, prompt: str, source: str, model: str | None = None,
+    session_id: str | None = None, parent_run_id: str | None = None,
+    workspace: Path, timeout_s: int,
+    fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
+    revived_from_task_id: str | None = None, mailbox_dispatch_id: int | None = None,
+    conn: Any | None = None,
+) -> None:
+    """INSERT one born-'queued' task row — the public pre-booking entry point.
+
+    Every pre-booked row shares the canonical column list
+    (``_prepared_row_statement``); per-site extras (``revived_from_task_id``
+    for canonical revival children, ``mailbox_dispatch_id`` for mailbox
+    dispatches) are optional parameters. With ``conn`` the INSERT joins the
+    caller's transaction (domain claim + task row commit together) and the
+    caller emits task.queued AFTER commit — bus.emit under the transaction's
+    write lock would deadlock; without it the row is written and the event
+    emitted here. Booking never drives the row: attach the in-process driver
+    with ``submit_prepared()``.
+    """
+    sql, params = _prepared_row_statement(
+        task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
+        session_id=session_id, parent_run_id=parent_run_id, workspace=workspace,
+        timeout_s=timeout_s, fallback_chain=fallback_chain,
+        lineage_root=lineage_root, revived_from_task_id=revived_from_task_id,
+        mailbox_dispatch_id=mailbox_dispatch_id,
+    )
+    if conn is not None:
+        await _conn_execute(conn, sql, params)
+        return
+    await db.execute(sql, params)
+    await bus.emit("task.queued", "task", task_id, {"hand": hand, "source": source})
 
 
 async def _create_row(
@@ -201,14 +250,12 @@ async def _create_row(
     fallback_chain: Sequence[str] | None = None, lineage_root: str | None = None,
     revived_from_task_id: str | None = None,
 ) -> None:
-    sql, params = _queued_row_statement(
+    await book_prepared(
         task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
         session_id=session_id, parent_run_id=parent_run_id, workspace=workspace,
         timeout_s=timeout_s, fallback_chain=fallback_chain,
         lineage_root=lineage_root, revived_from_task_id=revived_from_task_id,
     )
-    await db.execute(sql, params)
-    await bus.emit("task.queued", "task", task_id, {"hand": hand, "source": source})
 
 
 async def _queued_depth(hand: str) -> int:
@@ -256,17 +303,15 @@ async def _create_overcommitted_row(
     treats it as pending work.
     """
     now = bus.now_iso()
-    await db.execute(
-        """INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source,
-                              parent_run_id, workspace_dir, timeout_s, fallback_chain,
-                              lineage_root, error, created_at, finished_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (task_id, session_id, hand, model, prompt, "overcommitted", source,
-         parent_run_id, str(workspace), timeout_s,
-         None if fallback_chain is None else json.dumps(list(fallback_chain)),
-         lineage_root,
-         f"hand '{hand}' already has {depth} queued tasks (cap {cap})", now, now),
+    sql, params = _prepared_row_statement(
+        task_id=task_id, hand=hand, prompt=prompt, source=source, model=model,
+        session_id=session_id, parent_run_id=parent_run_id, workspace=workspace,
+        timeout_s=timeout_s, fallback_chain=fallback_chain, lineage_root=lineage_root,
+        status="overcommitted",
+        error=f"hand '{hand}' already has {depth} queued tasks (cap {cap})",
+        now=now, finished_at=now,
     )
+    await db.execute(sql, params)
     await bus.emit(
         "task.overcommitted", "task", task_id,
         {"hand": hand, "source": source, "status": "overcommitted"},
@@ -413,7 +458,7 @@ async def submit(
 ) -> Task:
     """Run a hand and wait for the result. THE way to invoke a model."""
     settings = get_settings()
-    task_id = uuid.uuid4().hex[:12]
+    task_id = new_id()
     ws = workspace or (settings.workspaces_dir / "adhoc" / task_id)
     ws.mkdir(parents=True, exist_ok=True)
     over = await _overcommit_depth(hand)
@@ -445,7 +490,7 @@ async def submit(
 async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     """Fire-and-forget submit. Returns the task id immediately."""
     settings = get_settings()
-    task_id = uuid.uuid4().hex[:12]
+    task_id = new_id()
     ws = kwargs.pop("workspace", None) or (settings.workspaces_dir / "adhoc" / task_id)
     ws.mkdir(parents=True, exist_ok=True)
     on_chunk = kwargs.pop("on_chunk", None)
@@ -480,6 +525,31 @@ async def spawn(hand: str, prompt: str, **kwargs: Any) -> str:
     return task_id
 
 
+async def submit_prepared(task_id: str) -> Task:
+    """Drive one pre-booked 'queued' row to a terminal state. THE way to run
+    a task whose row was booked ahead of time (``book_prepared()``).
+
+    The same driver ``submit()`` attaches, entered one layer in because the
+    row already exists: ``_execute``'s conditional queued→running claim, hand
+    mutex + global semaphore, fallback, terminal settle — plus the
+    ``_running`` registration that keeps operator cancel and the shutdown
+    drain working on it. An already-live in-process driver for the same id
+    is joined (shielded, so the joining caller's cancel never kills the
+    owner) instead of doubled; ``_execute``'s conditional claim stays the
+    final arbiter.
+    """
+    active = _running.get(task_id)
+    if active is not None and not active.done():
+        return await asyncio.shield(active)
+    atask = asyncio.ensure_future(_execute(task_id))
+    _register_driver(task_id, atask)
+    try:
+        return await atask
+    finally:
+        if _running.get(task_id) is atask:
+            _running.pop(task_id, None)
+
+
 def _legacy_retry_policy(source: str, requested_hand: str) -> tuple[str, dict[str, Any]]:
     """Rebuild policy only for rows whose persisted fallback_chain is NULL."""
     if source == "research":
@@ -496,7 +566,7 @@ def _respawn_spec(row: dict[str, Any], *, task_id: str | None = None) -> _Respaw
     prepare path both consume this spec; scheduler.py never duplicates task
     row construction or fallback-policy rules.
     """
-    task_id = task_id or uuid.uuid4().hex[:12]
+    task_id = task_id or new_id()
     requested = row["requested_hand"]
     if not requested:
         raise ValueError(f"task {row['id']} has no requested hand")
@@ -654,7 +724,8 @@ async def prepare_respawn_from_row(
             created=False,
         )
 
-    sql, params = _queued_row_statement(
+    await book_prepared(
+        conn=conn,
         task_id=spec.task_id,
         hand=spec.hand,
         prompt=spec.prompt,
@@ -668,7 +739,6 @@ async def prepare_respawn_from_row(
         lineage_root=spec.lineage_root,
         revived_from_task_id=row["id"],
     )
-    await _conn_execute(conn, sql, params)
     return PreparedRespawn(
         task_id=spec.task_id,
         lineage_root=spec.lineage_root,
@@ -948,6 +1018,10 @@ async def recover_orphans(*, drive_prepared: bool = True) -> int:
     immediately after this generic executor pass.  ``drive_prepared=False``
     keeps every database transition but defers model execution to the gated
     scheduler, which is required when booting under maintenance.
+
+    Offline twin: app/cli.py's check_orphans() counts this same queued/running
+    residue (plus research_queue's) over a read-only connection — a
+    status-vocabulary change must land in both.
     """
     recovered = await recover_prepared(drive=drive_prepared)
     mailbox_requeued = await db.execute(

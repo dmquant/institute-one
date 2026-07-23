@@ -17,6 +17,7 @@ import logging
 import math
 import random
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from ..config import Settings
@@ -250,6 +251,47 @@ class HandRegistry:
             return pick.choice(pool)
         w = [x / top for x in w]  # normalize: sum stays finite for any finite inputs
         return pick.choices(pool, weights=w, k=1)[0]
+
+    def pick_weighted(
+        self,
+        scope: str,
+        *,
+        explicit: str | None = None,
+        pool: Iterable[str] | None = None,
+    ) -> str | None:
+        """Shared weighted-pick entry for the four opt-in scope call sites.
+
+        Centralizes the three decisions that had drifted into four inline
+        copies (workflows research policy, mailbox dispatch, whiteboard card,
+        analyst daily rotation):
+
+        - ``explicit`` always wins: a step/analyst-pinned hand is returned
+          unchanged, whether or not the feature switch is on (weights never
+          override a pinned hand).
+        - Feature switch: ``settings.enable_hand_weights`` off -> None, i.e.
+          "no opinion"; the caller keeps its own pre-weights fallback
+          (round-robin, default hand, ...).
+        - Pool source stays the caller's choice: ``pool=None`` means "the
+          scope's positive weight rows" (mailbox/whiteboard semantics); an
+          explicit ``pool`` keeps the caller's candidate list (research hand
+          chain, daily ROTATION_HANDS). Either way the pool is filtered
+          through ``is_available`` before ``pick_weighted_hand`` samples it.
+
+        Returns the picked hand, or None when the switch is off or the live
+        pool is empty — callers keep their existing fallbacks either way.
+        """
+        if explicit:
+            return explicit
+        if not self.settings.enable_hand_weights:
+            return None
+        if pool is None:
+            candidates = [
+                h for h, w in self.weights_snapshot().get(scope, {}).items() if w > 0
+            ]
+        else:
+            candidates = [h for h in pool if h]
+        live = [h for h in candidates if self.is_available(h)]
+        return self.pick_weighted_hand(scope, live)
 
     # ---- introspection -------------------------------------------------------
     def status_snapshot(self) -> list[dict]:

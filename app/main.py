@@ -57,20 +57,10 @@ async def _drain_background(
     scheduler job submitting one last executor task before it hits its next
     await) is picked up and cancelled by round 2.
     """
-    from .institute import analyst_daily, archive, bilingual, mailbox, research, whiteboard, workflows
+    from .background import all_background_tasks
 
     def _registered() -> set[asyncio.Task]:
-        return (
-            set(executor._running.values())
-            | set(workflows._driving)
-            | set(whiteboard._bg_tasks)
-            | set(mailbox._bg_tasks)
-            | set(analyst_daily._background)
-            | set(research._bg_tasks)
-            | set(archive._bg_tasks)
-            | set(bilingual._bg_tasks)
-            | (extra or set())
-        )
+        return all_background_tasks() | (extra or set())
 
     seen: set[asyncio.Task] = set()
     for sweep in (1, 2):
@@ -184,11 +174,19 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _unhandled(request, exc):  # noqa: ANN001
+        # full traceback goes to the server log; the response deliberately
+        # carries no str(exc) — raw exception text can leak local paths, SQL
+        # fragments or prompt content to any client on the bind
         log.exception("unhandled error on %s", request.url.path)
         transient = "locked" in str(exc).lower() or "busy" in str(exc).lower()
         return JSONResponse(
             status_code=500,
-            content={"error": type(exc).__name__, "message": str(exc), "path": request.url.path, "transient": transient},
+            content={
+                "error": type(exc).__name__,
+                "message": "internal error — see the server log for details",
+                "path": request.url.path,
+                "transient": transient,
+            },
         )
 
     from .api import (
