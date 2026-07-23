@@ -31,11 +31,11 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 
 MARKETS = {"CN_A", "HK", "US", "GLOBAL_CONTEXT"}
 # open set in the schema (an additive-only migration cannot widen a CHECK);
@@ -55,10 +55,6 @@ class TransitionConflict(MarketDataError):
 
 
 # ---- helpers ---------------------------------------------------------------
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _validate_enum(value: Any, allowed: set[str], label: str) -> None:
     if value not in allowed:
@@ -249,7 +245,7 @@ async def add_suspension(
         if end_date < start_date:
             raise MarketDataError(f"end_date {end_date} is before start_date {start_date}")
     await _check_security(security_id)
-    sid = _new_id()
+    sid = new_id()
     now = bus.now_iso()
     try:
         await db.execute(
@@ -384,7 +380,7 @@ async def upsert_bar(fields: dict[str, Any]) -> dict[str, Any]:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(security_id, freq, bar_date, as_known_at) DO NOTHING",
             (
-                _new_id(), security_id, freq, bar_date, prices["open"], prices["high"], prices["low"],
+                new_id(), security_id, freq, bar_date, prices["open"], prices["high"], prices["low"],
                 prices["close"], volume, adj_factor, valid_time, as_known_at, source, _dumps(metadata),
                 bus.now_iso(),
             ),
@@ -553,7 +549,7 @@ async def upsert_benchmark_mark(
             "INSERT INTO benchmark_marks (id, benchmark_id, mark_date, value, valid_time, as_known_at, "
             "source, metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(benchmark_id, mark_date, as_known_at) DO NOTHING",
-            (_new_id(), benchmark_id, mark_date, value, valid_time, as_known_at, source, _dumps(metadata),
+            (new_id(), benchmark_id, mark_date, value, valid_time, as_known_at, source, _dumps(metadata),
              bus.now_iso()),
         )
     except sqlite3.IntegrityError as exc:

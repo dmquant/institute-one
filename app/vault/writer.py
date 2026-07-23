@@ -332,14 +332,17 @@ class VaultWriter:
         if row and new_sha == row["sha256"] and target.exists():
             return rel  # rule (d): unchanged
 
+        # File reads/hashes/atomic writes run in a worker thread: bus handlers
+        # await these writes inline, so synchronous disk IO would stall the
+        # emitter's event loop (loop-fix: artifact-completion hot path).
         if row and target.exists():
-            disk_sha = _sha_file(target)
+            disk_sha = await asyncio.to_thread(_sha_file, target)
             if disk_sha is not None and disk_sha != row["sha256"]:
                 # rule (c): human edited — never overwrite, write a sibling instead
                 p = PurePosixPath(rel)
                 alt_rel = str(p.parent / f"{p.stem} (institute update {work_date()}){p.suffix}")
                 assert self._root is not None
-                _atomic_write(self._root / alt_rel, content)
+                await asyncio.to_thread(_atomic_write, self._root / alt_rel, content)
                 await db.execute(
                     "UPDATE vault_index SET state='conflict', written_at=? WHERE path=?",
                     (bus.now_iso(), rel),
@@ -349,7 +352,7 @@ class VaultWriter:
                 log.warning("vault conflict on %s; wrote %s", rel, alt_rel)
                 return alt_rel
 
-        _atomic_write(target, content)
+        await asyncio.to_thread(_atomic_write, target, content)
         await self._upsert(rel, artifact_kind, artifact_id, new_sha, "clean")
         log.info("vault write: %s (%s %s)", rel, artifact_kind, artifact_id)
         return rel
@@ -393,7 +396,9 @@ class VaultWriter:
         )
 
         exists = target.exists()
-        disk_text = _read_exact(target) if exists else None  # None: missing OR unreadable
+        # threaded read: notes can embed a full report, and bus handlers await
+        # these writes inline (same off-loop rule as _write_note_locked)
+        disk_text = await asyncio.to_thread(_read_exact, target) if exists else None  # None: missing OR unreadable
         disk_region = _extract_region(disk_text) if disk_text is not None else None
         # in-place eligibility: strict markers + ownership marker still present
         disk_ok = disk_region is not None and _has_ownership(disk_text or "")
@@ -411,7 +416,7 @@ class VaultWriter:
         )
 
         if not exists:
-            _atomic_write(target, fresh)
+            await asyncio.to_thread(_atomic_write, target, fresh)
             await self._upsert(rel, artifact_kind, artifact_id, region_sha, "clean", mode="region")
             log.info("vault write (region): %s (%s %s)", rel, artifact_kind, artifact_id)
             return rel
@@ -419,15 +424,18 @@ class VaultWriter:
         if disk_ok and row and _sha_text(disk_region) == row["sha256"]:
             # structure strict, ownership intact, region bytes exactly as we
             # left them -> swap the region only; all other bytes survive
-            _atomic_write(target, _replace_region(disk_text, body_text))
+            await asyncio.to_thread(_atomic_write, target, _replace_region(disk_text, body_text))
             await self._upsert(rel, artifact_kind, artifact_id, region_sha, "clean", mode="region")
             log.info("vault write (region): %s (%s %s)", rel, artifact_kind, artifact_id)
             return rel
 
-        if disk_text is not None and disk_region is None and row and _sha_file(target) == row["sha256"]:
+        if (
+            disk_text is not None and disk_region is None and row
+            and await asyncio.to_thread(_sha_file, target) == row["sha256"]
+        ):
             # marker-less file byte-identical to its ledger entry: an institute
             # whole-file note with no human edits -> safe to upgrade in place
-            _atomic_write(target, fresh)
+            await asyncio.to_thread(_atomic_write, target, fresh)
             await self._upsert(rel, artifact_kind, artifact_id, region_sha, "clean", mode="region")
             log.info("vault write (region upgrade): %s (%s %s)", rel, artifact_kind, artifact_id)
             return rel
@@ -438,7 +446,7 @@ class VaultWriter:
         # or a file we cannot even decode -> rule (c) conflict sibling
         alt_rel = self._fresh_sibling(rel)
         assert self._root is not None
-        _atomic_write(self._root / alt_rel, fresh)
+        await asyncio.to_thread(_atomic_write, self._root / alt_rel, fresh)
         if row:
             await db.execute(
                 "UPDATE vault_index SET state='conflict', written_at=? WHERE path=?",
@@ -455,32 +463,14 @@ class VaultWriter:
         if self._root is None:
             return None
         rows = await db.query("SELECT path, sha256, state, mode FROM vault_index")
-        counts = {"total": len(rows), "clean": 0, "conflict": 0, "missing": 0, "drifted": 0}
-        for r in rows:
-            path = self._root / r["path"]
-            if not path.exists():
-                counts["missing"] += 1
-            elif r["state"] == "conflict":
-                counts["conflict"] += 1
-            elif r["mode"] == "region":
-                # region rows hash the exact region text only: annotations
-                # outside the markers are legitimate; an edited region,
-                # malformed/duplicated markers, a removed ownership line or an
-                # undecodable file is drift
-                text = _read_exact(path)
-                if text is None:
-                    # deleted between exists() and read (race) vs unreadable
-                    counts["missing" if not path.exists() else "drifted"] += 1
-                    continue
-                region = _extract_region(text)
-                if region is None or _sha_text(region) != r["sha256"] or not _has_ownership(text):
-                    counts["drifted"] += 1
-                else:
-                    counts["clean"] += 1
-            elif _sha_file(path) != r["sha256"]:
-                counts["drifted"] += 1
-            else:
-                counts["clean"] += 1
+        # The scan reads + hashes every ledgered file — seconds of synchronous
+        # IO on a big vault, and POST /api/vault/doctor awaits this on the
+        # event loop. Run the operator sweep's own classification pass in a
+        # worker thread: ONE shared implementation (the old per-row mirror
+        # here has been deleted), never a blocked loop (loop-fix P8a).
+        from ..institute.operator import _classify_vault_rows  # lazy: domain module
+
+        counts, _nonclean = await asyncio.to_thread(_classify_vault_rows, self._root, rows)
         return counts
 
 

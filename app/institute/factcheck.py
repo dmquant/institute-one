@@ -53,7 +53,6 @@ cron health sees them; per-row failures are absorbed inside).
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -62,12 +61,12 @@ import re
 import struct
 import uuid
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..util import new_id, read_text, session_workspace
 from . import vectors
 from .prompts import date_anchor, work_date
 
@@ -213,26 +212,9 @@ def _now_plus_days(days: float) -> str:
 
 
 def _daily_cap() -> int:
-    # A missing/None/invalid setting falls back to the documented default.
-    try:
-        return max(0, int(getattr(get_settings(), "factcheck_daily_cap", DEFAULT_DAILY_CAP)))
-    except (TypeError, ValueError):
-        return DEFAULT_DAILY_CAP
-
-
-def _extract_hand() -> str:
-    """Cheap-hand routing for extraction (ROADMAP: opencode/cheap hand).
-    An optional settings extension can override it; missing or empty falls
-    back to the default hand (tests: echo)."""
-    s = get_settings()
-    return str(getattr(s, "factcheck_extract_hand", "") or "") or s.default_hand
-
-
-def _verify_hand() -> str:
-    """Websearch-capable hand for verification (ROADMAP: claude/gemini with
-    web access). Same defensive-read contract as _extract_hand."""
-    s = get_settings()
-    return str(getattr(s, "factcheck_verify_hand", "") or "") or s.default_hand
+    # None (unset) falls back to the documented default.
+    raw = get_settings().factcheck_daily_cap
+    return DEFAULT_DAILY_CAP if raw is None else max(0, raw)
 
 
 # ---- reuse policy ------------------------------------------------------------
@@ -524,7 +506,7 @@ async def extract_claims(
         f"{date_anchor()}\n\n"
         + CLAIM_EXTRACT_PROMPT.format(max_claims=MAX_CLAIMS_PER_SOURCE, text=text[:EXTRACT_TEXT_CAP])
     )
-    task = await executor.submit(_extract_hand(), prompt, source=SOURCE)
+    task = await executor.submit(get_settings().default_hand, prompt, source=SOURCE)
     if task.status != "completed":
         log.warning("claim extraction task %s ended %s for %s %s",
                     task.id, task.status, source_kind, source_ref)
@@ -536,7 +518,7 @@ async def extract_claims(
         vec = await vectors.embed(claim)
         state, related_fact_id, sim = await _reuse_state(claim, vec, category)
         status = {"fresh": "pending", "reused": "reused", "self_contradicted": "self_contradicted"}[state]
-        card_id = uuid.uuid4().hex[:12]
+        card_id = new_id()
         row = {
             "id": card_id, "source_kind": source_kind, "source_ref": str(source_ref),
             "analyst_id": analyst_id or None, "claim": claim, "category": category,
@@ -762,13 +744,13 @@ async def _book_verification(
     if cap <= 0:
         return None, "budget"
     settings = get_settings()
-    task_id = uuid.uuid4().hex[:12]
+    task_id = new_id()
     workspace = settings.workspaces_dir / "adhoc" / task_id
     prompt = (
         f"{date_anchor()}\n\n"
         + CLAIM_VERIFY_PROMPT.format(claim=_quote_material(card["claim"]), category=card["category"])
     )
-    hand = _verify_hand()
+    hand = settings.default_hand
     key = _attempts_key()
     try:
         async with db.transaction() as conn:
@@ -789,15 +771,12 @@ async def _book_verification(
             )
             if cur.rowcount == 0:
                 raise _BookingRefused("lost")
-            # the executor row shape (_create_row), born 'queued' inside OUR
-            # transaction; the task.queued event is emitted post-commit
-            # (bus.emit inside transaction() would deadlock)
-            await conn.execute(
-                "INSERT INTO tasks (id, session_id, requested_hand, model, prompt, status, source, "
-                "parent_run_id, workspace_dir, timeout_s, fallback_chain, lineage_root, created_at) "
-                "VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?,?)",
-                (task_id, None, hand, None, prompt, SOURCE, None, str(workspace),
-                 settings.default_timeout_s, None, None, bus.now_iso()),
+            # the executor row shape (executor.book_prepared), born 'queued'
+            # inside OUR transaction; the task.queued event is emitted
+            # post-commit (bus.emit inside transaction() would deadlock)
+            await executor.book_prepared(
+                conn=conn, task_id=task_id, hand=hand, prompt=prompt, source=SOURCE,
+                workspace=workspace, timeout_s=settings.default_timeout_s,
             )
     except _BookingRefused as refusal:
         return None, refusal.reason
@@ -808,21 +787,15 @@ async def _book_verification(
 
 async def _run_verification_task(task_id: str) -> executor.Task:
     """Drive one pre-booked queued verification task through the executor
-    core: _execute() is the executor's own claim-and-run layer (conditional
-    queued→running claim, hand mutex + global semaphore, fallback, terminal
-    settle) — the ONE execution path, entered one layer in because
+    core: submit_prepared() attaches the executor's own claim-and-run driver
+    (_execute's conditional queued→running claim, hand mutex + global
+    semaphore, fallback, terminal settle) to the row our booking transaction
+    created — the ONE execution path, entered one layer in because
     submit()/spawn() insist on creating their own rows and R4 P1 requires
-    the row to pre-exist in the booking transaction. The _running
-    registration mirrors submit()'s body exactly, so operator cancel and the
-    shutdown drain keep working on in-flight verifications. Deliberate,
-    documented private-API use; a public executor.submit_prepared(task_id)
-    is the follow-up once executor.py unfreezes (PATCH-NOTES-LOOP-P3 R4)."""
-    atask = asyncio.ensure_future(executor._execute(task_id))  # noqa: SLF001 - see docstring
-    executor._running[task_id] = atask  # noqa: SLF001
-    try:
-        return await atask
-    finally:
-        executor._running.pop(task_id, None)  # noqa: SLF001
+    the row to pre-exist in the booking transaction. The registration keeps
+    operator cancel and the shutdown drain working on in-flight
+    verifications."""
+    return await executor.submit_prepared(task_id)
 
 
 async def _claim_card(card_id: str) -> str | None:
@@ -913,7 +886,7 @@ async def _settle_exhausted_card(
             "verdict=excluded.verdict, evidence=excluded.evidence, "
             "source_urls=excluded.source_urls, work_date=excluded.work_date, "
             "verified_at=excluded.verified_at, expires_at=excluded.expires_at",
-            (uuid.uuid4().hex[:12], card_id, "UNVERIFIABLE", evidence, "[]",
+            (new_id(), card_id, "UNVERIFIABLE", evidence, "[]",
              work_date(), now, _now_plus_days(ttl_days)),
         )
     log.warning("card %s exhausted %d verification attempts; settled unverifiable",
@@ -957,7 +930,7 @@ async def _quarantine_verification_binding(
             "verdict=excluded.verdict, evidence=excluded.evidence, "
             "source_urls=excluded.source_urls, work_date=excluded.work_date, "
             "verified_at=excluded.verified_at, expires_at=excluded.expires_at",
-            (uuid.uuid4().hex[:12], card["id"], "UNVERIFIABLE", evidence, "[]",
+            (new_id(), card["id"], "UNVERIFIABLE", evidence, "[]",
              work_date(), now, _now_plus_days(ttl_days)),
         )
     log.error("quarantined fact card %s: %s", card["id"], reason)
@@ -1073,7 +1046,7 @@ async def _settle_completed_verification(
     policy = await get_reuse_policy()
     ttl_days = float(policy.get(card["category"], policy["other"])["ttl_days"])
     now = bus.now_iso()
-    fact_id = uuid.uuid4().hex[:12]
+    fact_id = new_id()
     status = verdict.lower()  # VERIFIED→verified / DISPUTED→disputed / UNVERIFIABLE→unverifiable
     outbox_id: str | None = None
     event_outbox_id: str | None = None
@@ -1235,7 +1208,7 @@ async def _enqueue_dispute_outbox(
     recipient_id = str(card.get("analyst_id") or "")
     if not recipient_id:
         return None
-    outbox_id = uuid.uuid4().hex[:12]
+    outbox_id = new_id()
     dispute_id = f"{kind}:{card['id']}:{_dispute_generation(card, kind)}"
     payload = json.dumps(
         _dispute_payload(
@@ -1276,7 +1249,7 @@ async def _enqueue_dispute_event(
     DETERMINISTIC mailbox thread id the sibling mailbox intent will
     materialize (factcheck-<outbox id>), or None when the card has no
     analyst — same shape consumers always saw."""
-    outbox_id = uuid.uuid4().hex[:12]
+    outbox_id = new_id()
     dispute_id = f"{kind}:{card['id']}:{_dispute_generation(card, kind)}"
     payload = _dispute_payload(
         card, kind=kind, verdict_label=verdict_label,
@@ -1649,7 +1622,7 @@ async def enqueue_extraction(
         "INSERT OR IGNORE INTO fact_extract_queue "
         "(id, source_kind, source_ref, analyst_id, status, created_at) "
         "VALUES (?,?,?,?,'pending',?)",
-        (uuid.uuid4().hex[:12], source_kind, str(source_ref), analyst_id or None, bus.now_iso()),
+        (new_id(), source_kind, str(source_ref), analyst_id or None, bus.now_iso()),
     )
     return bool(n)
 
@@ -1689,26 +1662,6 @@ def register() -> None:
 
 # ---- source text resolution ------------------------------------------------------
 
-def _read_text(path: Path) -> str | None:
-    try:
-        if path.is_file():
-            return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        log.warning("could not read %s", path)
-    return None
-
-
-async def _session_workspace(session_id: Any) -> Path | None:
-    if not session_id:
-        return None
-    row = await db.query_one("SELECT workspace_dir FROM sessions WHERE id = ?", (str(session_id),))
-    if row and row["workspace_dir"]:
-        ws = Path(row["workspace_dir"]).expanduser()
-        if ws.is_dir():
-            return ws
-    return None
-
-
 async def _source_text(row: dict[str, Any]) -> str | None:
     """The text to extract claims from, for one queue row. None == no source
     (unknown ref / nothing readable) — the row is marked failed, not retried."""
@@ -1720,9 +1673,9 @@ async def _source_text(row: dict[str, Any]) -> str | None:
         board = await db.query_one(
             "SELECT session_id FROM whiteboard_boards WHERE id = ?", (card["board_id"],)
         )
-        ws = await _session_workspace(board["session_id"]) if board else None
+        ws = await session_workspace(board["session_id"]) if board else None
         if ws and card["output_file"]:
-            text = _read_text(ws / str(card["output_file"]))
+            text = read_text(ws / str(card["output_file"]))
             if text and text.strip():
                 return text
         return (card["summary"] or "").strip() or None
@@ -1735,9 +1688,9 @@ async def _source_text(row: dict[str, Any]) -> str | None:
             run = await db.query_one(
                 "SELECT session_id FROM workflow_runs WHERE id = ?", (item["run_id"],)
             )
-        ws = await _session_workspace(run["session_id"]) if run else None
+        ws = await session_workspace(run["session_id"]) if run else None
         if ws:
-            text = _read_text(ws / RESEARCH_REPORT_FILE)
+            text = read_text(ws / RESEARCH_REPORT_FILE)
             if text and text.strip():
                 return text
         if item["run_id"]:

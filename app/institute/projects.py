@@ -24,10 +24,10 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-import uuid
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 from .digests import clamp_md
 from .prompts import work_date
 
@@ -69,7 +69,7 @@ async def create(name: str, description: str = "") -> dict[str, Any]:
         raise ValueError(f"project name exceeds {MAX_NAME_LEN} chars ({len(name)})")
     if len(description) > MAX_DESCRIPTION_LEN:
         raise ValueError(f"description exceeds {MAX_DESCRIPTION_LEN} chars ({len(description)})")
-    project_id = uuid.uuid4().hex[:12]
+    project_id = new_id()
     try:
         await db.execute(
             "INSERT INTO projects (id, name, description, status, created_at) "

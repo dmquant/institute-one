@@ -23,13 +23,13 @@ import json
 import logging
 import re
 import sqlite3
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..util import new_id
 from .analysts import Analyst, get_analyst
 from .prompts import build_analyst_prompt
 
@@ -399,7 +399,7 @@ async def create_group(
     description = (description or "").strip()
     if len(description) > GROUP_DESCRIPTION_MAX:
         raise ValueError(f"description exceeds {GROUP_DESCRIPTION_MAX} chars ({len(description)})")
-    group_id = uuid.uuid4().hex[:12]
+    group_id = new_id()
     now = bus.now_iso()
     try:
         await db.execute(
@@ -542,7 +542,7 @@ async def start_run(
         raise ValueError("prompt must not be empty")
     roster = _roster(agents)
     settings = get_settings()
-    run_id = uuid.uuid4().hex[:12]
+    run_id = new_id()
     await db.execute(
         "INSERT INTO multi_agent_runs (id, group_id, agents, mode, prompt, status, task_ids, created_at) "
         "VALUES (?,?,?,?,?,'running','[]',?)",
@@ -773,7 +773,7 @@ async def open_committee_run(workflow_run_id: str) -> dict[str, Any] | None:
             "INSERT OR IGNORE INTO multi_agent_runs "
             "(id, group_id, workflow_run_id, agents, mode, prompt, status, task_ids, created_at) "
             "VALUES (?,?,?,?,?,?, 'running', '[]', ?)",
-            (uuid.uuid4().hex[:12],
+            (new_id(),
              group["id"] if group else None,
              workflow_run_id,
              json.dumps((group or {}).get("agents") or [], ensure_ascii=False),

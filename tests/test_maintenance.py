@@ -19,6 +19,9 @@ async def _store_switches(switches: dict[str, bool]) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (json.dumps({"version": 1, "switches": switches}),),
     )
+    # the direct write bypasses the CAS PUT, so the scheduler's ~5s admin_state
+    # cache must be dropped by hand (production write paths invalidate themselves)
+    scheduler.invalidate_admin_state_cache("feature_switches")
 
 
 # ---- API round-trip ---------------------------------------------------------
@@ -51,6 +54,48 @@ async def test_maintenance_api_roundtrip():
         # body must carry a bool
         r = await client.post("/api/admin/maintenance", json={})
         assert r.status_code == 422
+
+
+# ---- the ~5s admin_state read cache ------------------------------------------
+
+async def test_admin_state_cache_serves_reads_and_expires():
+    """metered() re-reads two admin_state rows per firing; the TTL cache keeps
+    a burst of firings off SQLite. Inside the TTL a cached value is served
+    (an out-of-band write is briefly invisible); after expiry it re-fetches."""
+    assert await scheduler.get_maintenance() is False  # miss: caches the absent row
+
+    # an out-of-band write inside the TTL stays invisible (documented staleness)
+    await db.execute(
+        "INSERT INTO admin_state (key, value) VALUES ('maintenance', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (json.dumps({"paused": True}),),
+    )
+    assert await scheduler.get_maintenance() is False
+
+    # explicit invalidation (what every production write path does) sees it now
+    scheduler.invalidate_admin_state_cache()
+    assert await scheduler.get_maintenance() is True
+
+    # TTL expiry alone re-reads too: age the cached entry past the TTL
+    await db.execute(
+        "UPDATE admin_state SET value = ? WHERE key = 'maintenance'",
+        (json.dumps({"paused": False}),),
+    )
+    ts, value = scheduler._admin_state_cache["maintenance"]
+    scheduler._admin_state_cache["maintenance"] = (
+        ts - 2 * scheduler._ADMIN_STATE_CACHE_TTL_S, value,
+    )
+    assert await scheduler.get_maintenance() is False  # re-fetched after expiry
+
+
+async def test_set_maintenance_invalidates_the_cache():
+    """The production write path: a flip is visible on the very next read, no
+    TTL wait — the pause gate must not lag behind the operator's click."""
+    assert await scheduler.get_maintenance() is False  # warm the cache
+    await scheduler.set_maintenance(True)
+    assert await scheduler.get_maintenance() is True
+    await scheduler.set_maintenance(False)
+    assert await scheduler.get_maintenance() is False
 
 
 # ---- the metered() gate -----------------------------------------------------
@@ -135,10 +180,12 @@ async def test_job_switch_default_is_enabled():
         "UPDATE admin_state SET value = ? WHERE key = 'feature_switches'",
         (json.dumps({"job:probe-sw-default": False}),),  # 3) legacy flat map: OFF
     )
+    scheduler.invalidate_admin_state_cache("feature_switches")  # direct write, like _store_switches
     await probe()
     await db.execute(
         "UPDATE admin_state SET value = '{not json' WHERE key = 'feature_switches'"
     )
+    scheduler.invalidate_admin_state_cache("feature_switches")  # direct write, like _store_switches
     await probe()  # 4) corrupt value fails open
     assert calls == [1, 1, 1]  # ran for 1/2/4, skipped only for the legacy OFF
 

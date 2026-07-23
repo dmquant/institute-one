@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -18,8 +17,10 @@ from .. import bus, db
 from ..config import get_settings
 from ..hands.registry import get_registry
 from ..router import executor
+from ..util import new_id
 from . import sessions
-from .analysts import get_analyst
+from .analysts import get_analyst, roster
+from .claims import claim_admin_state, release_admin_state
 from .prompts import (
     extract_summary,
     previous_steps_block,
@@ -122,6 +123,12 @@ async def get_workflow(workflow_id: str) -> dict[str, Any] | None:
 
 # ---- lazy prompt variables --------------------------------------------------
 
+# Variables the engine computes lazily inside _drive — only when a step prompt
+# references them and the caller passed no explicit value. Callers never have
+# to supply them, so run-variable validation exempts them.
+LAZY_VARIABLES = ("DATA_BUNDLE", "WEEK_DISPUTES", "ANALYST_CATALOG")
+
+
 def _truncate_utf8(text: str, max_bytes: int) -> str:
     raw = text.encode("utf-8")
     if len(raw) <= max_bytes:
@@ -165,7 +172,31 @@ async def week_disputes_variable() -> str:
         return ""
 
 
+def analyst_catalog_variable() -> str:
+    """${ANALYST_CATALOG} value: the closed-list roster catalog the research
+    follow-ups step picks mailbox recipients from. Sync like the roster read
+    itself (catalog JSON, no DB)."""
+    return "\n".join(f"- {a.id}：{a.name}（{a.focus}）" for a in roster())
+
+
 # ---- runs -----------------------------------------------------------------
+
+def _validate_variables(wf: dict[str, Any], variables: dict[str, str]) -> None:
+    """Reject a run missing a declared, non-lazy variable (blank included).
+
+    substitute_variables() leaves ``${NAME}`` literally in the prompt when no
+    value was passed, so e.g. a manual research trigger without TOPIC would
+    otherwise feed the model the raw "${TOPIC}" placeholder. Lazy variables
+    (LAZY_VARIABLES) are computed in _drive and exempt; WORK_DATE is already
+    defaulted by the caller. Raises ValueError — the API layer maps it to 400.
+    """
+    missing = [
+        name for name in wf["variables"]
+        if name not in LAZY_VARIABLES and not str(variables.get(name) or "").strip()
+    ]
+    if missing:
+        raise ValueError(f"workflow {wf['id']} requires variable(s): {', '.join(missing)}")
+
 
 async def _create_run(workflow_id: str, variables: dict[str, str] | None, source: str) -> str:
     wf = await get_workflow(workflow_id)
@@ -173,7 +204,8 @@ async def _create_run(workflow_id: str, variables: dict[str, str] | None, source
         raise ValueError(f"unknown workflow {workflow_id}")
     variables = dict(variables or {})
     variables.setdefault("WORK_DATE", work_date())
-    run_id = uuid.uuid4().hex[:12]
+    _validate_variables(wf, variables)
+    run_id = new_id()
     session = await sessions.create_session(f"{wf['name']} {work_date()}", kind="workflow")
     await db.execute(
         """INSERT INTO workflow_runs (id, workflow_id, session_id, status, variables, source, started_at)
@@ -220,11 +252,31 @@ def committee_week(wd: str | None = None) -> str:
     return f"{y}-W{w:02d}"
 
 
+async def _committee_claim_stale(value: str, key: str) -> bool:
+    """A claimed week is retryable when its recorded run failed/was cancelled
+    (or the run row vanished), or when it never recorded a run_id and is older
+    than COMMITTEE_CLAIM_STALE_S; a corrupt claim must not wedge the week."""
+    try:
+        held = json.loads(value)
+        run_id = held.get("run_id")
+        if run_id:
+            run = await db.query_one(
+                "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
+            )
+            return run is None or run["status"] in ("failed", "cancelled")
+        claimed_at = datetime.fromisoformat(held["claimed_at"])
+        return (
+            datetime.now(timezone.utc) - claimed_at
+        ).total_seconds() > COMMITTEE_CLAIM_STALE_S
+    except (ValueError, KeyError, TypeError):
+        return True  # a corrupt claim must not wedge the week forever
+
+
 async def run_committee_once(*, source: str = "scheduler") -> str | None:
     """Idempotent committee kickoff: at most ONE run per ISO week (SGT).
 
-    Durable atomic claim (hard rule 2): INSERT ... ON CONFLICT DO NOTHING on
-    the admin_state row ``committee:<iso-week>`` makes one winner per week —
+    Durable atomic claim (hard rule 2): the shared claims.py idiom on the
+    admin_state row ``committee:<iso-week>`` makes one winner per week —
     scheduler misfires/coalesce replays, restarts and manual run-now triggers
     all collapse into it. Retry semantics: if the claimed week's run ended
     'failed'/'cancelled' (or the claim never recorded a run_id and is older
@@ -238,47 +290,22 @@ async def run_committee_once(*, source: str = "scheduler") -> str | None:
     """
     week = committee_week()
     key = f"{COMMITTEE_CLAIM_PREFIX}:{week}"
-    token = json.dumps({"status": "claimed", "claimed_at": bus.now_iso()})
-    won = await db.execute(
-        "INSERT INTO admin_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
-        (key, token),
+    claim = await claim_admin_state(
+        key,
+        make_token=lambda: json.dumps({"status": "claimed", "claimed_at": bus.now_iso()}),
+        is_stale=_committee_claim_stale,
     )
-    if not won:
-        row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
-        if row is None:  # released between INSERT and SELECT — don't race it, just skip
-            return None
-        stale = False
-        try:
-            held = json.loads(row["value"])
-            run_id = held.get("run_id")
-            if run_id:
-                run = await db.query_one(
-                    "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
-                )
-                stale = run is None or run["status"] in ("failed", "cancelled")
-            else:
-                claimed_at = datetime.fromisoformat(held["claimed_at"])
-                stale = (
-                    datetime.now(timezone.utc) - claimed_at
-                ).total_seconds() > COMMITTEE_CLAIM_STALE_S
-        except (ValueError, KeyError, TypeError):
-            stale = True  # a corrupt claim must not wedge the week forever
-        if not stale:
-            log.info("committee already ran/running for %s; skipping", week)
-            return None
-        taken = await db.execute(
-            "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
-            (token, key, row["value"]),
-        )
-        if not taken:
-            return None  # lost the takeover race — exactly one retryer wins
+    if claim is None:  # live claim, or lost the takeover race — exactly one retryer wins
+        log.info("committee already ran/running for %s; skipping", week)
+        return None
+    _, token = claim
     try:
         run_id = await run_workflow(
             COMMITTEE_WORKFLOW_ID, variables={"WORK_DATE": work_date()}, source=source,
         )
     except Exception:
         # release our own claim (CAS) so the week stays retryable
-        await db.execute("DELETE FROM admin_state WHERE key = ? AND value = ?", (key, token))
+        await release_admin_state(key, token)
         raise
     recorded = await db.execute(
         "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
@@ -324,11 +351,9 @@ def _workflow_hand_policy(
         # round-robin below): the pool is intersected with research_hand_names
         # (hard rule 10 — weights only reorder INSIDE the chain); an explicit
         # step hand still wins and the fallback chain is unchanged either way.
-        if settings.enable_hand_weights and not step.get("hand"):
-            live = [h for h in hands if get_registry().is_available(h)]
-            picked = get_registry().pick_weighted_hand("research", live)
-            if picked:
-                return picked, hands
+        picked = get_registry().pick_weighted("research", explicit=step.get("hand"), pool=hands)
+        if picked:
+            return picked, hands
         return str(step.get("hand") or hands[step_index % len(hands)]), hands
     return str(step.get("hand") or analyst_hand or settings.default_hand), None
 
@@ -381,6 +406,18 @@ async def _drive(run_id: str) -> None:
                 "UPDATE workflow_runs SET variables = json_set(variables, '$.WEEK_DISPUTES', ?) "
                 "WHERE id = ? AND status = 'running'",
                 (variables["WEEK_DISPUTES"], run_id),
+            )
+        # ${ANALYST_CATALOG}: closed-list roster catalog (research follow-ups
+        # step). Same lazy contract as ${WEEK_DISPUTES}: only computed when a
+        # step prompt references it and no explicit value was passed.
+        if "ANALYST_CATALOG" not in variables and any(
+            isinstance(s, dict) and "${ANALYST_CATALOG}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            variables["ANALYST_CATALOG"] = analyst_catalog_variable()
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.ANALYST_CATALOG', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["ANALYST_CATALOG"], run_id),
             )
         prior: list[tuple[str, str]] = []
         results: list[dict[str, Any]] = []

@@ -81,6 +81,13 @@ async def export_vault_history(body: ExportVaultBody):
     return await _call(forecasts.export_vault_history)
 
 
+@router.get("/stats")
+async def forecast_stats():
+    """Settled hit/miss/partial counts over the performance scope — registered
+    BEFORE /{forecast_id} so 'stats' is never captured as an id."""
+    return await forecasts.hit_rate_stats()
+
+
 @router.get("/{forecast_id}")
 async def get_forecast(forecast_id: str):
     fc = await forecasts.get_forecast(forecast_id)

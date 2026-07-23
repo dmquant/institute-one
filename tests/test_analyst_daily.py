@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import bus, db
-from app.institute import analyst_daily
+from app.institute import analyst_daily, claims
 from app.institute.analysts import get_analyst, roster
 
 SAMPLE_WITH_SELF_MAIL = """## 观察日报
@@ -265,12 +265,26 @@ async def test_sweep_heartbeat_renews_claim_live_owner_never_taken_over(monkeypa
     a dead (hard-killed) owner (that path is covered by the expired-claim
     takeover test above).
 
-    claimed_at is second-precision (bus.now_iso() truncates), so the observed
-    age can read up to ~1s older than reality; the lease here stays above
-    heartbeat + 1s so renewals reliably register as live.
+    A simulated clock shared by token minting and the staleness check lets
+    the test jump past the lease without a real multi-second wait — and
+    without the ~1s second-precision slop bus.now_iso() truncation adds.
     """
     monkeypatch.setattr(analyst_daily, "SWEEP_LEASE_S", 1.2)
     monkeypatch.setattr(analyst_daily, "SWEEP_HEARTBEAT_S", 0.05)
+
+    fake_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fake_now
+
+    monkeypatch.setattr(claims, "datetime", FakeDateTime)
+    monkeypatch.setattr(
+        analyst_daily,
+        "_claim_token",
+        lambda owner: json.dumps({"owner": owner, "claimed_at": fake_now.isoformat()}),
+    )
 
     claim = await analyst_daily._claim_sweep()
     assert claim is not None
@@ -279,7 +293,13 @@ async def test_sweep_heartbeat_renews_claim_live_owner_never_taken_over(monkeypa
     stop = asyncio.Event()
     beat = asyncio.create_task(analyst_daily._heartbeat_loop(key, holder, stop))
     try:
-        await asyncio.sleep(1.8)  # well past the 1.2s lease
+        # jump past the 1.2s lease, then wait for the next heartbeat renewal
+        # to re-stamp the claim at the new "now"
+        fake_now = fake_now + timedelta(seconds=2)
+        for _ in range(100):  # one heartbeat tick (0.05s) is plenty
+            if holder["token"] != token:
+                break
+            await asyncio.sleep(0.01)
         # the ORIGINAL claimed_at is long expired, but renewals keep it live
         assert await analyst_daily._claim_sweep() is None
         assert holder["token"] != token  # renewals actually happened

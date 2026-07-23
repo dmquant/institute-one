@@ -92,16 +92,17 @@ app lifespan calls ``register()``.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
 import sqlite3
-import uuid
 from pathlib import Path
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 from . import forecasts
 
 log = logging.getLogger("institute.forecast_extract")
@@ -200,10 +201,6 @@ _HORIZON_PATTERNS: list[tuple[re.Pattern[str], int, int]] = [
     (re.compile(r"(\d{1,3})[\s-]*weeks?", re.I), 7, 104),
     (re.compile(r"(\d{1,3})[\s-]*(?:trading\s+)?days?", re.I), 1, 365),
 ]
-
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
 
 
 def _cn_num(token: str) -> int | None:
@@ -530,7 +527,7 @@ def _deterministic_forecast_id(extraction_id: str, security_id: str) -> str:
     """Pre-generated forecast id for one candidate slot: a pure function of
     the item's identity, so every claim/retry of the same slot produces the
     SAME id and create_forecast becomes safely replayable (the forecasts
-    primary key is the replay arbiter). 12 hex chars, the _new_id() shape."""
+    primary key is the replay arbiter). 12 hex chars, the new_id() shape."""
     return hashlib.sha256(f"{extraction_id}|{security_id}".encode("utf-8")).hexdigest()[:12]
 
 
@@ -610,7 +607,7 @@ async def process_source(
         "INSERT INTO forecast_extractions (id, source_ref, source_kind, status, analyst_id, "
         "text_sha256, made_at, created_at, updated_at) VALUES (?,?,?,'pending',?,?,?,?,?) "
         "ON CONFLICT(source_ref) DO NOTHING",
-        (_new_id(), source_ref, source_kind, analyst_id, text_sha256, frozen_made_at, now, now),
+        (new_id(), source_ref, source_kind, analyst_id, text_sha256, frozen_made_at, now, now),
     )
     row = await db.query_one(
         "SELECT id, status, text_sha256, made_at FROM forecast_extractions "
@@ -794,6 +791,16 @@ async def process_source(
 
 # ---- bus handlers (never raise) -------------------------------------------------
 
+def _read_file_text(path: Path) -> str | None:
+    """Sync workspace read — run under asyncio.to_thread (see _workspace_text)."""
+    try:
+        if path.is_file():
+            return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log.warning("could not read %s", path)
+    return None
+
+
 async def _workspace_text(session_id: Any, filename: str) -> str | None:
     if not session_id:
         return None
@@ -801,12 +808,9 @@ async def _workspace_text(session_id: Any, filename: str) -> str | None:
     if not row or not row["workspace_dir"]:
         return None
     path = Path(row["workspace_dir"]).expanduser() / filename
-    try:
-        if path.is_file():
-            return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        log.warning("could not read %s", path)
-    return None
+    # the compiled report reaches the 200KB output cap and the bus awaits this
+    # handler inline — keep the read off the emitter's event loop
+    return await asyncio.to_thread(_read_file_text, path)
 
 
 async def _on_research_completed(event: bus.Event) -> None:

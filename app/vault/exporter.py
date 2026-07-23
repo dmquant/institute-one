@@ -6,6 +6,7 @@ ever raises into the bus (the bus guards too, but belt and braces).
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -16,6 +17,7 @@ from typing import Any
 from .. import bus, db
 from ..config import get_settings
 from ..institute.prompts import extract_summary, work_date
+from ..util import read_text, session_workspace
 from .writer import get_writer
 
 log = logging.getLogger("institute.exporter")
@@ -39,26 +41,11 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def _read_text(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    try:
-        if path.is_file():
-            return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        log.warning("could not read %s", path)
-    return None
-
-
-async def _session_workspace(session_id: Any) -> Path | None:
-    if not session_id:
-        return None
-    row = await db.query_one("SELECT workspace_dir FROM sessions WHERE id = ?", (str(session_id),))
-    if row and row["workspace_dir"]:
-        ws = Path(row["workspace_dir"]).expanduser()
-        if ws.is_dir():
-            return ws
-    return None
+async def _read_text_async(path: Path | None) -> str | None:
+    """Threaded util.read_text: workspace reports reach the 200KB output cap,
+    and the bus awaits these handlers inline — a synchronous read would stall
+    the emitter's event loop (loop-fix: artifact-completion hot path)."""
+    return await asyncio.to_thread(read_text, path)
 
 
 async def _get_run(run_id: Any) -> Any | None:
@@ -145,8 +132,8 @@ async def _export_research(
 ) -> str | None:
     run = await _get_run(run_id)
     session_id = session_id or _get(run, "session_id")
-    ws = await _session_workspace(session_id)
-    report = _read_text(ws / "06_深度报告.md") if ws else None
+    ws = await session_workspace(session_id)
+    report = await _read_text_async(ws / "06_深度报告.md") if ws else None
     if report is None:
         report = _steps_text(run)
     summary = (summary or "").strip() or (extract_summary(report) if report else "")
@@ -159,7 +146,7 @@ async def _export_research(
         parts.append(f"## 核心结论\n\n{summary}")
     if report:
         parts.append(report.strip())
-    followups = _read_text(ws / "07_后续跟进.md") if ws else None
+    followups = await _read_text_async(ws / "07_后续跟进.md") if ws else None
     if followups and followups.strip():
         text = followups.strip()
         if not text.startswith(("## 后续跟进", "#")):
@@ -290,9 +277,9 @@ async def _on_workflow(event: bus.Event) -> None:
         if run is None:
             run = await _get_run(run_id)
         session_id = p.get("session_id") or _get(run, "session_id")
-        ws = await _session_workspace(session_id)
+        ws = await session_workspace(session_id)
         fname, folder, title = _COMPILED[wf_id]
-        text = (_read_text(ws / fname) if ws else None) or _steps_text(run)
+        text = (await _read_text_async(ws / fname) if ws else None) or _steps_text(run)
         if not text.strip():
             log.warning("nothing to export for %s run %s", wf_id, run_id)
             return
@@ -329,7 +316,7 @@ async def export_board(board_id: str) -> str | None:
     topic = str(_get(board, "topic") or board_id)
     question = str(_get(board, "question") or "").strip()
     wd = str(_get(board, "work_date") or "") or work_date()
-    ws = await _session_workspace(_get(board, "session_id"))
+    ws = await session_workspace(_get(board, "session_id"))
 
     from ..institute.analysts import get_analyst  # lazy: domain module
 
@@ -343,7 +330,7 @@ async def export_board(board_id: str) -> str | None:
         idx = _get(card, "idx")
         idx = idx if isinstance(idx, int) and idx > 0 else n
         output_file = _get(card, "output_file")
-        text = _read_text(ws / str(output_file)) if ws and output_file else None
+        text = await _read_text_async(ws / str(output_file)) if ws and output_file else None
         text = (text or str(_get(card, "summary") or "")).strip() or "（无产出）"
         parts.append(f"## card-{idx:02d} · {who}\n\n{text}")
 
@@ -400,8 +387,8 @@ async def _on_analyst_daily(event: bus.Event) -> None:
         p = event.payload or {}
         analyst_id = str(event.ref_id or "")
         date = str(p.get("date") or work_date())
-        ws = await _session_workspace(p.get("session_id"))
-        text = _read_text(ws / str(p.get("file") or f"{analyst_id}.md")) if ws else None
+        ws = await session_workspace(p.get("session_id"))
+        text = await _read_text_async(ws / str(p.get("file") or f"{analyst_id}.md")) if ws else None
         if not text and p.get("task_id"):
             row = await db.query_one("SELECT output FROM tasks WHERE id = ?", (str(p["task_id"]),))
             text = (row or {}).get("output")
@@ -706,8 +693,8 @@ async def _on_committee(event: bus.Event) -> None:
             return
         if run is None:
             run = await _get_run(run_id)
-        ws = await _session_workspace(p.get("session_id") or _get(run, "session_id"))
-        verdict = (_read_text(ws / "委员会裁决.md") if ws else None) or _steps_text(run)
+        ws = await session_workspace(p.get("session_id") or _get(run, "session_id"))
+        verdict = (await _read_text_async(ws / "委员会裁决.md") if ws else None) or _steps_text(run)
         if not verdict.strip():
             log.warning("nothing to export for committee run %s", run_id)
             return

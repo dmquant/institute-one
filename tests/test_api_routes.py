@@ -73,7 +73,7 @@ DICT_200 = {
     "/api/tasks/queue", "/api/operator/actions", "/api/operator/triage",
     "/api/vault/status", "/api/whiteboard/similarity-config", "/api/roadmap/process",
     "/api/roadmap/export", "/api/mcp/health", "/api/hands/scorecard", "/api/hands/stats",
-    "/api/analysts/roles",
+    "/api/analysts/roles", "/api/forecasts/stats",
 }
 
 _FAKE_ID = "999999"
@@ -258,6 +258,27 @@ async def test_detail_endpoints_follow_created_rows():
 
         r = await client.get("/api/events", params={"types": "task.,research."})
         assert r.status_code == 200
+
+
+async def test_workflow_run_missing_declared_variable_is_400():
+    """A manual research trigger without TOPIC gets a clear 400 instead of a
+    run that would feed the literal "${TOPIC}" placeholder to the model."""
+    from app.institute import workflows as workflows_mod
+
+    await workflows_mod.reconcile_from_disk()
+    async with _client() as client:
+        r = await client.post("/api/workflows/research/run", json={})
+        assert r.status_code == 400
+        assert "TOPIC" in r.json()["detail"]
+
+        r = await client.post("/api/workflows/research/run", json={"variables": {"TOPIC": " "}})
+        assert r.status_code == 400
+
+        r = await client.post(
+            "/api/workflows/research/run", json={"variables": {"TOPIC": "路由冒烟"}}
+        )
+        assert r.status_code == 200
+    await workflows_mod.cancel_run(r.json()["run_id"])  # leave no driver running
 
 
 # ---- guard: the enumeration itself stays meaningful ------------------------------

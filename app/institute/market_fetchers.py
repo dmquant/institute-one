@@ -43,7 +43,6 @@ import logging
 import math
 import os
 import re
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
@@ -51,6 +50,7 @@ import httpx
 
 from .. import bus, db
 from ..config import get_settings
+from ..util import new_id
 from . import market_data
 from .prompts import work_date
 
@@ -881,7 +881,7 @@ async def _store_bundle(topic: str, content: str, metadata: dict[str, Any]) -> N
         "VALUES (?,?,?,?,?,?,?) "
         "ON CONFLICT(topic, work_date) DO UPDATE SET content = excluded.content, "
         "metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
-        (uuid.uuid4().hex[:12], topic, work_date(), content, json.dumps(metadata, ensure_ascii=False), now, now),
+        (new_id(), topic, work_date(), content, json.dumps(metadata, ensure_ascii=False), now, now),
     )
 
 

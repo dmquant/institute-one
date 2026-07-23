@@ -185,19 +185,25 @@ async def test_job_registry_live_scheduler_marks_all_jobs_registered(monkeypatch
 async def test_cron_health_endpoint_shape():
     from app.main import create_app
 
+    base = datetime.now(timezone.utc)
+
+    def ts(hours_ago: int) -> str:
+        # window-relative timestamps: the endpoint only counts the last 30
+        # days, so pinned calendar dates would silently age out of the window
+        return (base - timedelta(hours=hours_ago)).isoformat(timespec="seconds")
+
     async def put(job: str, *, ok: int = 1, skipped: int = 0, duration: int = 0,
                   error: str | None = None, fired_at: str | None = None):
         await db.execute(
             "INSERT INTO cron_metrics (job, fired_at, duration_ms, ok, error, skipped_by_maintenance) "
             "VALUES (?,?,?,?,?,?)",
-            (job, fired_at or "2026-07-20T10:00:00+00:00", duration, ok, error, skipped),
+            (job, fired_at or ts(3), duration, ok, error, skipped),
         )
 
-    await put("briefing", duration=100, fired_at="2026-07-20T10:00:00+00:00")
-    await put("briefing", ok=0, duration=300, error="RuntimeError: x",
-              fired_at="2026-07-20T11:00:00+00:00")
-    await put("briefing", skipped=1, fired_at="2026-07-20T12:00:00+00:00")
-    await put("janitor", duration=50, fired_at="2026-07-20T09:00:00+00:00")
+    await put("briefing", duration=100, fired_at=ts(3))
+    await put("briefing", ok=0, duration=300, error="RuntimeError: x", fired_at=ts(2))
+    await put("briefing", skipped=1, fired_at=ts(1))
+    await put("janitor", duration=50, fired_at=ts(4))
 
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -211,10 +217,9 @@ async def test_cron_health_endpoint_shape():
     assert briefing["ok"] == 1 and briefing["failed"] == 1 and briefing["skipped"] == 1
     assert briefing["ok_rate"] == 0.5              # skips excluded from the rate
     assert briefing["avg_duration_ms"] == 200       # (100+300)/2, skip excluded
-    assert briefing["last_fired_at"] == "2026-07-20T12:00:00+00:00"
+    assert briefing["last_fired_at"] == ts(1)
     assert briefing["last_status"] == "skipped"
-    assert briefing["last_error"] == {"fired_at": "2026-07-20T11:00:00+00:00",
-                                      "error": "RuntimeError: x"}
+    assert briefing["last_error"] == {"fired_at": ts(2), "error": "RuntimeError: x"}
     # registry fields (scheduler not running under tests)
     assert briefing["gated"] is True and briefing["registered"] is False
 
@@ -225,6 +230,38 @@ async def test_cron_health_endpoint_shape():
     assert janitor["gated"] is False
 
 
+async def test_cron_health_excludes_rows_outside_the_30_day_window():
+    """The endpoint advertises a 30-day window: stale rows contribute nothing —
+    not to aggregates, not to last_status/last_error — and a metrics-only job
+    whose rows are ALL stale drops out of the response entirely (the registry
+    keeps every live job listed with zeroed fields regardless)."""
+    from app.main import create_app
+
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(days=31)).isoformat(timespec="seconds")
+    fresh = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    for job, ok, fired_at, error in (
+        ("briefing", 0, stale, "RuntimeError: ancient"),  # stale failure...
+        ("briefing", 1, fresh, None),                     # ...superseded by a fresh ok
+        ("probe-renamed-old", 1, stale, None),            # metrics-only AND stale: gone
+    ):
+        await db.execute(
+            "INSERT INTO cron_metrics (job, fired_at, duration_ms, ok, error, skipped_by_maintenance) "
+            "VALUES (?,?,0,?,?,0)",
+            (job, fired_at, ok, error),
+        )
+
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        body = (await client.get("/api/cron/health")).json()
+
+    briefing = body["jobs"]["briefing"]
+    assert briefing["fires"] == 1 and briefing["ok"] == 1 and briefing["failed"] == 0
+    assert briefing["last_fired_at"] == fresh and briefing["last_status"] == "ok"
+    assert briefing["last_error"] is None  # the stale failure is outside the window
+    assert "probe-renamed-old" not in body["jobs"]  # no registry entry, no in-window metrics
+
+
 async def test_cron_health_includes_never_fired_jobs():
     """S4-P0-03: the response is the registry full set LEFT JOIN metrics —
     with only one job having metrics, the other 19 still show up with zeroed
@@ -233,7 +270,8 @@ async def test_cron_health_includes_never_fired_jobs():
 
     await db.execute(
         "INSERT INTO cron_metrics (job, fired_at, duration_ms, ok, skipped_by_maintenance) "
-        "VALUES ('janitor', '2026-07-20T09:00:00+00:00', 5, 1, 0)"
+        "VALUES ('janitor', ?, 5, 1, 0)",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"),),
     )
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -254,7 +292,8 @@ async def test_cron_health_keeps_metrics_only_job_names():
 
     await db.execute(
         "INSERT INTO cron_metrics (job, fired_at, duration_ms, ok, skipped_by_maintenance) "
-        "VALUES ('probe-renamed', '2026-07-20T09:00:00+00:00', 5, 1, 0)"
+        "VALUES ('probe-renamed', ?, 5, 1, 0)",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"),),
     )
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

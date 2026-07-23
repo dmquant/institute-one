@@ -52,12 +52,12 @@ import hashlib
 import json
 import re
 import sqlite3
-import uuid
 from pathlib import Path
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..util import new_id
 from .theses import VIEWS
 
 BUNDLE_SCHEMAS = {"researchos.market_thesis_export.bundle.v1"}
@@ -127,10 +127,6 @@ class MarketThesisImportError(ValueError):
 
 
 # ---- helpers ---------------------------------------------------------------
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _dumps(val: Any) -> str:
     return json.dumps(val, ensure_ascii=False)
@@ -347,7 +343,7 @@ def _plan_theses(
                 rec.get("networkHref"), _dumps(metadata), now, now,
             ),
             "version_row": (
-                _new_id(), tid, 1, None, None, view, "medium", str(rec.get("coreView") or ""),
+                new_id(), tid, 1, None, None, view, "medium", str(rec.get("coreView") or ""),
                 "[]", "[]", "[]", "[]", _dumps(stock_universe), now,
             ),
         })
@@ -467,7 +463,7 @@ def _plan_stocks(
             occupied[(alias, kind)] = sid
             alias_entries.append({"alias": alias, "kind": kind, "security_id": sid,
                                   "status": "inserted",
-                                  "row": (_new_id(), sid, alias, kind, SOURCE, now)})
+                                  "row": (new_id(), sid, alias, kind, SOURCE, now)})
     return entries, alias_entries, ticker_map
 
 
@@ -527,7 +523,7 @@ def _plan_edges(
                 else:
                     claimed.add((source, sid, role))
                     metadata = {k: v for k, v in rec.items() if k not in _EDGE_MAPPED}
-                    local = ext if not ext.startswith("edge[") else _new_id()
+                    local = ext if not ext.startswith("edge[") else new_id()
                     entry = {
                         "status": "inserted", "message": None, "local_id": local,
                         "row": (local, source, sid, role, bucket, exposure, "medium", "",
@@ -603,7 +599,7 @@ async def _apply_plan(import_id: str, plan: dict[str, Any], warnings: list[str])
     for item_type, entries in (("lane", plan["lanes"]), ("thesis", plan["theses"]),
                                ("stock", plan["stocks"]), ("edge", plan["edges"])):
         for e in entries:
-            items.append((_new_id(), import_id, item_type, e["external_id"],
+            items.append((new_id(), import_id, item_type, e["external_id"],
                           e["local_id"], e["status"], e["message"], now))
 
     thesis_sql = (
@@ -751,7 +747,7 @@ async def import_bundle(path: str | Path, mode: str = "dry_run") -> dict[str, An
                 f"(completed {prior['finished_at']}); refusing to re-apply"
             )
 
-    import_id = _new_id()
+    import_id = new_id()
     manifest = {k: v for k, v in bundle.items() if k not in ("lanes", "theses", "stocks", "edges")}
     await db.execute(
         "INSERT INTO market_thesis_imports (id, schema, generated_at, source_schema, "

@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 
+import pytest
+
 from app import bus, db
 from app.config import get_settings
 from app.hands.base import Hand, HandResult
@@ -162,7 +164,7 @@ async def test_research_workflow_uses_configured_research_hands(monkeypatch):
 
 # must match workflows/research.json byte-for-byte
 _STEP0_LINE = (
-    "【研究前置】开始研究前，先执行 curl -s "
+    "【研究前置】开始研究前，先执行 curl -sf "
     "'http://127.0.0.1:8100/api/institute/recent-reports.md?days=7' "
     "了解研究所近 7 天已完成的工作，避免重复劳动；若命令失败则忽略，直接开始。"
 )
@@ -292,3 +294,46 @@ async def test_cancel_run_stops_between_steps(monkeypatch):
 
     events = await bus.replay(0, types=["workflow.cancelled"])
     assert any(e.ref_id == run_id for e in events)
+
+
+# ---- declared-variable validation (ValueError -> 400 at the API) --------------
+
+async def test_create_run_rejects_missing_or_blank_declared_variable():
+    """research declares TOPIC: a run without it (or a blank one) is refused
+    up front — substitute_variables() would otherwise feed the literal
+    "${TOPIC}" placeholder to the model. No run row is left behind."""
+    await workflows.reconcile_from_disk()
+    with pytest.raises(ValueError, match="TOPIC"):
+        await workflows.run_workflow("research", source="test")
+    with pytest.raises(ValueError, match="TOPIC"):
+        await workflows.run_workflow("research", variables={"TOPIC": "   "}, source="test")
+    assert await workflows.list_runs(workflow_id="research") == []
+
+
+async def test_create_run_lazy_variables_need_no_caller_value():
+    """LAZY_VARIABLES (DATA_BUNDLE/WEEK_DISPUTES/ANALYST_CATALOG) are exempt
+    from validation: _drive computes them only when a step prompt references
+    them and persists the value on the run row, like ${DATA_BUNDLE}."""
+    await workflows.reconcile_from_disk()
+    run = await workflows.run_workflow_and_wait(
+        "research", variables={"TOPIC": "变量校验"}, source="test",
+    )
+    assert run["status"] == "completed"
+    catalog = run["variables"]["ANALYST_CATALOG"]
+    assert "equity-analyst" in catalog  # computed lazily, then persisted
+    followups = next(r for r in run["results"] if r["step_id"] == "07-followups")
+    row = await db.query_one("SELECT prompt FROM tasks WHERE id = ?", (followups["task_id"],))
+    assert "${ANALYST_CATALOG}" not in row["prompt"]
+    assert "equity-analyst" in row["prompt"]
+
+
+async def test_create_run_explicit_lazy_variable_wins():
+    """The lazy contract: an explicit caller value is never overwritten."""
+    await workflows.reconcile_from_disk()
+    run = await workflows.run_workflow_and_wait(
+        "research",
+        variables={"TOPIC": "变量校验", "ANALYST_CATALOG": "- custom-catalog"},
+        source="test",
+    )
+    assert run["status"] == "completed"
+    assert run["variables"]["ANALYST_CATALOG"] == "- custom-catalog"

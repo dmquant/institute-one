@@ -5,7 +5,10 @@ refusal, not a JSON-RPC error); topic_pool_add defers entirely to
 whiteboard.add_topic() — same content hash, and "did this call insert" comes
 from the domain INSERT OR IGNORE result, never from an MCP-side pre-check
 (REVIEW-A2 M1/M2; PATCH-NOTES-A2.md landed the ``inserted`` key, so the
-tests assert it unconditionally).
+tests assert it unconditionally). The topic_pool.added event is likewise
+domain-owned: whiteboard.add_topic() emits it on a real insert (payload
+{"topic", "source"}), so direct domain calls in these tests show up in the
+replay alongside MCP-triggered ones — MCP itself never emits.
 """
 from __future__ import annotations
 
@@ -151,7 +154,8 @@ async def test_topic_pool_add_exact_duplicate_across_sources():
 
     rows = await db.query("SELECT * FROM topic_pool WHERE topic = ?", ("光模块景气度",))
     assert len(rows) == 1
-    assert await _added_events() == []  # duplicates never emit
+    # the seeded domain insert emitted once; the duplicate MCP call adds nothing
+    assert await _added_events() == ["光模块景气度"]
 
 
 async def test_topic_pool_add_hash_alias_not_reported_as_new():
@@ -170,7 +174,7 @@ async def test_topic_pool_add_hash_alias_not_reported_as_new():
 
     rows = await db.query("SELECT topic, question FROM topic_pool")
     assert rows == [{"topic": "机器人产业链", "question": ""}]  # the alias inserted nothing
-    assert await _added_events() == []
+    assert await _added_events() == ["机器人产业链"]  # only the seed insert emitted
 
 
 async def test_topic_pool_add_lands_on_domain_hash():
@@ -206,7 +210,12 @@ async def test_topic_pool_add_reports_genuine_insert():
         assert rerun["duplicate"] is True
         assert rerun["id"] == res["id"]
 
-    assert await _added_events() == ["储能出海"]  # exactly one event, from the real insert
+    events = await bus.replay(0, types=["topic_pool.added"])
+    # one event per real insert, domain-owned: the direct probe and the
+    # MCP-triggered one; the duplicate rerun emitted nothing
+    assert [(e.payload["topic"], e.payload["source"]) for e in events] == [
+        ("__a2-probe__", "test"), ("储能出海", "mcp"),
+    ]
 
 
 async def test_topic_pool_add_concurrent_calls_single_added():

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 from fastapi import FastAPI
@@ -146,6 +147,26 @@ async def test_daily_cap_counts_sgt_work_date_not_utc_timestamp(monkeypatch):
     assert await research.tick() is None  # cap reached via work_date
     after = await research.get_item(item["id"])
     assert after["status"] == "pending"
+
+
+async def test_daily_cap_nonpositive_disables_queue_and_logs_once(monkeypatch, caplog):
+    """research_daily_cap <= 0 is the documented kill switch: the tick claims
+    nothing, and the fact is logged once per process (not on every tick) so the
+    job doesn't look healthy while the feature silently does nothing."""
+    await workflows.reconcile_from_disk()
+    monkeypatch.setattr(get_settings(), "research_daily_cap", 0)
+
+    item = await research.enqueue("MSFT", source="test")
+    assert item["status"] == "pending"
+
+    with caplog.at_level(logging.INFO, logger="institute.research"):
+        assert await research.tick() is None
+        assert await research.tick() is None
+
+    after = await research.get_item(item["id"])
+    assert after["status"] == "pending"
+    hits = [r for r in caplog.records if "research_daily_cap" in r.message]
+    assert len(hits) == 1  # one-shot: the second tick stays quiet
 
 
 # ==== card M3-001: thesis-aware structured rail ==============================

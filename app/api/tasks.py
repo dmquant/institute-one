@@ -130,31 +130,54 @@ def _prefer_idle_hand(hand: str) -> str:
     return hand
 
 
+async def resolve_ask(
+    prompt: str,
+    analyst_id: str | None = None,
+    hand: str | None = None,
+    model: str | None = None,
+) -> tuple[str, str]:
+    """Hand resolution + persona wrap shared by every ask surface → (hand, prompt).
+
+    Persona wrap via ``memory.prompt_with_memory`` (standing-memory block
+    included), hand precedence explicit > analyst > default — then the
+    interactive idle-hand preference (交互优先空闲手, ROADMAP Phase 0): asks
+    are interactive traffic, so when the caller did not explicitly pin a hand
+    or a model (``model`` is hand-family-specific, so it counts as pinning
+    too), a busy resolved hand is swapped for the first idle+available hand
+    in its fallback chain; if the whole chain is busy the ask queues on the
+    original hand as before. An explicit ``hand`` is never rerouted, busy or
+    not.
+
+    Raises ``LookupError`` for an unknown analyst — each surface maps it to
+    its own error shape (404 on HTTP, -32602 on MCP).
+    """
+    settings = get_settings()
+    resolved = hand or settings.default_hand
+    if analyst_id:
+        analyst = get_analyst(analyst_id)
+        if analyst is None:
+            raise LookupError(f"unknown analyst {analyst_id}")
+        prompt = await memory.prompt_with_memory(analyst, prompt)
+        resolved = hand or analyst.hand or settings.default_hand
+    if hand is None and model is None:
+        resolved = _prefer_idle_hand(resolved)
+    return resolved, prompt
+
+
 async def prepare_ask(body: AskBody) -> tuple[str, str]:
     """Shared ``/api/ask`` + ``/api/ask/stream`` preprocessing → (hand, prompt).
 
-    Persona wrap via ``memory.prompt_with_memory`` (standing-memory block
-    included; unknown analyst ⇒ 404), hand precedence body > analyst > default — then
-    the interactive idle-hand preference (交互优先空闲手, ROADMAP Phase 0):
-    asks are ``source="api"`` interactive traffic, so when the caller did not
-    explicitly pin a hand (``body.hand``) or a model (``body.model`` is
-    hand-family-specific, so it counts as pinning too), a busy resolved hand
-    is swapped for the first idle+available hand in its fallback chain; if
-    the whole chain is busy the ask queues on the original hand as before.
-    An explicit ``body.hand`` is never rerouted, busy or not.
+    Thin ``AskBody`` wrapper over ``resolve_ask`` (which the MCP
+    ``institute_ask`` tool shares verbatim): persona wrap, hand precedence
+    body > analyst > default, idle-hand preference — an unknown analyst is
+    mapped from ``LookupError`` to 404 here.
     """
-    settings = get_settings()
-    prompt = body.prompt
-    hand = body.hand or settings.default_hand
-    if body.analyst_id:
-        analyst = get_analyst(body.analyst_id)
-        if analyst is None:
-            raise HTTPException(404, f"unknown analyst {body.analyst_id}")
-        prompt = await memory.prompt_with_memory(analyst, body.prompt)
-        hand = body.hand or analyst.hand or settings.default_hand
-    if body.hand is None and body.model is None:
-        hand = _prefer_idle_hand(hand)
-    return hand, prompt
+    try:
+        return await resolve_ask(
+            body.prompt, analyst_id=body.analyst_id, hand=body.hand, model=body.model,
+        )
+    except LookupError:
+        raise HTTPException(404, f"unknown analyst {body.analyst_id}") from None
 
 
 @router.post("/ask")

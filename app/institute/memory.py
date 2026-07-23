@@ -43,15 +43,15 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..util import new_id
 from .analysts import Analyst, get_analyst, roster
+from .claims import claim_admin_state, lease_stale_checker, release_admin_state
 from .prompts import build_analyst_prompt, work_date
 
 log = logging.getLogger("institute.memory")
@@ -308,10 +308,10 @@ async def _collect_material(analyst_id: str, prev_cursors: dict[str, int]) -> tu
 # The version-row UNIQUE alone let two overlapping compacts BOTH run the model
 # and discard one output (2x quota, M8-005). A per-analyst conditional claim on
 # an admin_state row makes one winner BEFORE any model call; the loser skips.
-# Same claim/lease/CAS-takeover idiom as analyst_daily._claim_sweep, without
-# the heartbeat: a compact is one bounded model call (settings-default 30 min
-# hand timeout), so a fixed lease with slack covers a live compact end-to-end,
-# and only a hard-killed one (finally never ran) goes stale and is taken over.
+# The shared claims.py claim/lease/CAS-takeover idiom, without the heartbeat:
+# a compact is one bounded model call (settings-default 30 min hand timeout),
+# so a fixed lease with slack covers a live compact end-to-end, and only a
+# hard-killed one (finally never ran) goes stale and is taken over.
 # Escape hatch while a claim is held: deleting the row frees it.
 
 COMPACT_LEASE_S = 45 * 60
@@ -328,45 +328,19 @@ def _claim_token(owner: str) -> str:
 async def _claim_compact(analyst_id: str) -> tuple[str, str] | None:
     """Conditionally claim one analyst's compact; (key, token) for the winner.
 
-    INSERT ... ON CONFLICT DO NOTHING decides the winner by rowcount. Takeover
-    of an expired claim is a CAS UPDATE on the exact stale value, so two
-    concurrent takeovers also get one winner.
+    The shared idiom (claims.claim_admin_state) picks one winner by rowcount
+    and takes over stale claims via exact-value CAS.
     """
-    key = _claim_key(analyst_id)
-    token = _claim_token(uuid.uuid4().hex[:12])
-    n = await db.execute(
-        "INSERT INTO admin_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
-        (key, token),
+    return await claim_admin_state(
+        _claim_key(analyst_id),
+        make_token=lambda: _claim_token(new_id()),
+        is_stale=lease_stale_checker(COMPACT_LEASE_S, label="compact claim"),
     )
-    if n:
-        return key, token
-
-    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
-    if row is None:  # released between INSERT and SELECT — don't race the release, just skip
-        return None
-    try:
-        claimed_at = datetime.fromisoformat(json.loads(row["value"])["claimed_at"])
-        age_s = (datetime.now(timezone.utc) - claimed_at).total_seconds()
-        # a FUTURE claimed_at (clock jumped back / garbage) would otherwise
-        # stay "live" until that future time plus the lease — treat as stale
-        live = 0 <= age_s < COMPACT_LEASE_S
-        if age_s < 0:
-            log.warning("compact claim %s has a future claimed_at (%s); treating as stale", key, claimed_at)
-    except (ValueError, KeyError, TypeError):
-        live = False  # corrupt claim must not wedge the analyst forever
-    if live:
-        return None  # another compact for this analyst is running
-    n = await db.execute(
-        "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
-        (token, key, row["value"]),
-    )
-    return (key, token) if n else None
 
 
 async def _release_compact(key: str, token: str) -> None:
-    # CAS delete — only our own claim: a late-finishing timed-out owner must
-    # not erase the claim of the compact that took over its lease
-    await db.execute("DELETE FROM admin_state WHERE key = ? AND value = ?", (key, token))
+    # CAS delete — only our own claim (claims.release_admin_state)
+    await release_admin_state(key, token)
 
 
 # ---- compaction -----------------------------------------------------------------
@@ -433,7 +407,7 @@ async def _compact_claimed(analyst_id: str, analyst: Analyst) -> dict[str, Any]:
         }
 
     version = (prev["version"] if prev else 0) + 1
-    memory_id = uuid.uuid4().hex[:12]
+    memory_id = new_id()
     wd = work_date()
     claimed = await db.execute(
         "INSERT OR IGNORE INTO analyst_memory "

@@ -24,7 +24,7 @@ from typing import Any
 
 from httpx import ASGITransport, AsyncClient
 
-from app import db
+from app import bus, db
 from app import mcp as mcp_mod
 from app.institute import sessions
 
@@ -241,6 +241,34 @@ async def test_sessions_roundtrip_and_8kb_output_cap():
         # a small result is untouched, valid JSON
         small = _result_text(await _call_tool_raw(client, "sessions_list", {"limit": 1}))
         assert json.loads(small)[0]["id"] == session["id"]
+
+
+async def test_mailbox_get_thread_returns_latest_window_ascending():
+    """mailbox_get_thread caps the message list at the most recent N (default
+    50, passable via ``limit``) and still presents them oldest-first."""
+    await db.execute(
+        "INSERT INTO mailbox_threads (id, subject, analyst_id, status, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?)",
+        ("th-cap", "窗口", "equity-analyst", "open", bus.now_iso(), bus.now_iso()),
+    )
+    for i in range(1, 61):
+        await db.execute(
+            "INSERT INTO mailbox_messages (thread_id, author, kind, body, created_at) "
+            "VALUES (?,?,?,?,?)",
+            ("th-cap", "operator", "note", f"msg-{i:02d}", bus.now_iso()),
+        )
+
+    async with _client() as client:
+        body = json.loads(_result_text(
+            await _call_tool_raw(client, "mailbox_get_thread", {"thread_id": "th-cap"}),
+        ))
+        bodies = [m["body"] for m in body["messages"]]
+        assert bodies == [f"msg-{i:02d}" for i in range(11, 61)]  # newest 50, ascending
+
+        small = json.loads(_result_text(
+            await _call_tool_raw(client, "mailbox_get_thread", {"thread_id": "th-cap", "limit": 3}),
+        ))
+        assert [m["body"] for m in small["messages"]] == ["msg-58", "msg-59", "msg-60"]
 
 
 async def test_validation_of_unknown_arguments_and_tools():

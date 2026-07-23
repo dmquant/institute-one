@@ -399,12 +399,12 @@ SWEEP_MAX_ATTEMPTS = 100
 def _classify_vault_row(root: Path, r: dict[str, Any]) -> str:
     """doctor()'s verdict for ONE ledger row: clean|conflict|missing|drifted.
 
-    Mirrors writer.doctor()'s classification exactly (same check order) using
-    the writer's own helpers, because doctor() returns counts without refs.
-    Follow-up card unchanged: a doctor(detail=True) in writer.py would remove
-    this mirror entirely (noted in PATCH-NOTES-C4.md). Synchronous: the batch
-    caller runs under asyncio.to_thread; the card loop re-verifies single
-    rows on the loop (one small file read — the writer's own on-loop cost)."""
+    THE per-row classification, built on the writer's own helpers:
+    writer.doctor() (via _classify_vault_rows), the sweep scan and the card
+    loop's fresh-ledger re-verify all run THIS code, so their verdicts can
+    never drift. Synchronous: every caller runs it under asyncio.to_thread —
+    even a single-row re-verify can hash a whole file/region, and the card
+    loop does it while holding the writer coordination lock."""
     path = root / r["path"]
     if not path.exists():
         return "missing"
@@ -430,8 +430,10 @@ def _classify_vault_rows(
     per-path non-clean states ([(path, conflict|drifted|missing)]) that
     actions need. The sweep used to call doctor() AND a per-path mirror —
     reading + hashing every vault file twice; the merge halves the IO
-    (loop-fix P8a). Runs under asyncio.to_thread so the full-table file read
-    + SHA never blocks the event loop."""
+    (loop-fix P8a). writer.doctor() (POST /api/vault/doctor) reuses this same
+    pass, so endpoint and sweep verdicts are one implementation. Runs under
+    asyncio.to_thread so the full-table file read + SHA never blocks the
+    event loop."""
     counts = {"total": len(rows), "clean": 0, "conflict": 0, "missing": 0, "drifted": 0}
     nonclean: list[tuple[str, str]] = []
     for r in rows:
@@ -1099,37 +1101,46 @@ async def observe_operator(window_days: int = OBSERVE_WINDOW_DAYS) -> dict[str, 
             )
             written += 1
 
-        # 1) which action kinds keep recurring
-        opened = {r["kind"]: r["n"] for r in await db.query(
-            "SELECT kind, COUNT(*) AS n FROM operator_actions "
-            "WHERE created_at >= ? GROUP BY kind", (since,))}
-        resolved = {r["kind"]: r["n"] for r in await db.query(
-            "SELECT kind, COUNT(*) AS n FROM operator_actions "
-            "WHERE status = 'done' AND resolved_at >= ? GROUP BY kind", (since,))}
-        dismissed = {r["kind"]: r["n"] for r in await db.query(
-            "SELECT kind, COUNT(*) AS n FROM operator_actions "
-            "WHERE status = 'dismissed' AND resolved_at >= ? GROUP BY kind", (since,))}
-        open_now = {r["kind"]: r["n"] for r in await db.query(
-            "SELECT kind, COUNT(*) AS n FROM operator_actions "
-            "WHERE status = 'open' GROUP BY kind")}
-        for kind in sorted(set(opened) | set(resolved) | set(dismissed) | set(open_now)):
-            await _snapshot("action_recurrence", kind, {
-                "opened": opened.get(kind, 0), "resolved": resolved.get(kind, 0),
-                "dismissed": dismissed.get(kind, 0), "open_now": open_now.get(kind, 0),
+        # 1) which action kinds keep recurring — one table scan with conditional
+        # SUMs (was four separate GROUP BY queries); HAVING keeps the original
+        # "kinds with any activity" surface, NULL resolved_at falls to ELSE 0
+        recurrence_rows = await db.query(
+            "SELECT kind, "
+            "SUM(CASE WHEN created_at >= ?1 THEN 1 ELSE 0 END) AS opened, "
+            "SUM(CASE WHEN status = 'done' AND resolved_at >= ?1 THEN 1 ELSE 0 END) AS resolved, "
+            "SUM(CASE WHEN status = 'dismissed' AND resolved_at >= ?1 THEN 1 ELSE 0 END) AS dismissed, "
+            "SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_now "
+            "FROM operator_actions GROUP BY kind "
+            "HAVING opened > 0 OR resolved > 0 OR dismissed > 0 OR open_now > 0 "
+            "ORDER BY kind",
+            (since,))
+        opened = {r["kind"]: r["opened"] for r in recurrence_rows}
+        for r in recurrence_rows:
+            await _snapshot("action_recurrence", r["kind"], {
+                "opened": r["opened"], "resolved": r["resolved"],
+                "dismissed": r["dismissed"], "open_now": r["open_now"],
             })
 
         # 2) per-recipe hit rate + adoption (retired recipes only while they
-        #    still show window activity)
+        #    still show window activity) — window hits pre-aggregated in one
+        #    query instead of one query per recipe; the SQL flag test mirrors
+        #    _flags_has (exact comma-delimited element match)
+        hits_by_recipe = {h["recipe_id"]: h for h in await db.query(
+            "SELECT recipe_id, COUNT(*) AS hits, "
+            "SUM(CASE WHEN ',' || COALESCE(flags, '') || ',' LIKE '%,approved,%' "
+            "THEN 1 ELSE 0 END) AS approved "
+            "FROM action_dispositions "
+            "WHERE recipe_id IS NOT NULL AND created_at >= ? GROUP BY recipe_id",
+            (since,))}
         for r in await db.query("SELECT id, kind, status FROM recipes"):
-            hits = await db.query(
-                "SELECT flags FROM action_dispositions "
-                "WHERE recipe_id = ? AND created_at >= ?", (r["id"], since))
+            h = hits_by_recipe.get(r["id"])
+            hits = int(h["hits"]) if h else 0
             if not hits and r["status"] != "active":
                 continue
-            approved = sum(1 for h in hits if _flags_has(h["flags"], "approved"))
+            approved = int(h["approved"] or 0) if h else 0
             await _snapshot("recipe_performance", f"recipe:{r['id']}", {
-                "status": r["status"], "hits": len(hits), "hits_approved": approved,
-                "adoption_rate": (approved / len(hits)) if hits else None,
+                "status": r["status"], "hits": hits, "hits_approved": approved,
+                "adoption_rate": (approved / hits) if hits else None,
                 "kind_actions_opened": opened.get(r["kind"], 0),
             }, recipe_id=r["id"])
 

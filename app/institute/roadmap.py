@@ -14,16 +14,17 @@ User-visible changes append to ``roadmap_events`` and emit namespaced
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
-import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..util import new_id
 
 STATUSES = ("inbox", "ready", "in_progress", "review", "verify", "done", "parked")
 # parked is outside the forward flow, so it never counts as a forward move
@@ -73,10 +74,6 @@ class IdempotencyConflict(MoveConflict):
 
 
 # ---- helpers ---------------------------------------------------------------
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _det_id(*parts: str) -> str:
     """Deterministic id so re-imports merge instead of duplicating."""
@@ -150,7 +147,7 @@ async def _record_event(event_type: str, card_id: str | None, payload: dict[str,
     """Append to roadmap_events and mirror onto the bus as roadmap.<event_type>."""
     await db.execute(
         "INSERT INTO roadmap_events (id, card_id, event_type, payload_json, created_at) VALUES (?,?,?,?,?)",
-        (_new_id(), card_id, event_type, json.dumps(payload, ensure_ascii=False), bus.now_iso()),
+        (new_id(), card_id, event_type, json.dumps(payload, ensure_ascii=False), bus.now_iso()),
     )
     await bus.emit(f"roadmap.{event_type}", "roadmap_card" if card_id else "roadmap", card_id or "", payload)
 
@@ -546,7 +543,9 @@ async def import_backlog(
     if not src.is_absolute():
         src = get_settings().repo_root / src
     try:
-        data = json.loads(src.read_text(encoding="utf-8"))
+        # off-loop read (house to_thread rule): the seed file is small, but a
+        # cold/networked disk must not stall the event loop under the write lock
+        data = json.loads(await asyncio.to_thread(src.read_text, encoding="utf-8"))
     except FileNotFoundError:
         raise RoadmapError(f"backlog file not found: {src}") from None
     except ValueError as exc:
@@ -789,7 +788,7 @@ async def create_card(
     }
 
     async def mutation(conn: Any) -> tuple[dict[str, Any] | None, bool]:
-        card_id = requested_id or _new_id()
+        card_id = requested_id or new_id()
         now = bus.now_iso()
         try:
             await conn.execute(
@@ -1144,7 +1143,7 @@ async def add_evidence(
     async def mutation(conn: Any) -> tuple[dict[str, Any] | None, bool]:
         if await _conn_one(conn, "SELECT id FROM roadmap_cards WHERE id = ?", (card_id,)) is None:
             return None, False
-        evidence_id = _new_id()
+        evidence_id = new_id()
         await conn.execute(
             "INSERT INTO roadmap_evidence (id, card_id, kind, title, body, status, artifact_ref, created_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
@@ -1388,7 +1387,7 @@ async def create_session(
     async def mutation(conn: Any) -> tuple[dict[str, Any] | None, bool]:
         if await _conn_one(conn, "SELECT id FROM roadmap_cards WHERE id = ?", (card_id,)) is None:
             return None, False
-        session_id = _new_id()
+        session_id = new_id()
         await conn.execute(
             "INSERT INTO roadmap_coding_sessions "
             "(id, card_id, actor, goal, status, planned_files_json, "
@@ -1523,7 +1522,7 @@ async def append_command(
         if session is None:
             return None, False
         event_card_id = session["card_id"]
-        command_id = _new_id()
+        command_id = new_id()
         await conn.execute(
             "INSERT INTO roadmap_session_commands "
             "(id, session_id, command_label, command_text, exit_code, output_excerpt, created_at) "
@@ -1545,7 +1544,7 @@ async def append_command(
                 normalized_text if output_excerpt is None
                 else f"{normalized_text}\n{output_excerpt}"
             )
-            evidence_id = _new_id()
+            evidence_id = new_id()
             await conn.execute(
                 "INSERT INTO roadmap_evidence "
                 "(id, card_id, kind, title, body, status, artifact_ref, created_at) "
@@ -1620,7 +1619,7 @@ async def open_decision(
             conn, "SELECT id FROM roadmap_cards WHERE id = ?", (card_id,)
         ) is None:
             raise RoadmapError(f"unknown card {card_id!r}")
-        decision_id = _new_id()
+        decision_id = new_id()
         await conn.execute(
             "INSERT INTO roadmap_decisions "
             "(id, card_id, title, question, options_json, decision, status, created_at, resolved_at) "

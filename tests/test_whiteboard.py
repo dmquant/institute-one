@@ -37,6 +37,23 @@ async def test_add_topic_dedups_by_hash():
     assert third["id"] != first["id"]
 
 
+async def test_add_topic_emits_event_exactly_once_per_real_insert():
+    """topic_pool.added is domain-owned: add_topic() emits it on inserted=True
+    (payload {"topic", "source"}), so every caller path publishes exactly one
+    event per real insert and a deduped repeat publishes none."""
+    first = await whiteboard.add_topic("事件发射议题", "q", source="test")
+    assert first["inserted"] is True
+    second = await whiteboard.add_topic("事件发射议题", "q", source="test")
+    assert second["inserted"] is False
+
+    events = await bus.replay(0, types=["topic_pool.added"])
+    mine = [e for e in events if e.payload.get("topic") == "事件发射议题"]
+    assert len(mine) == 1
+    assert mine[0].ref_kind == "topic"
+    assert mine[0].ref_id == str(first["id"])
+    assert mine[0].payload == {"topic": "事件发射议题", "source": "test"}
+
+
 async def test_kickoff_creates_board_and_first_card():
     await whiteboard.add_topic("AI 芯片竞争格局", "英伟达的护城河还有多宽？", source="test")
     board_id = await whiteboard.kickoff()

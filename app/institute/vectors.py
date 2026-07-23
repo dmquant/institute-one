@@ -96,13 +96,11 @@ _search_reason: ContextVar[str] = ContextVar(
 
 
 def _enabled() -> bool:
-    # Defensive read: the setting may not exist until config.py grows it
-    # (see PATCH-NOTES-A8.md). Missing == disabled == degrade.
-    return bool(getattr(get_settings(), "enable_vectors", False))
+    return bool(get_settings().enable_vectors)
 
 
 def _model() -> str:
-    return str(getattr(get_settings(), "embed_model", "") or DEFAULT_MODEL)
+    return str(get_settings().embed_model or DEFAULT_MODEL)
 
 
 def model_name() -> str:

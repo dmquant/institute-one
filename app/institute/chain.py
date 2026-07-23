@@ -73,7 +73,6 @@ import asyncio
 import json
 import logging
 import re
-import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -81,6 +80,7 @@ from typing import Any
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..util import ARTIFACT_READ_CAP, new_id, read_text, session_workspace
 from ..vault import writer as vault_writer
 from ..vault.writer import get_writer
 from .operator import _fold_line, open_action
@@ -111,9 +111,6 @@ TICK_PERSIST_FAILURE_LIMIT = 3  # halted-batch retries for ONE event's persisten
                                 # failure before the event is dropped with an
                                 # operator card (LOOP-P4: a poison event must not
                                 # buy an extraction model call every hour forever)
-ARTIFACT_READ_CAP = 512 * 1024  # bytes per session-workspace artifact file read
-                                # (LOOP-P11c: a runaway report must not flood the
-                                # INSTR scan / text assembly)
 CLUSTER_COMPARE_BUDGET = 20000  # surface-term comparisons per cluster sweep
                                 # (LOOP-P8b / R3 P2: bounds candidates × nodes ×
                                 # aliases work per tick regardless of graph size)
@@ -243,8 +240,7 @@ def _norm_term(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "")).casefold()
 
 
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
+_new_id = new_id  # tests monkeypatch this name for deterministic ids
 
 
 def _parse_aliases(raw: Any) -> list[str]:
@@ -263,29 +259,13 @@ def _node_out(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def _session_workspace(session_id: Any) -> Path | None:
-    if not session_id:
-        return None
-    row = await db.query_one("SELECT workspace_dir FROM sessions WHERE id = ?", (str(session_id),))
-    if row and row["workspace_dir"]:
-        ws = Path(row["workspace_dir"]).expanduser()
-        if ws.is_dir():
-            return ws
-    return None
+_session_workspace = session_workspace  # tests monkeypatch this name
 
 
 def _read_text(path: Path) -> str | None:
-    """Clamped artifact read (LOOP-P11c): at most ARTIFACT_READ_CAP bytes, so
-    a runaway report file cannot flood the INSTR backstop scan or the
-    extraction text assembly. A multi-byte char split at the clamp boundary
-    degrades to the U+FFFD replacement char, which no matcher depends on."""
-    try:
-        if path.is_file():
-            with path.open("rb") as fh:
-                return fh.read(ARTIFACT_READ_CAP).decode("utf-8", errors="replace")
-    except OSError:
-        log.warning("could not read %s", path)
-    return None
+    """Clamped artifact read via util.read_text; the cap stays THIS module's
+    global, read at call time, so tests can monkeypatch ARTIFACT_READ_CAP."""
+    return read_text(path, ARTIFACT_READ_CAP)
 
 
 # ---- node / edge CRUD -----------------------------------------------------------
@@ -1174,12 +1154,23 @@ SELECT n.id, n.name, n.slug, a.value FROM chain_nodes n, json_each(n.aliases) a
 WHERE a.type = 'text' AND length(a.value) >= 2 AND instr(?1, a.value) > 0\
 """
 
+# Cap the text bound into the instr() scan: the topic/summary lead and the
+# report's opening sections are where entity mentions live, while a full
+# artifact reaches the 200KB task-output cap — one giant SQL parameter scanned
+# against every node × alias, TWICE per artifact (entity_footer + backstop_tag
+# assemble similar-but-not-identical texts in different modules, so both call
+# and both cap here rather than sharing one scan). Hits are positions in a
+# PREFIX, so snippets stay valid; a mention that appears ONLY beyond the cap
+# no longer links — accepted trade-off (audit 2026-07).
+MATCH_TEXT_CAP = 20_000
+
 
 async def _match_hits(text: str) -> list[dict[str, Any]]:
     """[{node_id, node_name, node_slug, term, pos}] — one row per node,
     earliest hit wins."""
     if not text:
         return []
+    text = text[:MATCH_TEXT_CAP]
     rows = await db.query(_MATCH_SQL, (text,))
     best: dict[str, dict[str, Any]] = {}
     for r in rows:
@@ -1244,7 +1235,9 @@ async def _artifact_from_event(event: bus.Event) -> tuple[str, str, str] | None:
         parts = [str(p.get("topic") or ""), str(p.get("summary") or "")]
         ws = await _session_workspace(p.get("session_id"))
         if ws:
-            report = _read_text(ws / "06_深度报告.md")
+            # threaded: clamped report reads still reach ARTIFACT_READ_CAP and
+            # the bus awaits this handler inline — never stall the emitter
+            report = await asyncio.to_thread(_read_text, ws / "06_深度报告.md")
             if report:
                 parts.append(report)
         return "research", str(event.ref_id), "\n\n".join(s for s in parts if s.strip())
@@ -1270,7 +1263,8 @@ async def _artifact_from_event(event: bus.Event) -> tuple[str, str, str] | None:
         text: str | None = None
         ws = await _session_workspace(p.get("session_id"))
         if ws:
-            text = _read_text(ws / str(p.get("file") or f"{analyst_id}.md"))
+            text = await asyncio.to_thread(  # same off-loop rule as above
+                _read_text, ws / str(p.get("file") or f"{analyst_id}.md"))
         if not (text and text.strip()) and p.get("task_id"):
             row = await db.query_one("SELECT output FROM tasks WHERE id = ?", (str(p["task_id"]),))
             text = (row or {}).get("output")
@@ -1621,20 +1615,6 @@ async def promote_candidate(
         log.info("chain node created: %s (%s, %s)", cand["name"], kind, node_id)
     node = await get_node(node_id)
     return {"node": node, "merged": merged, "candidate_id": candidate_id}
-
-
-async def reject_candidate(candidate_id: str) -> dict[str, Any]:
-    """Mark a pending candidate rejected (conditional claim, same idiom)."""
-    cand = await db.query_one("SELECT * FROM chain_candidates WHERE id = ?", (candidate_id,))
-    if cand is None:
-        raise LookupError(f"unknown chain candidate: {candidate_id}")
-    claimed = await db.execute(
-        "UPDATE chain_candidates SET status = 'rejected' WHERE id = ? AND status = 'pending'",
-        (candidate_id,),
-    )
-    if not claimed:
-        raise PromoteConflict(f"candidate {candidate_id} is '{cand['status']}', not pending")
-    return {**cand, "status": "rejected"}
 
 
 # ---- promotion threshold (admin_state config row) ----------------------------------

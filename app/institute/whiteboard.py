@@ -18,7 +18,6 @@ import logging
 import math
 import shutil
 import struct
-import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,8 +26,10 @@ from .. import bus, db
 from ..config import get_settings
 from ..hands.registry import get_registry
 from ..router import executor
+from ..util import new_id
 from . import vectors
 from .analysts import get_analyst, roster
+from .claims import claim_admin_state, lease_stale_checker, release_admin_state
 from .prompts import (
     date_anchor,
     extract_summary,
@@ -114,6 +115,15 @@ async def add_topic(
         (topic, question, source, score, content_hash, category or None, bus.now_iso()),
     )
     row = await db.query_one("SELECT * FROM topic_pool WHERE content_hash = ?", (content_hash,))
+    if n:
+        # emitted here in the domain layer so EVERY add path (API, MCP, daily /
+        # research follow-ups) publishes exactly one topic_pool.added per real
+        # insert, keyed off the same atomic INSERT OR IGNORE rowcount verdict —
+        # never a phantom event for a deduped call.
+        await bus.emit(
+            "topic_pool.added", "topic", str((row or {}).get("id", "")),
+            {"topic": topic, "source": source},
+        )
     return {**(row or {}), "inserted": bool(n)}
 
 
@@ -142,43 +152,30 @@ def _topic_claim_token(owner: str) -> str:
     return json.dumps({"owner": owner, "claimed_at": bus.now_iso()})
 
 
-def _topic_claim_live(value: str, key: str) -> bool:
-    try:
-        claimed_at = datetime.fromisoformat(json.loads(value)["claimed_at"])
-        age_s = (datetime.fromisoformat(bus.now_iso()) - claimed_at).total_seconds()
-        if age_s < 0:
-            log.warning("topic claim %s has a future claimed_at (%s); treating as stale", key, claimed_at)
-        return 0 <= age_s < TOPIC_CLAIM_LEASE_S
-    except (ValueError, KeyError, TypeError):
-        return False  # corrupt claims must not wedge a topic forever
+async def _topic_claim_stale(value: str, key: str) -> bool:
+    """Stale = lease expired / future claimed_at / corrupt token (shared
+    claims.py checker); the clock stays bus.now_iso-based, as this module's
+    timestamps all are."""
+    return await lease_stale_checker(
+        TOPIC_CLAIM_LEASE_S,
+        now=lambda: datetime.fromisoformat(bus.now_iso()),
+        label="topic claim",
+    )(value, key)
 
 
 async def _claim_topic(topic_id: int) -> tuple[str, str] | None:
-    """Claim a pool topic, taking over an expired claim with an exact-value CAS."""
-    key = _topic_claim_key(topic_id)
-    token = _topic_claim_token(uuid.uuid4().hex[:12])
-    n = await db.execute(
-        "INSERT INTO admin_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
-        (key, token),
+    """Claim a pool topic, taking over an expired claim with an exact-value CAS
+    (the shared claims.claim_admin_state idiom)."""
+    return await claim_admin_state(
+        _topic_claim_key(topic_id),
+        make_token=lambda: _topic_claim_token(new_id()),
+        is_stale=_topic_claim_stale,
     )
-    if n:
-        return key, token
-
-    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
-    if row is None:  # released between INSERT and SELECT; retry on the next kickoff
-        return None
-    if _topic_claim_live(row["value"], key):
-        return None
-    n = await db.execute(
-        "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
-        (token, key, row["value"]),
-    )
-    return (key, token) if n else None
 
 
 async def _release_topic_claim(key: str, token: str) -> None:
     # A timed-out zombie must not erase the newer owner's takeover claim.
-    await db.execute("DELETE FROM admin_state WHERE key = ? AND value = ?", (key, token))
+    await release_admin_state(key, token)
 
 
 async def reap_orphans() -> dict[str, int]:
@@ -200,7 +197,7 @@ async def reap_orphans() -> dict[str, int]:
             (len(TOPIC_CLAIM_PREFIX), TOPIC_CLAIM_PREFIX),
         )
         for row in claims:
-            if _topic_claim_live(row["value"], row["key"]):
+            if not await _topic_claim_stale(row["value"], row["key"]):
                 continue
             deleted = await db.execute(
                 "DELETE FROM admin_state WHERE key = ? AND value = ?",
@@ -596,7 +593,7 @@ def _match_root_analyst(text: str) -> str:
 
 def _new_board_session(topic: str, now: str) -> dict[str, str]:
     """Allocate session metadata; its row lands atomically with the board."""
-    session_id = uuid.uuid4().hex[:12]
+    session_id = new_id()
     workspace = get_settings().workspaces_dir / "sessions" / session_id
     return {
         "id": session_id,
@@ -626,7 +623,7 @@ async def _open_board(
     topic_claim: tuple[int, str, str] | None = None,
 ) -> dict[str, Any]:
     if topic_claim is None:
-        board_id = uuid.uuid4().hex[:12]
+        board_id = new_id()
     else:
         try:
             # The claim owner doubles as the reserved board id. This lets the
@@ -674,7 +671,7 @@ async def _open_board(
         await conn.execute(
             "INSERT INTO whiteboard_cards (id, board_id, idx, analyst_id, status, question, created_at) "
             "VALUES (?,?,1,?,'pending',?,?)",
-            (uuid.uuid4().hex[:12], board_id, root, question, now),
+            (new_id(), board_id, root, question, now),
         )
     # COMMIT done: the board exists. From here on no ordinary exception may
     # escape — callers (kickoff) treat a raise as "nothing landed" and release
@@ -898,15 +895,12 @@ async def _run_card(board: dict[str, Any], card: dict[str, Any]) -> None:
             context_blocks=context_blocks or None,
             output_file=output_file,
         )
-        hand = analyst.hand or settings.default_hand
         # opt-in weighted pick (settings.enable_hand_weights, default False = the
-        # line above is final): pool = available hands with a positive 'whiteboard'
-        # weight row; an explicit analyst.hand is always respected.
-        if settings.enable_hand_weights and not analyst.hand:
-            reg = get_registry()
-            pool = [h for h, w in reg.weights_snapshot().get("whiteboard", {}).items()
-                    if w > 0 and reg.is_available(h)]
-            hand = reg.pick_weighted_hand("whiteboard", pool) or hand
+        # default hand is final): pool = available hands with a positive
+        # 'whiteboard' weight row; an explicit analyst.hand is always respected.
+        hand = get_registry().pick_weighted("whiteboard", explicit=analyst.hand) or (
+            analyst.hand or settings.default_hand
+        )
         task = await executor.submit(
             hand, prompt,
             source="whiteboard", model=analyst.model,
@@ -1048,7 +1042,7 @@ async def _handoff(board: dict[str, Any]) -> None:
     await db.execute(
         "INSERT INTO whiteboard_cards (id, board_id, idx, analyst_id, status, question, created_at) "
         "VALUES (?,?,?,?,'pending',?,?)",
-        (uuid.uuid4().hex[:12], board["id"], next_idx, analyst_id, question or "", bus.now_iso()),
+        (new_id(), board["id"], next_idx, analyst_id, question or "", bus.now_iso()),
     )
     await db.execute(
         "UPDATE whiteboard_boards SET updated_at=? WHERE id=?", (bus.now_iso(), board["id"])

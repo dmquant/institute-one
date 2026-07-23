@@ -841,6 +841,10 @@ async def test_api_stored_switches_are_consumed_by_scheduler(client):
     convention, missing = enabled)."""
     from app.institute import scheduler
 
+    # warm the scheduler's admin_state cache with a miss (enabled-by-default),
+    # so the assertions below also prove the PUT invalidates that cache
+    assert await scheduler.job_switch_enabled("probe-api") is True
+
     r = await client.put(SWITCHES_URL,
                          json={"switches": {"job:probe-api": False}, "expected_version": 0})
     assert r.status_code == 200

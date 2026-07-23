@@ -996,17 +996,21 @@ async def test_event_outbox_interleaved_drains_emit_once(monkeypatch):
     outbox_id, _ = await insert_event_outbox()
     orig_emit = bus.emit
     stalled = {"first": True}
+    inside_emit = asyncio.Event()
+    proceed = asyncio.Event()
 
     async def slow_first_emit(*args, **kwargs):
         if stalled["first"]:
             stalled["first"] = False
-            await asyncio.sleep(0.2)      # A holds the lease inside its emit
+            inside_emit.set()           # A holds the lease inside its emit...
+            await proceed.wait()        # ...while B re-SELECTs the same row
         return await orig_emit(*args, **kwargs)
 
     monkeypatch.setattr(bus, "emit", slow_first_emit)
     task_a = asyncio.create_task(factcheck.drain_dispute_outbox())
-    await asyncio.sleep(0.05)             # let A claim, then race B mid-window
+    await asyncio.wait_for(inside_emit.wait(), timeout=1)  # A claimed and is mid-emit
     r_b = await factcheck.drain_dispute_outbox()
+    proceed.set()
     r_a = await task_a
 
     assert r_a["events"] + r_b["events"] == 1

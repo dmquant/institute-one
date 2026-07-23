@@ -70,9 +70,14 @@ class RunBody(BaseModel):
 async def run_workflow(workflow_id: str, body: RunBody | None = None):
     if await workflows.get_workflow(workflow_id) is None:
         raise HTTPException(404, "workflow not found")
-    run_id = await workflows.run_workflow(
-        workflow_id, variables=(body.variables if body else None), source="api",
-    )
+    try:
+        run_id = await workflows.run_workflow(
+            workflow_id, variables=(body.variables if body else None), source="api",
+        )
+    except ValueError as exc:
+        # missing/blank declared variables (e.g. research without TOPIC) — the
+        # engine refuses to feed a literal ${NAME} placeholder to the model
+        raise HTTPException(400, str(exc)) from exc
     return {"run_id": run_id}
 
 

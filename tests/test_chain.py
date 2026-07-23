@@ -93,6 +93,22 @@ async def test_backstop_case_sensitive_and_empty_inputs():
     assert await chain.backstop_tag("", "r3", "宁德时代") == []
 
 
+async def test_match_hits_scans_only_the_capped_prefix():
+    """MATCH_TEXT_CAP: mention detection binds a bounded PREFIX of the
+    artifact into the instr() scan (the full text reaches the 200KB output
+    cap and would hog the single shared connection twice per artifact).
+    Mentions inside the cap link; a mention living ONLY beyond it does not —
+    the accepted audit trade-off."""
+    node = await chain.create_node("宁德时代", "company")
+
+    head = "填充" * (chain.MATCH_TEXT_CAP // 2 - 10) + "宁德时代"
+    assert await chain.backstop_tag("research", "cap-head", head) == [node["id"]]
+
+    tail = "填" * (chain.MATCH_TEXT_CAP + 100) + "宁德时代"
+    assert await chain.backstop_tag("research", "cap-tail", tail) == []
+    assert await chain.entity_footer(tail) == ""
+
+
 async def test_backstop_via_research_event_handler():
     node = await chain.create_node("英伟达", "company")
     event = bus.Event(

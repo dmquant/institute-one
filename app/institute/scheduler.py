@@ -53,13 +53,47 @@ RESEARCH_TREE_BOOKED_PREFIX = "research_tree_booked:"
 # admin_state is the operator-config surface. Two keys matter to metered():
 # 'maintenance' (global pause of every gated job) and 'feature_switches'
 # (per-job kill switches, key convention 'job:<name>', consumed below).
+#
+# Both rows are re-read on EVERY job firing, so they sit behind a short
+# process-local TTL cache: a firing burst (24 jobs, several per minute) would
+# otherwise pay two serialized SQLite reads each time. Every write path —
+# set_maintenance() below and the feature-switches CAS PUT in
+# app/api/operator.py — invalidates explicitly, so a committed flip is
+# visible immediately; the TTL only bounds staleness for out-of-band edits
+# (manual sqlite3), where a few seconds is harmless.
+_ADMIN_STATE_CACHE_TTL_S = 5.0
+_admin_state_cache: dict[str, tuple[float, str | None]] = {}
+
+
+async def _admin_state_value(key: str) -> str | None:
+    """Raw admin_state value for ``key``, cached for ~5s. The raw string is
+    cached (not the parsed payload) so the fail-open JSON handling in the
+    callers below stays exactly where it was."""
+    now = time.monotonic()
+    hit = _admin_state_cache.get(key)
+    if hit is not None and now - hit[0] < _ADMIN_STATE_CACHE_TTL_S:
+        return hit[1]
+    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (key,))
+    value = row["value"] if row is not None else None
+    _admin_state_cache[key] = (now, value)
+    return value
+
+
+def invalidate_admin_state_cache(key: str | None = None) -> None:
+    """Drop cached admin_state rows so a committed write is seen at once
+    (``None`` = every cached row)."""
+    if key is None:
+        _admin_state_cache.clear()
+    else:
+        _admin_state_cache.pop(key, None)
+
 
 async def get_maintenance() -> bool:
-    row = await db.query_one("SELECT value FROM admin_state WHERE key = 'maintenance'")
-    if row is None:
+    value = await _admin_state_value("maintenance")
+    if value is None:
         return False
     try:
-        return bool(json.loads(row["value"]).get("paused", False))
+        return bool(json.loads(value).get("paused", False))
     except Exception:  # noqa: BLE001 - corrupt state means not paused
         return False
 
@@ -70,6 +104,7 @@ async def set_maintenance(paused: bool) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (json.dumps({"paused": paused}),),
     )
+    invalidate_admin_state_cache("maintenance")
     log.info("maintenance %s", "paused" if paused else "resumed")
 
 
@@ -83,11 +118,11 @@ async def job_switch_enabled(name: str) -> bool:
     Both value shapes are accepted: the versioned envelope the CAS PUT writes
     ({"version": N, "switches": {...}}) and the legacy flat {name: bool} map.
     """
-    row = await db.query_one("SELECT value FROM admin_state WHERE key = 'feature_switches'")
-    if row is None:
+    value = await _admin_state_value("feature_switches")
+    if value is None:
         return True
     try:
-        raw = json.loads(row["value"])
+        raw = json.loads(value)
     except Exception:  # noqa: BLE001 - corrupt state means enabled
         return True
     if not isinstance(raw, dict):

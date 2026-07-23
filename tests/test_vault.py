@@ -6,6 +6,7 @@ import shutil
 import pytest
 
 from app import bus, db
+from app.institute import operator
 from app.vault.writer import REGION_BEGIN, REGION_END, get_writer
 
 
@@ -117,6 +118,54 @@ async def test_doctor_counts():
     assert counts["missing"] == 1
     assert counts["drifted"] == 0
     assert sibling_rel != conflict_rel
+
+
+async def test_doctor_scan_runs_off_the_event_loop(monkeypatch):
+    """POST /api/vault/doctor awaits writer.doctor() on the event loop, so the
+    full-vault read + SHA scan must run in a worker thread (sharing the sweep's
+    classification) — a big vault otherwise freezes SSE / /api/ask / scheduler
+    ticks for seconds. A deliberately slowed read must leave the loop breathing."""
+    import asyncio
+    import threading
+    import time
+
+    writer = get_writer()
+    rel = await writer.write_note(
+        "Doctor/loop.md", {}, "v1", artifact_kind="memory", artifact_id="dl1", region=True,
+    )
+    p = writer.root / rel
+    p.write_text(p.read_text(encoding="utf-8").replace("v1", "v1 人工改动"),
+                 encoding="utf-8")               # region edited -> drifted
+
+    real_read = operator._read_exact
+    event_loop_thread = threading.get_ident()
+    read_threads = []
+
+    def slow_read(path):
+        read_threads.append(threading.get_ident())
+        time.sleep(0.2)  # a big vault, compressed into one slow region read
+        return real_read(path)
+
+    monkeypatch.setattr(operator, "_read_exact", slow_read)
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    t = asyncio.create_task(ticker())
+    try:
+        counts = await writer.doctor()
+    finally:
+        t.cancel()
+    assert counts["drifted"] == 1          # counts still authoritative
+    assert read_threads and all(tid != event_loop_thread for tid in read_threads)
+    # blocked-loop behaviour yields ~0 ticks during the 0.2s read; a threaded
+    # scan yields ~20 — a generous threshold keeps the test load-tolerant
+    assert ticks >= 3
 
 
 async def test_unsafe_paths_rejected():

@@ -8,8 +8,11 @@ the SQLite database directly.
 
 Doctor is strictly READ-ONLY (REVIEW-C6 H1): every database access goes
 through ``file:...?mode=ro`` (sqlite3 stdlib) — including the vault drift
-scan, which reads ``vault_index`` over that read-only connection and re-runs
-the writer's pure classification helpers. The doctor path never touches
+scan, which reads ``vault_index`` over that read-only connection and runs
+the SAME shared classification pass as the server
+(``app.institute.operator._classify_vault_rows``, imported lazily inside
+``check_vault``: a side-effect-free import that keeps doctor's startup
+module graph minimal). The doctor path never touches
 ``app.db`` (``init()``/``migrate()``/``close()``): those open a write
 connection, switch journal mode and run DDL.
 
@@ -48,10 +51,13 @@ DISK_FAIL_BYTES = 1 * 1024**3   # < 1 GiB free
 DISK_WARN_BYTES = 5 * 1024**3   # < 5 GiB free
 
 # Per-CLI no-prompt login-status probes (REVIEW-C6 M1): argv appended to the
-# resolved binary; exit 0 = logged in, non-zero = not logged in. Both commands
-# only read cached credentials — no prompt, no network generation, no quota.
-# CLIs with no reliable non-interactive status command map to None and are
-# reported as "auth unknown" (WARN) instead of ok.
+# resolved binary; exit 0 = logged in, non-zero = not logged in — UNLESS the
+# stderr shows the subcommand itself was not recognized (usage/unknown-command,
+# see _AUTH_PROBE_USAGE_HINTS): then the upstream CLI renamed/removed its
+# status command and the verdict is auth unknown, never a false FAIL. Both
+# commands only read cached credentials — no prompt, no network generation,
+# no quota. CLIs with no reliable non-interactive status command map to None
+# and are reported as "auth unknown" (WARN) instead of ok.
 AUTH_PROBES: dict[str, list[str] | None] = {
     "claude": ["auth", "status"],   # exits 0 when logged in, 1 when not
     "codex": ["login", "status"],   # exits 0 when logged in, 1 when not
@@ -59,6 +65,11 @@ AUTH_PROBES: dict[str, list[str] | None] = {
     "agy": None,
     "opencode": None,
 }
+
+# Case-insensitive stderr signatures meaning "this CLI has no such subcommand"
+# (renamed/removed upstream) rather than "not logged in" (REVIEW follow-up:
+# a non-zero probe exit used to be read as logged-out unconditionally).
+_AUTH_PROBE_USAGE_HINTS = ("usage:", "unknown command", "unrecognized", "invalid choice")
 
 
 def _run_async(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -126,6 +137,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _probe_host(host: str) -> str:
+    """Connectable probe destination for a configured bind host.
+
+    Wildcard binds (0.0.0.0/::) mean "every local interface" and are not
+    connect destinations — probe through loopback instead, the same mapping
+    scripts/start.sh applies to its readiness check.
+    """
+    return "127.0.0.1" if host in ("0.0.0.0", "::", "[::]") else host
+
+
 def _port_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=1):
@@ -135,9 +156,12 @@ def _port_open(host: str, port: int) -> bool:
 
 
 def _probe_health(settings: Settings) -> dict | None:
+    host = _probe_host(settings.host)
+    if ":" in host and not host.startswith("["):  # IPv6 literal: URLs need brackets
+        host = f"[{host}]"
     try:
         with httpx.Client(trust_env=False, timeout=3) as client:
-            resp = client.get(f"http://{settings.host}:{settings.port}/health")
+            resp = client.get(f"http://{host}:{settings.port}/health")
         if resp.status_code == 200:
             return resp.json()
     except (httpx.HTTPError, ValueError):
@@ -163,7 +187,7 @@ def probe_server(settings: Settings) -> ServerProbe:
         pid=pid,
         pid_alive=alive,
         pid_is_uvicorn=is_uvicorn,
-        port_open=_port_open(settings.host, settings.port),
+        port_open=_port_open(_probe_host(settings.host), settings.port),
         health=_probe_health(settings),
     )
 
@@ -175,7 +199,9 @@ def _probe_cli_hand(name: str, binary: str, env: dict[str, str]) -> tuple[bool |
 
     usable: True = binary runs AND auth probe (when one exists) says logged
     in; False = provably broken or logged out; None = binary runs but auth
-    cannot be verified (no reliable status command) — "auth unknown".
+    cannot be verified — no reliable status command, or the probe subcommand
+    itself is not recognized by this CLI version (usage/unknown-command
+    stderr: the upstream CLI renamed/removed it) — "auth unknown".
     """
     def _run(args: list[str]) -> subprocess.CompletedProcess | None:
         try:
@@ -203,6 +229,12 @@ def _probe_cli_hand(name: str, binary: str, env: dict[str, str]) -> tuple[bool |
         return None, f"{version_str}; auth unknown ({name} {' '.join(probe_args)} failed to run)"
     if auth.returncode == 0:
         return True, f"{version_str}; authenticated ({name} {' '.join(probe_args)})"
+    stderr = (auth.stderr or "").lower()
+    if any(hint in stderr for hint in _AUTH_PROBE_USAGE_HINTS):
+        return None, (
+            f"{version_str}; auth unknown ({name} {' '.join(probe_args)} not recognized "
+            "by this CLI version — status subcommand renamed/removed upstream?)"
+        )
     return False, f"not logged in ({name} {' '.join(probe_args)} exited {auth.returncode})"
 
 
@@ -353,40 +385,14 @@ def check_db(settings: Settings) -> tuple[Check, list[str]]:
     ), []
 
 
-def _classify_ledger_row(root: Path, path: str, sha256: str, state: str, mode: str) -> str:
-    """clean | conflict | missing | drifted for one vault_index row.
-
-    Pure read-only re-implementation of ``VaultWriter.doctor()``'s per-row
-    logic, sharing the writer's pure helpers so the two classifications can
-    never diverge on hashing/region semantics.
-    """
-    from .vault.writer import _extract_region, _has_ownership, _read_exact, _sha_file, _sha_text
-
-    target = root / path
-    if not target.exists():
-        return "missing"
-    if state == "conflict":
-        return "conflict"
-    if mode == "region":
-        text = _read_exact(target)
-        if text is None:
-            # deleted between exists() and read (race) vs unreadable
-            return "missing" if not target.exists() else "drifted"
-        region = _extract_region(text)
-        if region is None or _sha_text(region) != sha256 or not _has_ownership(text):
-            return "drifted"
-        return "clean"
-    if _sha_file(target) != sha256:
-        return "drifted"
-    return "clean"
-
-
 def check_vault(settings: Settings) -> Check:
     """Ledger vs disk drift scan — strictly read-only (REVIEW-C6 H1).
 
     Reads ``vault_index`` over a read-only SQLite connection and hashes vault
     files; never goes near ``app.db`` (whose init() opens a write connection,
-    switches journal mode and runs the migrator).
+    switches journal mode and runs the migrator). Classification reuses the
+    server's ONE pass (``app.institute.operator._classify_vault_rows``) so
+    doctor and writer/sweep verdicts are a single implementation.
     """
     if settings.vault_dir is None:
         return Check("vault", SKIP, "vault_dir not configured")
@@ -407,9 +413,14 @@ def check_vault(settings: Settings) -> Check:
         conn.close()
 
     root = settings.vault_dir.expanduser()
-    counts = {"total": len(rows), "clean": 0, "conflict": 0, "missing": 0, "drifted": 0}
-    for r in rows:
-        counts[_classify_ledger_row(root, r["path"], r["sha256"], r["state"], r["mode"])] += 1
+    # THE classification pass — the writer's doctor(), the operator sweep and
+    # this scan share one implementation; the lazy import keeps the operator
+    # module graph (bus/db/executor) out of every other CLI command. Rows are
+    # plain dicts, not sqlite3.Row: the shared helper's contract is key-indexed
+    # mappings from ``db.query``.
+    from .institute.operator import _classify_vault_rows
+
+    counts, _nonclean = _classify_vault_rows(root, [dict(r) for r in rows])
     detail = (
         f"{counts['total']} ledger rows: {counts['clean']} clean, "
         f"{counts['conflict']} conflict, {counts['missing']} missing, "
@@ -429,6 +440,9 @@ def check_cron(settings: Settings) -> Check:
     except sqlite3.Error as exc:
         return Check("cron", WARN, f"cannot open db read-only ({exc})")
     try:
+        # Same per-job last-row + trailing-24h-failure knowledge as
+        # app/api/meta.py's cron_health() — this is its offline twin; a
+        # cron_metrics semantics change must land in both.
         last_rows = conn.execute(
             "SELECT job, ok, skipped_by_maintenance, fired_at FROM cron_metrics "
             "WHERE id IN (SELECT MAX(id) FROM cron_metrics GROUP BY job) ORDER BY job"
@@ -474,6 +488,10 @@ def check_orphans(settings: Settings, server_up: bool) -> Check:
         return Check("orphans", WARN, f"cannot open db read-only ({exc})")
     counts: dict[str, int] = {}
     try:
+        # The same residue sets the boot-time recovery sweeps own:
+        # app/router/executor.py's recover_orphans() (tasks queued/running)
+        # and app/institute/research.py's recover_orphans() (research
+        # 'running'). A status-vocabulary change must land in all three.
         for label, sql in (
             ("tasks", "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running')"),
             ("research_queue", "SELECT COUNT(*) FROM research_queue WHERE status = 'running'"),

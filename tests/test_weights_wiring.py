@@ -7,8 +7,9 @@ The ON sections use registered fake hands plus extreme weights (0 vs 1) so the
 assertions are deterministic, and one seeded-RNG test pins the distribution
 shift. Explicit hands (analyst.hand / workflow step hand) always win.
 
-Call sites under test (PATCH-NOTES-B2 wiring shape: build a live pool, then
-pick_weighted_hand(scope, pool), then submit as before — resolve untouched):
+Call sites under test (all four funnel through registry.pick_weighted, which
+centralizes the feature switch, explicit-hand precedence, pool building and
+the availability filter; pick_weighted_hand samples — resolve untouched):
 - analyst_daily._pick_hand        scope 'daily'      pool = ROTATION_HANDS ∩ available
 - whiteboard._run_card            scope 'whiteboard' pool = positive weight rows ∩ available
 - mailbox._run_dispatch           scope 'mailbox'    pool = positive weight rows ∩ available

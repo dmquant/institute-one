@@ -87,7 +87,6 @@ import json
 import logging
 import math
 import re
-import uuid
 from typing import Any
 
 import aiosqlite
@@ -95,6 +94,7 @@ import aiosqlite
 from .. import bus, db
 from ..config import get_settings
 from ..router import executor
+from ..util import new_id
 from .prompts import date_anchor, work_date
 
 log = logging.getLogger("institute.research_tree")
@@ -362,7 +362,7 @@ async def create_tree(root_topic: str, *, max_depth: int = 2, max_nodes: int = 1
             "root_topic": topic,
         }
 
-    tree_id, root_id, now = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12], bus.now_iso()
+    tree_id, root_id, now = new_id(), new_id(), bus.now_iso()
     # NB: transaction() holds the db write lock — use the yielded conn
     # directly (db.execute in here would deadlock; the factcheck precedent)
     async with db.transaction() as conn:
@@ -517,7 +517,7 @@ async def _insert_children(
                 "WHERE (SELECT status FROM research_trees WHERE id = ?) = 'exploring' "
                 "AND (SELECT COUNT(*) FROM research_tree_nodes "
                 "     WHERE tree_id = ? AND status != 'pruned') < ?",
-                (uuid.uuid4().hex[:12], node["tree_id"], node["id"], child_depth,
+                (new_id(), node["tree_id"], node["id"], child_depth,
                  child["topic"], child["question"], now,
                  node["tree_id"], node["tree_id"], tree["max_nodes"]),
             )
@@ -541,7 +541,7 @@ async def _insert_children(
             "(id, tree_id, parent_id, depth, topic, question, status, created_at, finished_at) "
             "SELECT ?,?,?,?,?,?, 'pruned', ?, ? "
             "WHERE (SELECT status FROM research_trees WHERE id = ?) = 'exploring'",
-            (uuid.uuid4().hex[:12], node["tree_id"], node["id"], child_depth,
+            (new_id(), node["tree_id"], node["id"], child_depth,
              child["topic"], child["question"], now, now, node["tree_id"]),
         )
         pruned += cur.rowcount
@@ -794,7 +794,26 @@ async def tick() -> dict[str, Any]:
         out["claimed"] = len(nodes)
         if not nodes:
             return out
-        results = await asyncio.gather(*(_run_node(n) for n in nodes), return_exceptions=True)
+        # Bounded fan-out (same rule as analyst_daily.run_all): the executor
+        # caps each model call, but a wedged driver would hang this gather —
+        # and with it every future tick (max one instance). On timeout the
+        # cancelled batch's still-running nodes requeue as pending (the
+        # recover_orphans idiom), so no node strands until a restart.
+        budget_s = len(nodes) * (get_settings().default_timeout_s + 120) + 60
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*(_run_node(n) for n in nodes), return_exceptions=True),
+                timeout=budget_s,
+            )
+        except asyncio.TimeoutError:
+            log.error("research tree tick exceeded its %.0fs budget; requeueing the batch", budget_s)
+            marks = ",".join("?" for _ in nodes)
+            out["failed"] += await db.execute(
+                f"UPDATE research_tree_nodes SET status='pending', task_id=NULL "
+                f"WHERE status='running' AND id IN ({marks})",
+                [n["id"] for n in nodes],
+            )
+            return out
         for res in results:
             if isinstance(res, BaseException):  # _run_node guards internally; belt only
                 log.error("run_node raised despite guards: %r", res)

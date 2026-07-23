@@ -20,6 +20,7 @@ from .. import bus, db
 from ..config import get_settings
 from ..hands.registry import get_registry
 from ..router import executor
+from ..util import new_id
 from .analysts import get_analyst
 
 log = logging.getLogger("institute.mailbox")
@@ -36,11 +37,12 @@ SWEEP_REDRIVE_LIMIT = 20
 # orphans sorted behind it.
 SWEEP_SCAN_LIMIT = 100
 SWEEP_CURSOR_KEY = "mailbox_sweep_cursor"
-# Dispatch lease TTL (R4 P1, 0040): a pending row whose lease is younger than
-# this belongs to a live worker (or a crash younger than the horizon) and is
-# not sweepable; older leases are reclaimed. Sized over the executor's
-# default_timeout_s (1800s) plus its 30s belt, so a slow-but-alive dispatch
-# is never re-driven from under its worker.
+# Dispatch lease TTL floor (R4 P1, 0040): a pending row whose lease is younger
+# than this belongs to a live worker (or a crash younger than the horizon) and
+# is not sweepable; older leases are reclaimed. The effective TTL is computed
+# at every expiry check as max(this floor, settings.default_timeout_s + 300),
+# so raising the executor timeout always widens the lease horizon with it —
+# a slow-but-alive dispatch is never re-driven from under its worker.
 DISPATCH_LEASE_TTL_S = 45 * 60
 # Hard model-attempt ceiling (R5 P1): every task booking increments this in
 # the SAME transaction as the durable task row and dispatch binding.
@@ -66,7 +68,7 @@ def _spawn_bg(coro: Any) -> None:
 async def create_thread(subject: str, analyst_id: str, body: str) -> dict[str, Any]:
     if get_analyst(analyst_id) is None:
         raise ValueError(f"unknown analyst {analyst_id}")
-    thread_id = uuid.uuid4().hex[:12]
+    thread_id = new_id()
     now = bus.now_iso()
     await db.execute(
         "INSERT INTO mailbox_threads (id, subject, analyst_id, status, created_at, updated_at) "
@@ -151,9 +153,15 @@ async def _dispatch(thread_id: str) -> None:
 
 
 def _stale_lease_cutoff() -> str:
-    """Leases written strictly before this instant are reclaimable."""
+    """Leases written strictly before this instant are reclaimable.
+
+    TTL = max(DISPATCH_LEASE_TTL_S, settings.default_timeout_s + 300): the
+    constant is only a floor, so a configured executor timeout longer than
+    40 minutes still cannot be swept out from under its live worker.
+    """
+    ttl = max(DISPATCH_LEASE_TTL_S, get_settings().default_timeout_s + 300)
     return (
-        datetime.fromisoformat(bus.now_iso()) - timedelta(seconds=DISPATCH_LEASE_TTL_S)
+        datetime.fromisoformat(bus.now_iso()) - timedelta(seconds=ttl)
     ).isoformat(timespec="seconds")
 
 
@@ -199,14 +207,12 @@ async def _prepare_dispatch(
     prompt = await memory.prompt_with_memory(
         analyst, task_text, context_blocks=[context] if context else None,
     )
-    hand = analyst.hand or settings.default_hand
-    if settings.enable_hand_weights and not analyst.hand:
-        registry = get_registry()
-        pool = [
-            name for name, weight in registry.weights_snapshot().get("mailbox", {}).items()
-            if weight > 0 and registry.is_available(name)
-        ]
-        hand = registry.pick_weighted_hand("mailbox", pool) or hand
+    # opt-in weighted pick (settings.enable_hand_weights, default False): the
+    # pool is the 'mailbox' scope's positive weight rows; an explicit
+    # analyst.hand always wins and no pick keeps the default hand.
+    hand = get_registry().pick_weighted("mailbox", explicit=analyst.hand) or (
+        analyst.hand or settings.default_hand
+    )
     return thread, analyst, hand, prompt
 
 
@@ -235,7 +241,7 @@ async def _book_dispatch_task(
         return None, None, "capacity"
 
     settings = get_settings()
-    task_id = uuid.uuid4().hex[:12]
+    task_id = new_id()
     lease_id = uuid.uuid4().hex
     workspace = settings.workspaces_dir / "adhoc" / task_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -256,15 +262,10 @@ async def _book_dispatch_task(
             await cur.close()
             if not claimed:
                 raise _DispatchBookingRefused("lost")
-            await conn.execute(
-                "INSERT INTO tasks "
-                "(id, session_id, requested_hand, model, prompt, status, source, "
-                "parent_run_id, workspace_dir, timeout_s, fallback_chain, lineage_root, "
-                "mailbox_dispatch_id, created_at) "
-                "VALUES (?,?,?,?,?,'queued',?,?,?,?,?,?,?,?)",
-                (task_id, None, hand, model, prompt, "mailbox", None,
-                 str(workspace), settings.default_timeout_s, None, None,
-                 message_id, now),
+            await executor.book_prepared(
+                conn=conn, task_id=task_id, hand=hand, model=model, prompt=prompt,
+                source="mailbox", workspace=workspace,
+                timeout_s=settings.default_timeout_s, mailbox_dispatch_id=message_id,
             )
     except _DispatchBookingRefused as refusal:
         return None, None, refusal.reason
@@ -278,16 +279,7 @@ async def _book_dispatch_task(
 
 async def _drive_bound_task(task_id: str) -> executor.Task:
     """Drive or join one already durable queued task through executor core."""
-    active = executor._running.get(task_id)  # noqa: SLF001 - shared owner registry
-    if active is not None and not active.done():
-        return await asyncio.shield(active)
-    atask = asyncio.ensure_future(executor._execute(task_id))  # noqa: SLF001
-    executor._register_driver(task_id, atask)  # noqa: SLF001
-    try:
-        return await atask
-    finally:
-        if executor._running.get(task_id) is atask:  # noqa: SLF001
-            executor._running.pop(task_id, None)  # noqa: SLF001
+    return await executor.submit_prepared(task_id)
 
 
 def _task_deadline_passed(task: dict[str, Any]) -> bool:

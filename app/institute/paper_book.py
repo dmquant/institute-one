@@ -85,11 +85,11 @@ import json
 import logging
 import math
 import sqlite3
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 from . import forecasts, market_data
 from .prompts import work_date
 
@@ -125,10 +125,6 @@ class TransitionConflict(PaperBookError):
 
 class RiskLimitConflict(TransitionConflict):
     """An opening risk invariant rejected the position (API maps to 409)."""
-
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
 
 
 # ---- config (admin_state, 0011 idiom) ----------------------------------------
@@ -241,7 +237,7 @@ async def _insert_position(fc: dict[str, Any], entry_date: str, entry_price: flo
     invariants (one position per forecast, one open position per security)
     are hard regardless.
     """
-    pid = _new_id()
+    pid = new_id()
     sql = (
         "INSERT INTO paper_positions (id, forecast_id, security_id, direction, "
         "entry_date, entry_price, size, stop_pct, target_pct, status, opened_at, updated_at) "

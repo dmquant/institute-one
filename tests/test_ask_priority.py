@@ -1,9 +1,10 @@
 """Interactive asks prefer an idle hand + the per-task cancel protocol.
 
 ROADMAP Phase 0 "Interactive asks queue behind long workflow steps":
-``executor.hand_busy()`` reads the per-hand mutex; ``tasks.prepare_ask``
-(shared by /api/ask and /api/ask/stream) reroutes an unpinned busy hand to
-the first idle+available hand in its fallback chain. Busy hands are faked by
+``executor.hand_busy()`` reads the per-hand mutex; ``tasks.resolve_ask``
+(shared by /api/ask, /api/ask/stream via ``prepare_ask`` and by the MCP
+institute_ask tool) reroutes an unpinned busy hand to the first
+idle+available hand in its fallback chain. Busy hands are faked by
 holding the real ``executor._hand_lock`` — no model calls beyond echo.
 
 Cancel: POST /api/tasks/{id}/cancel — queued rows flip conditionally (and a
@@ -171,6 +172,45 @@ async def test_ask_stream_shares_the_same_preprocessing(monkeypatch):
     assert done["type"] == "done"
     assert done["task"]["hand"] == "echo2"
     assert done["task"]["status"] == "completed"
+
+
+# ---- MCP institute_ask: same shared preprocessing -----------------------------
+
+
+async def _mcp_call(client: httpx.AsyncClient, name: str, arguments: dict) -> dict:
+    r = await client.post("/api/mcp", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    assert r.status_code == 200
+    payload = r.json()
+    assert "error" not in payload
+    return json.loads(payload["result"]["content"][0]["text"])
+
+
+async def test_mcp_institute_ask_shares_the_idle_hand_preference(monkeypatch):
+    """MCP institute_ask routes through tasks.resolve_ask (the same helper
+    prepare_ask wraps): an unpinned busy hand reroutes to an idle sibling."""
+    get_registry().register(SecondEchoHand())
+    monkeypatch.setitem(registry_mod.DEFAULT_FALLBACK_CHAINS, "echo", ["echo2"])
+    async with _busy("echo"):
+        async with _client() as client:
+            res = await _mcp_call(client, "institute_ask", {"prompt": "空闲手接单"})
+    assert res["hand"] == "echo2"
+    assert res["status"] == "completed"
+    assert "空闲手接单" in res["output"]
+
+
+async def test_mcp_institute_ask_passes_model_and_timeout_through():
+    """The drift fix: model/timeout_s are accepted and land on the task row."""
+    async with _client() as client:
+        res = await _mcp_call(client, "institute_ask", {
+            "prompt": "透传参数", "model": "echo-model", "timeout_s": 42,
+        })
+    assert res["status"] == "completed"
+    row = await db.query_one("SELECT model, timeout_s FROM tasks WHERE id = ?", (res["task_id"],))
+    assert row["model"] == "echo-model"
+    assert row["timeout_s"] == 42
 
 
 # ---- cancel protocol -----------------------------------------------------------

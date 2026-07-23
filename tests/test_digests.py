@@ -555,16 +555,21 @@ async def test_ask_stream_slow_consumer_drops_oldest_reports_status(monkeypatch)
 
 
 class SlowChunkHand(Hand):
-    """Emits one chunk, then finishes after a delay — lets the disconnect test
-    close the stream while the task is still running."""
+    """Emits one chunk, then parks on a test-controlled release before
+    finishing — lets the disconnect test close the stream while the task is
+    still running, with exact ordering instead of a timing guess."""
 
     name = "slowchunk"
     hand_type = "cli"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
     async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None) -> HandResult:
         if on_chunk:
             on_chunk({"type": "stdout", "text": "first\n"})
-        await asyncio.sleep(0.3)
+        await self.release.wait()
         if on_chunk:
             on_chunk({"type": "stdout", "text": "second\n"})
         return HandResult(output="first\nsecond\n", exit_code=0)
@@ -574,7 +579,8 @@ async def test_ask_stream_client_disconnect_does_not_cancel_task(monkeypatch):
     """Fire-and-forget semantics: closing the response mid-stream must leave the
     executor task running to completion (unlike the synchronous /api/ask) —
     and (M1) the bridge must stop buffering the moment the consumer is gone."""
-    get_registry().register(SlowChunkHand())
+    hand = SlowChunkHand()
+    get_registry().register(hand)
     from app.api import ask_stream as ask_stream_mod
 
     bridges: list = []
@@ -596,6 +602,7 @@ async def test_ask_stream_client_disconnect_does_not_cancel_task(monkeypatch):
 
     (bridge,) = bridges
     assert bridge.closed  # generator exit flipped the bridge off
+    hand.release.set()  # let the task finish on its own despite the disconnect
 
     row = await db.query_one("SELECT id FROM tasks WHERE prompt = 'slow please'")
     assert row is not None

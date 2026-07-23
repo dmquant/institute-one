@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter
 from pydantic import BaseModel, StrictBool
 
-from .. import db
+from .. import bus, db
 from ..config import VERSION, get_settings
 from ..hands.registry import get_registry
 from ..institute import scheduler
@@ -48,12 +50,17 @@ async def cron_health():
 
     The job set is scheduler.job_registry() (every @metered job, even ones
     that never fired) plus any job names only present in cron_metrics (renamed
-    jobs inside the 30-day window). Registry fields: registered/gated/schedule/
-    next_run_time (gated is None for metrics-only names). Metric fields keep
+    jobs inside the 30-day window). All three metric queries are bounded to
+    the advertised 30-day window (same fired_at cutoff shape the janitor
+    prunes with) — the SPA polls this endpoint every 30s, so the aggregate
+    scans must stay bounded even before the janitor catches up. Registry
+    fields: registered/gated/schedule/next_run_time (gated is None for
+    metrics-only names). Metric fields keep
     the pre-S4 shape: ok_rate counts real executions only (maintenance skips
     are neither ok nor failed); avg_duration_ms likewise. last_status is
     'ok'|'failed'|'skipped', None for jobs that never fired.
     """
+    cutoff = (datetime.fromisoformat(bus.now_iso()) - timedelta(days=30)).isoformat(timespec="seconds")
     aggregates = await db.query(
         """SELECT job,
                   COUNT(*) AS fires,
@@ -62,11 +69,16 @@ async def cron_health():
                   SUM(CASE WHEN skipped_by_maintenance = 0 AND ok = 0 THEN 1 ELSE 0 END) AS failed,
                   AVG(CASE WHEN skipped_by_maintenance = 0 THEN duration_ms END) AS avg_duration_ms,
                   MAX(fired_at) AS last_fired_at
-           FROM cron_metrics GROUP BY job"""
+           FROM cron_metrics WHERE fired_at >= ? GROUP BY job""",
+        (cutoff,),
     )
+    # Offline twin: app/cli.py's check_cron() runs the same MAX(id)-per-job
+    # last-status and 24h-failure queries over a read-only connection — a
+    # cron_metrics semantics change must land in both.
     last_rows = await db.query(
         "SELECT job, ok, skipped_by_maintenance FROM cron_metrics "
-        "WHERE id IN (SELECT MAX(id) FROM cron_metrics GROUP BY job)"
+        "WHERE id IN (SELECT MAX(id) FROM cron_metrics WHERE fired_at >= ? GROUP BY job)",
+        (cutoff,),
     )
     last_status = {
         r["job"]: ("skipped" if r["skipped_by_maintenance"] else ("ok" if r["ok"] else "failed"))
@@ -75,7 +87,8 @@ async def cron_health():
     error_rows = await db.query(
         "SELECT job, fired_at, error FROM cron_metrics "
         "WHERE id IN (SELECT MAX(id) FROM cron_metrics "
-        "             WHERE ok = 0 AND skipped_by_maintenance = 0 GROUP BY job)"
+        "             WHERE ok = 0 AND skipped_by_maintenance = 0 AND fired_at >= ? GROUP BY job)",
+        (cutoff,),
     )
     last_error = {r["job"]: {"fired_at": r["fired_at"], "error": r["error"]} for r in error_rows}
 

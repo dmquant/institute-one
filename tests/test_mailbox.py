@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from app import bus, db
+from app.config import get_settings
 from app.institute import mailbox
 
 
@@ -456,3 +458,18 @@ async def test_boot_recovery_preserves_and_schedules_same_prepared_task(monkeypa
     assert (await db.query_one(
         "SELECT COUNT(*) AS n FROM tasks WHERE mailbox_dispatch_id=?", (mid,),
     ))["n"] == 1
+
+
+def test_stale_lease_cutoff_tracks_executor_timeout(monkeypatch):
+    """TTL = max(DISPATCH_LEASE_TTL_S, default_timeout_s + 300): the 45min
+    constant is only a floor — a larger configured executor timeout widens the
+    reclaim horizon with it, so a slow-but-alive worker is never swept."""
+    base = datetime.fromisoformat(bus.now_iso())
+
+    # default 1800s timeout + 300s belt is BELOW the floor: the floor wins
+    age = (base - datetime.fromisoformat(mailbox._stale_lease_cutoff())).total_seconds()
+    assert mailbox.DISPATCH_LEASE_TTL_S - 2 <= age <= mailbox.DISPATCH_LEASE_TTL_S + 2
+
+    monkeypatch.setattr(get_settings(), "default_timeout_s", 7200)
+    age = (base - datetime.fromisoformat(mailbox._stale_lease_cutoff())).total_seconds()
+    assert 7200 + 300 - 2 <= age <= 7200 + 300 + 2

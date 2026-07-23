@@ -61,10 +61,10 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 from . import paper_book
 from .analysts import get_analyst, roster
 from .prompts import work_date
@@ -89,10 +89,6 @@ class PortfolioError(ValueError):
 
 class TransitionConflict(PortfolioError):
     """Conditional claim lost — the row changed under us (API maps to 409)."""
-
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
 
 
 def _dumps(val: Any) -> str:
@@ -126,7 +122,7 @@ async def ensure_portfolios(analyst_id: str) -> list[dict[str, Any]]:
             "INSERT INTO portfolios (id, analyst_id, tier, cash, initial_cash, "
             "created_at, updated_at) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(analyst_id, tier) DO NOTHING",
-            (_new_id(), analyst_id, tier, DEFAULT_INITIAL_CASH, DEFAULT_INITIAL_CASH,
+            (new_id(), analyst_id, tier, DEFAULT_INITIAL_CASH, DEFAULT_INITIAL_CASH,
              now, now),
         )
     return await list_portfolios(analyst_id=analyst_id)
@@ -289,7 +285,7 @@ async def generate_proposals(wd: str | None = None) -> dict[str, Any]:
                 if not changes:
                     summary["skipped_empty"] += 1
                     continue
-                pid = _new_id()
+                pid = new_id()
                 inserted = await db.execute(
                     "INSERT INTO portfolio_proposals (id, portfolio_id, work_date, "
                     "changes, rationale, status, created_at, updated_at) "
@@ -491,7 +487,7 @@ async def _apply_changes(
             else:
                 entry_date, entry_price = mark
                 quantity = cost / entry_price
-                pos_id = _new_id()
+                pos_id = new_id()
                 await conn.execute(
                     "INSERT INTO portfolio_positions (id, portfolio_id, proposal_id, "
                     "forecast_id, security_id, direction, quantity, cost, entry_date, "

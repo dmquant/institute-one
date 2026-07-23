@@ -221,6 +221,9 @@ async def put_feature_switches(body: FeatureSwitchesPut):
             "feature_switches changed concurrently — reload the switches "
             "and re-apply your edit",
         )
+    # the scheduler caches this admin_state row for ~5s; drop the cache so the
+    # next job firing sees the flip immediately instead of mid-edit
+    scheduler.invalidate_admin_state_cache(FEATURE_SWITCHES_KEY)
     return {"feature_switches": body.switches, "version": new_version}
 
 

@@ -221,6 +221,48 @@ async def test_settle_absolute_move_hit_partial_miss_neutral():
     assert len(events) == len(cases)
 
 
+async def test_hit_rate_stats_aggregates_settled_verdicts_excluding_backfill():
+    """GET /api/forecasts/stats backend: one aggregate over the performance
+    scope — the SPA used to page every settled forecast (and fetch each
+    settlement row) to derive these counts client-side."""
+    await _mk_thesis()
+    await _mk_security("AAA.US")
+    await _bar("AAA.US", "2026-06-01", 10.0)
+    await _bar("AAA.US", "2026-06-11", 10.3)  # +3% over the window
+
+    assert await forecasts.hit_rate_stats() == {
+        "hits": 0, "misses": 0, "partial": 0, "settled": 0}
+
+    for direction, threshold, expected in (
+        ("long", 0.02, "hit"),
+        ("long", 0.05, "partial"),
+        ("short", 0.02, "miss"),
+        ("neutral", 0.05, "hit"),
+        ("neutral", 0.02, "miss"),
+    ):
+        fc = await _forecast(
+            "AAA.US", direction=direction,
+            rule={"type": "absolute_move", "threshold": threshold},
+            claim=f"stats {direction}/{threshold}",
+        )
+        settled = await forecasts.settle_forecast(fc["id"])
+        assert settled["settlement"]["verdict"] == expected
+
+    # an OPEN forecast and a settled BACKFILL row both stay out of the stats
+    await _forecast("AAA.US", claim="still open")
+    backfill = await forecasts.create_forecast({
+        "thesis_id": "t-macro", "security_id": "AAA.US", "claim": "回填命中",
+        "direction": "long", "horizon_days": 10,
+        "settlement_rule": {"type": "absolute_move", "threshold": 0.02},
+        "made_at": MADE, "origin": "backfill",
+    })
+    settled = await forecasts.settle_forecast(backfill["id"])
+    assert settled["settlement"]["verdict"] == "hit"
+
+    assert await forecasts.hit_rate_stats() == {
+        "hits": 2, "misses": 2, "partial": 1, "settled": 5}
+
+
 async def test_settle_uses_adjusted_closes():
     # raw close halves but adj_factor doubles: adjusted +10% -> hit, not miss
     await _mk_thesis()
@@ -562,6 +604,25 @@ async def test_list_and_filters():
     assert await forecasts.list_forecasts(status="settled") == []
     with pytest.raises(forecasts.ForecastError, match="unknown status"):
         await forecasts.list_forecasts(status="closed")
+
+
+async def test_list_inlines_settlement():
+    """List rows carry their settlement inlined (same shape as the detail
+    endpoint) so the SPA ledger / hit-rate consumers never N+1 GET /{id}."""
+    await _mk_thesis()
+    await _mk_security("AAA.US")
+    await _bar("AAA.US", "2026-06-01", 100.0)
+    await _bar("AAA.US", "2026-06-10", 110.0)
+    settled = await _forecast("AAA.US", claim="会结算")
+    open_fc = await _forecast("AAA.US", claim="仍开放", made=bus.now_iso())
+    await forecasts.settle_forecast(settled["id"])
+
+    by_id = {f["id"]: f for f in await forecasts.list_forecasts()}
+    inlined = by_id[settled["id"]]["settlement"]
+    assert inlined["verdict"] == "hit"  # +10% >= 5% threshold
+    # identical row to the detail endpoint's settlement
+    assert inlined == (await forecasts.get_forecast(settled["id"]))["settlement"]
+    assert by_id[open_fc["id"]]["settlement"] is None
 
 
 async def test_forecast_history_exports_managed_vault_note():

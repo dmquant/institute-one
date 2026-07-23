@@ -200,36 +200,53 @@ def _duration_ms(started_at: str | None, finished_at: str | None) -> float | Non
 
 # ---- the daily job ----------------------------------------------------------
 
+# _score_completed pages the day's completed tasks by id keyset instead of one
+# unbounded SELECT: every row carries prompt+output (each up to ~200KB), so a
+# busy day in one shot pinned hundreds of MB in memory for no benefit.
+_SCORE_BATCH_SIZE = 200
+
+
 async def _score_completed(date: str, start: str, end: str) -> dict[str, int]:
     """Judge every completed task finished inside the window; upsert verdicts."""
-    rows = await db.query(
-        "SELECT id, hand, prompt, output, artifacts FROM tasks "
-        "WHERE status = 'completed' AND hand IS NOT NULL "
-        "AND finished_at >= ? AND finished_at < ?",
-        (start, end),
-    )
     counts = {"ok": 0, "stub": 0, "false_complete": 0}
     now = bus.now_iso()
-    for r in rows:
-        try:
-            artifacts = json.loads(r["artifacts"] or "[]")
-        except (ValueError, TypeError):
-            artifacts = []
-        try:
-            verdict, reason = judge_output(r["prompt"] or "", r["output"] or "", artifacts)
-        except Exception:  # noqa: BLE001 - one bad row must not sink the sweep
-            log.exception("judge_output crashed for task %s", r["id"])
-            continue
-        counts[verdict] += 1
-        # task_id is UNIQUE: a rerun re-judges instead of duplicating
-        await db.execute(
-            "INSERT INTO hand_scorecard (hand, work_date, task_id, verdict, reason, created_at) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(task_id) DO UPDATE SET "
-            "hand = excluded.hand, work_date = excluded.work_date, "
-            "verdict = excluded.verdict, reason = excluded.reason",
-            (r["hand"], date, r["id"], verdict, reason, now),
+    # Keyset (not OFFSET) paging: id is the TEXT PRIMARY KEY, so the order is
+    # total, and the verdict upserts below write to hand_scorecard — they never
+    # move a row across this scan's window, so batches cannot skip or repeat.
+    last_id = ""
+    while True:
+        rows = await db.query(
+            "SELECT id, hand, prompt, output, artifacts FROM tasks "
+            "WHERE status = 'completed' AND hand IS NOT NULL "
+            "AND finished_at >= ? AND finished_at < ? AND id > ? "
+            "ORDER BY id ASC LIMIT ?",
+            (start, end, last_id, _SCORE_BATCH_SIZE),
         )
+        if not rows:
+            break
+        for r in rows:
+            try:
+                artifacts = json.loads(r["artifacts"] or "[]")
+            except (ValueError, TypeError):
+                artifacts = []
+            try:
+                verdict, reason = judge_output(r["prompt"] or "", r["output"] or "", artifacts)
+            except Exception:  # noqa: BLE001 - one bad row must not sink the sweep
+                log.exception("judge_output crashed for task %s", r["id"])
+                continue
+            counts[verdict] += 1
+            # task_id is UNIQUE: a rerun re-judges instead of duplicating
+            await db.execute(
+                "INSERT INTO hand_scorecard (hand, work_date, task_id, verdict, reason, created_at) "
+                "VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "hand = excluded.hand, work_date = excluded.work_date, "
+                "verdict = excluded.verdict, reason = excluded.reason",
+                (r["hand"], date, r["id"], verdict, reason, now),
+            )
+        last_id = rows[-1]["id"]
+        if len(rows) < _SCORE_BATCH_SIZE:
+            break
     return counts
 
 

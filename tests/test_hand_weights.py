@@ -465,6 +465,27 @@ async def test_run_once_is_idempotent_and_rejudges():
     assert [s["tasks_total"] for s in stats] == [1]  # windows overwritten, not duplicated
 
 
+async def test_score_completed_pages_by_id_keyset(monkeypatch):
+    """The day's completed tasks are judged in id-keyset batches instead of one
+    unbounded SELECT carrying every prompt+output. A tiny batch size forces
+    multiple pages (2+2+1): every task is judged exactly once, none skipped,
+    none repeated across the page boundary."""
+    monkeypatch.setattr(scorecard, "_SCORE_BATCH_SIZE", 2)
+    d = work_date()
+    start, _ = scorecard._utc_range_for_work_date(d)
+    ts = _iso(datetime.fromisoformat(start) + timedelta(hours=3))
+    for i in range(5):
+        await _mk_task(f"page-{i}", hand="alpha", output=LONG_OK, finished_at=ts)
+
+    summary = await scorecard.run_once(d)
+    assert summary["scanned"] == 5
+    assert summary["verdicts"] == {"ok": 5, "stub": 0, "false_complete": 0}
+    rows = await db.query("SELECT task_id, verdict FROM hand_scorecard ORDER BY task_id")
+    assert [(r["task_id"], r["verdict"]) for r in rows] == [
+        (f"page-{i}", "ok") for i in range(5)
+    ]
+
+
 async def test_run_once_default_settles_previous_day():
     """REVIEW-B2 M2: no date = settle YESTERDAY (whose task set is closed).
 

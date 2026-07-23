@@ -84,11 +84,11 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 from . import market_data
 
 DIRECTIONS = {"long", "short", "neutral"}
@@ -110,10 +110,6 @@ class TransitionConflict(ForecastError):
 
 
 # ---- helpers ---------------------------------------------------------------
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _dumps(val: Any) -> str:
     # allow_nan=False: last line of defense for the canonical-JSON claim —
@@ -289,7 +285,7 @@ async def create_forecast(fields: dict[str, Any], *, forecast_id: str | None = N
         datetime.fromisoformat(made_at) + timedelta(days=horizon_days)
     ).astimezone(timezone.utc).isoformat(timespec="seconds")
 
-    fid = forecast_id or _new_id()
+    fid = forecast_id or new_id()
     now = bus.now_iso()
     try:
         await db.execute(
@@ -332,7 +328,12 @@ async def list_forecasts(
     backfilled rows (origin='backfill') are excluded, so every consumer that
     aggregates hit rates over this list (SPA dashboard, Obsidian plugin) never
     counts backfill. Pass origin='backfill'/'standard' to filter exactly, or
-    origin='all' for the unfiltered accountability view."""
+    origin='all' for the unfiltered accountability view.
+
+    Each row carries its ``settlement`` inlined (the full forecast_settlements
+    row or None, the same shape as ``get_forecast``) via ONE batched IN query —
+    list consumers (the SPA ledger's verdict badges, hit-rate aggregations)
+    must not N+1 the detail endpoint."""
     if status and status not in STATUSES:
         raise ForecastError(f"unknown status {status!r}; allowed: {', '.join(STATUSES)}")
     if origin is not None and origin != "all" and origin not in ORIGINS:
@@ -356,7 +357,39 @@ async def list_forecasts(
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY made_at DESC, id LIMIT ?"
     params.append(min(max(limit, 1), 500))
-    return [_forecast_out(r) for r in await db.query(sql, params)]
+    out = [_forecast_out(r) for r in await db.query(sql, params)]
+    ids = [fc["id"] for fc in out]
+    if ids:
+        # UNIQUE(forecast_id) on forecast_settlements ⇒ at most one row per id
+        marks = ",".join("?" for _ in ids)
+        by_forecast = {
+            s["forecast_id"]: s
+            for s in await db.query(
+                f"SELECT * FROM forecast_settlements WHERE forecast_id IN ({marks})", ids
+            )
+        }
+        for fc in out:
+            fc["settlement"] = by_forecast.get(fc["id"])
+    return out
+
+
+async def hit_rate_stats() -> dict[str, int]:
+    """Settled-verdict counts over the PERFORMANCE scope (origin <> 'backfill',
+    the same scope as the default list) — one aggregate for the SPA dashboard,
+    which used to page every settled forecast and fetch each settlement row
+    individually to compute this."""
+    rows = await db.query(
+        "SELECT s.verdict, COUNT(*) AS n "
+        "FROM forecasts f JOIN forecast_settlements s ON s.forecast_id = f.id "
+        "WHERE f.status = 'settled' AND f.origin <> 'backfill' GROUP BY s.verdict",
+    )
+    by_verdict = {str(r["verdict"]): int(r["n"]) for r in rows}
+    return {
+        "hits": by_verdict.get("hit", 0),
+        "misses": by_verdict.get("miss", 0),
+        "partial": by_verdict.get("partial", 0),
+        "settled": sum(by_verdict.values()),
+    }
 
 
 # ---- vault projection --------------------------------------------------------
@@ -810,7 +843,7 @@ async def settle_forecast(
     full_note = f"{note}; {ev['detail']}" if note else ev["detail"]
 
     new_status = "invalid" if verdict == "invalid" else "settled"
-    sid = _new_id()
+    sid = new_id()
     try:
         # claim + settlement row commit together: a lost claim rolls back the
         # insert, so double settlement is impossible (UNIQUE(forecast_id) backstops)

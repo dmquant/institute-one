@@ -23,8 +23,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import namedtuple
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,60 @@ async def test_probe_server_stale_pidfile(monkeypatch):
         pidfile.unlink(missing_ok=True)
 
 
+def _health_server() -> tuple[HTTPServer, int]:
+    """A real /health endpoint bound to 127.0.0.1 for probe tests."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):  # keep test output clean
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+@pytest.mark.parametrize("wildcard", ["0.0.0.0", "::", "[::]"])
+def test_probe_server_wildcard_host_maps_to_loopback(monkeypatch, wildcard):
+    """A server bound to a wildcard address must not report 'not running':
+    0.0.0.0/:: are bind addresses, not connect destinations (scripts/start.sh
+    maps them the same way). '::' also pins the old URL bug — raw
+    'http://::port/health' is unparseable, so /health always came back None.
+    """
+    server, port = _health_server()
+    try:
+        settings = get_settings()
+        monkeypatch.setattr(settings, "host", wildcard)
+        monkeypatch.setattr(settings, "port", port)
+        (settings.home_dir / "server.pid").unlink(missing_ok=True)
+        probe = cli.probe_server(settings)
+        assert probe.port_open
+        assert probe.up
+        assert probe.health == {"status": "ok"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_host_passthrough_and_mapping():
+    assert cli._probe_host("0.0.0.0") == "127.0.0.1"
+    assert cli._probe_host("::") == "127.0.0.1"
+    assert cli._probe_host("[::]") == "127.0.0.1"
+    assert cli._probe_host("127.0.0.1") == "127.0.0.1"
+    assert cli._probe_host("::1") == "::1"  # concrete IPv6 left for the URL bracketing
+
+
 def test_cmd_status_offline_exit_code(monkeypatch, capsys):
     settings = get_settings()
     monkeypatch.setattr(settings, "port", _free_port())
@@ -117,10 +173,11 @@ async def test_check_hands_fails_when_research_chain_dead(monkeypatch):
 
 # ---- hands: real auth probes against fake CLI binaries (REVIEW-C6 M1) ------------
 
-def _fake_cli(tmp_path: Path, name: str, auth_exit: int | None) -> str:
+def _fake_cli(tmp_path: Path, name: str, auth_exit: int | None, auth_stderr: str | None = None) -> str:
     """A fake CLI honoring --version and (optionally) its auth-status command.
 
     auth_exit None = the binary knows no status command (unknown-auth CLIs).
+    auth_stderr = extra stderr noise for the probe exit (e.g. a usage error).
     """
     lines = [
         "#!/bin/sh",
@@ -129,7 +186,8 @@ def _fake_cli(tmp_path: Path, name: str, auth_exit: int | None) -> str:
     if auth_exit is not None:
         probe = cli.AUTH_PROBES[name]
         cond = " ] && [ ".join(f'"${i + 1}" = "{arg}"' for i, arg in enumerate(probe))
-        lines.append(f"if [ {cond} ]; then exit {auth_exit}; fi")
+        err = f"echo '{auth_stderr}' >&2; " if auth_stderr else ""
+        lines.append(f"if [ {cond} ]; then {err}exit {auth_exit}; fi")
     lines.append("exit 64")
     script = tmp_path / f"fake-{name}"
     script.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -186,6 +244,37 @@ async def test_check_hands_auth_unknown_default_warns_not_fails(monkeypatch, tmp
     c = cli.check_hands(get_settings())
     assert c.status == cli.WARN  # unverifiable, but not provably broken
     assert any("auth could not be verified" in l for l in c.lines)
+
+
+async def test_check_hands_auth_probe_unrecognized_subcommand_is_unknown_not_fail(monkeypatch, tmp_path):
+    """A CLI update that renames/removes its status subcommand exits non-zero
+    with a usage error — that must read as auth unknown (WARN), never a false
+    'not logged in' FAIL, even when the hand is the default."""
+    _wire_fake_cli(
+        monkeypatch, "claude",
+        _fake_cli(
+            tmp_path, "claude", auth_exit=2,
+            auth_stderr="usage: fake-claude <command> — unknown command: auth",
+        ),
+    )
+    monkeypatch.setattr(get_settings(), "default_hand", "claude")
+    c = cli.check_hands(get_settings())
+    line = next(l for l in c.lines if l.startswith("- claude:"))
+    assert "auth unknown" in line and "not logged in" not in line
+    assert c.status == cli.WARN
+    assert any("auth could not be verified" in l for l in c.lines)
+
+
+async def test_check_hands_auth_probe_unrelated_stderr_still_logged_out(monkeypatch, tmp_path):
+    """Only usage/unknown-command stderr softens the verdict: a plain non-zero
+    probe exit (real logged-out signal) stays 'not logged in'."""
+    _wire_fake_cli(
+        monkeypatch, "claude",
+        _fake_cli(tmp_path, "claude", auth_exit=1, auth_stderr="token expired"),
+    )
+    c = cli.check_hands(get_settings())
+    line = next(l for l in c.lines if l.startswith("- claude:"))
+    assert "not logged in" in line
 
 
 # ---- database ------------------------------------------------------------------
@@ -282,6 +371,33 @@ async def test_check_vault_empty_ledger_passes():
     c = cli.check_vault(get_settings())
     assert c.status == cli.PASS
     assert "0 ledger rows" in c.detail
+
+
+async def test_check_vault_reuses_operator_classifier(monkeypatch):
+    """No second copy of the vault classification: check_vault converts the
+    read-only sqlite3 rows to plain dicts and hands them to the ONE shared
+    pass, app.institute.operator._classify_vault_rows."""
+    import app.institute.operator as operator
+
+    settings = get_settings()
+    root = settings.vault_dir.expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "note.md").write_text("# hi\n", encoding="utf-8")
+    await _seed_ledger_row("note.md", hashlib.sha256(b"# hi\n").hexdigest())
+
+    seen: list[list[dict]] = []
+    real = operator._classify_vault_rows
+
+    def spy(root_arg, rows):
+        seen.append(rows)
+        return real(root_arg, rows)
+
+    monkeypatch.setattr(operator, "_classify_vault_rows", spy)
+    c = cli.check_vault(settings)
+    assert c.status == cli.PASS
+    assert "1 clean" in c.detail
+    assert len(seen) == 1
+    assert seen[0] and type(seen[0][0]) is dict  # sqlite3.Row converted before hand-off
 
 
 # ---- asyncio bridge safety (REVIEW-C6 M2) -----------------------------------------
