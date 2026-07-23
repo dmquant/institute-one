@@ -11,9 +11,11 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from app import db
+from app.config import get_settings
 
 MIGRATIONS = sorted((Path(db.__file__).resolve().parent.parent / "migrations").glob("*.sql"))
 
@@ -139,6 +141,66 @@ async def test_fresh_db_applies_every_file_once():
     await db.migrate(db.conn())
     rows2 = await db.query("SELECT name FROM schema_migrations ORDER BY name")
     assert rows2 == rows
+
+
+# ---- pre-migration backup: pending files on a live DB snapshot first ---------
+
+def _pre_migrate_backups() -> set[Path]:
+    return set(get_settings().backups_dir.glob("pre-migrate-*.db"))
+
+
+async def test_pending_migrations_on_live_db_write_pre_migrate_backup(tmp_path, monkeypatch):
+    """A live DB (ledger table present) with >=1 pending file is first
+    snapshotted to backups/pre-migrate-<timestamp>.db — once per migrate()
+    call, not per file — and the snapshot predates the new schema."""
+    before = _pre_migrate_backups()
+    mig = tmp_path / "0001_premig_probe.sql"
+    mig.write_text("CREATE TABLE pre_migrate_probe (x TEXT);\n", encoding="utf-8")
+    monkeypatch.setattr(db, "_migrations_dir", lambda: tmp_path)
+
+    await db.migrate(db.conn())
+
+    new = _pre_migrate_backups() - before
+    assert len(new) == 1
+    snapshot = new.pop()
+    assert not Path(str(snapshot) + ".tmp").exists()  # no temp residue
+    con = sqlite3.connect(snapshot)
+    try:
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        # taken BEFORE the file applied: no probe table, no ledger row for it
+        assert con.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'pre_migrate_probe'"
+        ).fetchone() is None
+        assert con.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = '0001_premig_probe.sql'"
+        ).fetchone() is None
+    finally:
+        con.close()
+    assert await db.query_one(
+        "SELECT 1 FROM sqlite_master WHERE name = 'pre_migrate_probe'"
+    ) is not None
+
+
+async def test_fresh_database_writes_no_pre_migrate_backup(tmp_path):
+    """A brand-new database has no prior state to protect: applying the whole
+    chain must NOT write a pre-migrate backup."""
+    before = _pre_migrate_backups()
+    c = await aiosqlite.connect(tmp_path / "fresh.db", isolation_level=None)
+    try:
+        c.row_factory = aiosqlite.Row
+        await db.migrate(c)  # every file pending, but nothing to lose yet
+        row = await (await c.execute("SELECT COUNT(*) AS n FROM schema_migrations")).fetchone()
+        assert row["n"] == len(MIGRATIONS)
+    finally:
+        await c.close()
+    assert _pre_migrate_backups() == before
+
+
+async def test_up_to_date_database_writes_no_pre_migrate_backup():
+    """Nothing pending -> no snapshot (the common every-boot path)."""
+    before = _pre_migrate_backups()
+    await db.migrate(db.conn())
+    assert _pre_migrate_backups() == before
 
 
 # ---- the F1-6 crash window: script committed, ledger row missing -------------
@@ -533,3 +595,15 @@ async def test_add_column_guard_rejects_undeclared_existing_constraints(tmp_path
     assert await db.query_one(
         "SELECT name FROM schema_migrations WHERE name = '0001_extra.sql'"
     ) is None
+
+
+# ---- connection pragmas -------------------------------------------------------
+
+async def test_connection_pragmas_are_wal_and_synchronous_normal():
+    """Boot pragmas: WAL for concurrent reads under the single-writer lock, and
+    synchronous=NORMAL — commits skip the per-transaction fsync; durability is
+    bounded by the events table plus the nightly VACUUM INTO backup instead."""
+    row = await db.query_one("PRAGMA journal_mode")
+    assert row["journal_mode"] == "wal"
+    row = await db.query_one("PRAGMA synchronous")
+    assert row["synchronous"] == 1  # NORMAL (0=OFF, 1=NORMAL, 2=FULL)

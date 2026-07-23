@@ -11,6 +11,7 @@ import logging
 import re
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,16 @@ async def init() -> aiosqlite.Connection:
     try:
         c.row_factory = aiosqlite.Row
         await c.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL: commits stop fsync-ing the WAL on every transaction
+        # (fsync happens at checkpoints), which removes the dominant write
+        # latency on this event/write-heavy workload. Trade-off: an OS crash
+        # or power loss can roll back the last few committed transactions —
+        # but never corrupt the database (WAL keeps its consistency guarantee
+        # at NORMAL). That window is acceptable here: this is a local
+        # single-user app, the events table persists the authoritative domain
+        # trail, and the nightly janitor backup (VACUUM INTO snapshot) bounds
+        # any real loss to the same day.
+        await c.execute("PRAGMA synchronous=NORMAL")
         await c.execute("PRAGMA busy_timeout=5000")
         await c.execute("PRAGMA foreign_keys=ON")
         await migrate(c)
@@ -485,14 +496,51 @@ def _migrations_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "migrations"
 
 
+async def _pre_migrate_backup(c: aiosqlite.Connection) -> Path:
+    """Snapshot the live DB before applying pending migrations.
+
+    Same VACUUM INTO + rename pattern as the nightly janitor backup
+    (``app/institute/scheduler.py::_nightly_backup``): VACUUM INTO snapshots
+    through SQLite's own transaction machinery (WAL folded in, immune to a
+    concurrent auto-checkpoint), landing on a temp name that is renamed into
+    place only on success. Runs once per boot that actually applies
+    migrations — not per file. A failure raises: applying schema changes with
+    no usable snapshot is exactly the mid-day-loss window this exists to
+    close, so boot refuses rather than proceeding unprotected.
+    """
+    settings = get_settings()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    target = settings.backups_dir / f"pre-migrate-{stamp}.db"
+    settings.backups_dir.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / (target.name + ".tmp")
+    tmp.unlink(missing_ok=True)  # VACUUM INTO refuses existing files
+    try:
+        await c.execute("VACUUM INTO ?", (str(tmp),))
+        tmp.replace(target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    log.info("pre-migration backup written to %s", target.name)
+    return target
+
+
 async def migrate(c: aiosqlite.Connection) -> None:
+    # a pre-existing ledger table means a live database with prior state to
+    # protect; a fresh file (aiosqlite.connect creates it on open) has neither
+    # the ledger nor anything worth backing up
+    cur = await c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    )
+    live_db = await cur.fetchone() is not None
+    await cur.close()
     await c.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)"
     )
     applied = {r["name"] for r in await (await c.execute("SELECT name FROM schema_migrations")).fetchall()}
-    for path in sorted(_migrations_dir().glob("*.sql")):
-        if path.name in applied:
-            continue
+    pending = [p for p in sorted(_migrations_dir().glob("*.sql")) if p.name not in applied]
+    if pending and live_db:
+        await _pre_migrate_backup(c)
+    for path in pending:
         # one transaction per file: schema changes + the ledger row commit (or
         # roll back) together, so a crash can never leave a half-recorded file.
         # COMMIT sits INSIDE the protected block: a commit-stage failure

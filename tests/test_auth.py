@@ -4,10 +4,12 @@ The middleware is exercised on a self-contained probe app via install_auth()
 — app/main.py's mount is a PATCH-NOTES-E6 line owned by the main agent, and
 these tests must hold with or without it. Matrix:
 
-- token unset      → zero change: everything answers with no header.
+- token unset      → no credentials needed, BUT a non-GET /api/* request
+                     whose Origin does not match the bind is 403 (CSRF /
+                     DNS-rebinding guard); no Origin header at all stays open.
 - token set        → /api/* demands ``Authorization: Bearer <token>`` (401
                      otherwise, with WWW-Authenticate); /health and non-API
-                     paths stay open.
+                     paths stay open; the origin guard does not apply.
 - non-loopback host with no token → one startup warning from install_auth().
 """
 from __future__ import annotations
@@ -129,3 +131,57 @@ def test_no_warning_on_loopback_or_with_token(with_token, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="institute.auth"):
         _probe_app()  # non-loopback but token set: quiet
     assert not [r for r in caplog.records if "INSTITUTE_TOKEN" in r.getMessage()]
+
+
+# ---- no-token origin guard (CSRF / DNS-rebinding) ----------------------------
+
+async def test_no_token_rejects_foreign_origin_mutation(no_token):
+    async with _client() as client:
+        # a cross-origin form/no-cors POST from any web page
+        resp = await client.post("/api/probe", headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "forbidden origin"}
+        # DNS-rebinding shape: a foreign host ON the configured port
+        resp = await client.post("/api/probe", headers={"Origin": "http://attacker.example:8100"})
+        assert resp.status_code == 403
+        # sandboxed-iframe shape: the opaque "null" origin fails closed
+        resp = await client.post("/api/probe", headers={"Origin": "null"})
+        assert resp.status_code == 403
+        # GETs are not mutations: untouched even with a foreign Origin
+        resp = await client.get("/api/probe", headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 200
+
+
+async def test_no_token_allows_local_origins(no_token):
+    async with _client() as client:
+        for origin in (
+            "http://127.0.0.1:8100",  # the SPA itself
+            "http://localhost:8100",  # loopback alias of the bind
+            "http://[::1]:8100",
+            "http://localhost:5173",  # Vite dev proxy forwards this Origin unchanged
+            "app://obsidian.md",      # Obsidian streaming fetch (not web-mintable)
+        ):
+            resp = await client.post("/api/probe", headers={"Origin": origin})
+            assert resp.status_code == 200, origin
+
+
+async def test_no_token_allows_missing_origin(no_token):
+    """curl / launchd / Obsidian requestUrl / local scripts send no Origin."""
+    async with _client() as client:
+        resp = await client.post("/api/probe")
+        assert resp.status_code == 200
+
+
+async def test_origin_guard_inactive_when_token_set(with_token):
+    """Token-configured deployments are unaffected: the bearer check rules."""
+    async with _client() as client:
+        resp = await client.post("/api/probe", headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 401  # still the bearer 401, not the guard's 403
+        resp = await client.post(
+            "/api/probe",
+            headers={
+                "Origin": "https://evil.example",
+                "Authorization": f"Bearer {BEARER_FIXTURE}",
+            },
+        )
+        assert resp.status_code == 200

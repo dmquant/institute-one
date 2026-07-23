@@ -30,13 +30,13 @@ import logging
 import re
 import sqlite3
 import unicodedata
-import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from .. import bus, db
 from ..config import get_settings
+from ..util import new_id
 from . import archive
 from .prompts import work_date
 
@@ -49,6 +49,10 @@ QUEUE_STATUSES = ("pending", "running", "completed", "failed", "cancelled")
 # Serializes the cap-check + claim section across concurrent ticks (scheduler
 # job overlapping a manual POST /tick). The workflow run itself happens outside.
 _claim_lock = asyncio.Lock()
+
+# One-shot flag for the "queue disabled by research_daily_cap <= 0" log:
+# without it the tick loop would repeat the line every research_tick_minutes.
+_cap_disabled_logged = False
 
 # Tick tasks created for asyncio.shield callers (POST /api/research/tick).
 # Shielded tasks outlive their HTTP request, so they must be registered for
@@ -193,7 +197,7 @@ async def enqueue(
     if last and priority <= 0:
         return {"refused": "cooldown", "topic": topic, "last_completed_at": last["completed_at"]}
 
-    item_id = uuid.uuid4().hex[:12]
+    item_id = new_id()
     _cols = ("id, topic, priority, status, source, created_at, thesis_id, security_id, "
              "question, output_type, priority_reason, dedup_key, project_id")
     _vals = (item_id, topic, priority, "pending", source, bus.now_iso(),
@@ -311,6 +315,10 @@ async def recover_orphans() -> int:
     ``tasks`` and the janitor only ``workflow_runs`` — and ``_claim_next()``
     refuses to claim while any row is 'running', so a stale one deadlocks the
     whole research pipeline. Called from the app lifespan at boot.
+
+    Offline twin: app/cli.py's check_orphans() counts this same 'running'
+    residue (plus tasks') over a read-only connection — a status-vocabulary
+    change must land in both.
     """
     n = await db.execute(
         "UPDATE research_queue SET status='pending', started_at=NULL WHERE status='running'"
@@ -336,6 +344,16 @@ async def tick() -> str | None:
 async def _claim_next() -> dict[str, Any] | None:
     settings = get_settings()
     async with _claim_lock:
+        if settings.research_daily_cap <= 0:
+            # 0/negative disables the queue (documented kill switch). Log once
+            # per process so the tick job doesn't look healthy while the
+            # feature silently does nothing.
+            global _cap_disabled_logged
+            if not _cap_disabled_logged:
+                log.info("research queue disabled: research_daily_cap=%d (<=0)",
+                         settings.research_daily_cap)
+                _cap_disabled_logged = True
+            return None
         # daily cap counts SGT work days: work_date is written at insert time.
         # Legacy pre-0005 rows keep work_date NULL and never match this
         # equality — they are deliberately excluded from every day's cap.
@@ -373,13 +391,6 @@ def _as_dict(run: Any) -> dict[str, Any]:
         except ValueError:
             d["results"] = []
     return d
-
-
-def _analyst_catalog() -> str:
-    """Closed-list roster catalog injected into the follow-ups step prompt."""
-    from .analysts import roster
-
-    return "\n".join(f"- {a.id}：{a.name}（{a.focus}）" for a in roster())
 
 
 async def _topic_with_context(item: dict[str, Any]) -> str:
@@ -431,7 +442,6 @@ async def _run_item(item: dict[str, Any]) -> None:
             "research",
             variables={
                 "TOPIC": await _topic_with_context(item), "WORK_DATE": work_date(),
-                "ANALYST_CATALOG": _analyst_catalog(),
             },
             source="research",
         ))

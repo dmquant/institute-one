@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 VERSION = "0.1.0"
@@ -21,6 +23,7 @@ class Settings(BaseSettings):
     home: Path = Path("~/.institute-one")
     host: str = "127.0.0.1"
     port: int = 8100
+    # IANA zone name, pre-checked at load time by _timezone_must_resolve below.
     timezone: str = "Asia/Singapore"
     # Optional bearer auth (ROADMAP Phase 0). None/empty = auth disabled.
     token: str | None = None            # INSTITUTE_TOKEN
@@ -30,7 +33,10 @@ class Settings(BaseSettings):
     vault_dir: Path | None = None
 
     # Execution
-    max_concurrent: int = 3
+    # ge=1 — asyncio.Semaphore(0) is perfectly legal yet silently starves
+    # every task; the validator below rejects <1 with a pointer to the
+    # supported pause mechanism (the maintenance switch).
+    max_concurrent: int = Field(default=3, ge=1)
     # Per-hand queued-depth cap (ROADMAP Phase 2 executor depth): a submit/spawn
     # finding MORE THAN this many queued rows on its hand fast-fails as the
     # terminal status 'overcommitted' instead of queueing without bound (a
@@ -40,8 +46,10 @@ class Settings(BaseSettings):
     hand_queue_depth: int = 8           # INSTITUTE_HAND_QUEUE_DEPTH
     default_hand: str = "claude"
     research_hands: str = "codex,agy"
-    default_timeout_s: int = 1800
-    output_cap_bytes: int = 200_000  # tasks.output column cap
+    # gt=0 — 0/negative would make every task expire the moment it starts.
+    default_timeout_s: int = Field(default=1800, gt=0)
+    # tasks.output column cap; gt=0 — 0 would silently blank all task output.
+    output_cap_bytes: int = Field(default=200_000, gt=0)
 
     # Hand enable flags (CLI hands are additionally gated on the binary existing)
     enable_claude: bool = True
@@ -101,16 +109,49 @@ class Settings(BaseSettings):
     whiteboard_tick_seconds: int = 60      # advance running boards
     mailbox_sweep_seconds: int = 120
     research_tick_minutes: int = 30
-    research_daily_cap: int = 4
+    research_daily_cap: int = 4       # SGT work-day cap on completed runs; 0/negative disables the research queue
     research_cooldown_days: int = 30
     janitor_minutes: int = 60
     events_retention_days: int = 90       # durable SSE/audit replay window
-    # Phase 3 fact-check (factcheck.py reads both defensively)
+    # Phase 3 fact-check (scheduler.py reads the tick minutes directly;
+    # only the daily cap is read defensively, by factcheck.py)
     factcheck_tick_minutes: int = 30    # 0/negative disables the job
     # Verification ATTEMPTS per SGT work date. None -> factcheck's built-in
     # default (10); a concrete value here would shadow the module constant the
     # factcheck tests monkeypatch, so only the env override materialises one.
     factcheck_daily_cap: int | None = None  # INSTITUTE_FACTCHECK_DAILY_CAP
+
+    # ---- field guards --------------------------------------------------
+    @field_validator("max_concurrent", mode="before")
+    @classmethod
+    def _max_concurrent_is_not_a_pause(cls, v: object) -> object:
+        # A bare ge=1 error would not tell the operator what 0 was meant to
+        # achieve; say it explicitly. Runs before pydantic's int coercion, so
+        # env-var strings are parsed here for the range check only.
+        try:
+            n = int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return v  # not a number — let pydantic's own int parsing report it
+        if n < 1:
+            raise ValueError(
+                "max_concurrent must be >= 1: asyncio.Semaphore(0) is legal and "
+                "would silently starve every task. To pause the system use the "
+                "maintenance switch (POST /api/admin/maintenance) instead."
+            )
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_must_resolve(cls, v: str) -> str:
+        # Fail at config load with a clear message instead of crashing the
+        # lifespan later (scheduler/prompts build ZoneInfo from this string).
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"unknown IANA timezone {v!r} (expected e.g. 'Asia/Singapore', 'UTC')"
+            ) from exc
+        return v
 
     # ---- derived paths -------------------------------------------------
     @property
