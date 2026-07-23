@@ -1,5 +1,5 @@
 import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
-import { Analyst, ApiError, AskStreamFrame, AskTask, errMsg, isMissingEndpoint } from "./api";
+import { ASK_TIMEOUT_MS, Analyst, ApiError, AskStreamFrame, AskTask, errMsg, isMissingEndpoint } from "./api";
 import type InstituteOnePlugin from "./main";
 
 export const VIEW_TYPE_ASK_STREAM = "institute-ask-stream";
@@ -215,23 +215,67 @@ export class AskStreamView extends ItemView {
 	/**
 	 * fetch + NDJSON 流式路径。返回 false = 环境/后端不支持流式（CORS 拦截、
 	 * 404/405/501），调用方回落同步；其他错误（含中途断流）就地报告，不回落。
+	 * 设置了访问令牌时带 Authorization Bearer；整个流与同步 /api/ask 共享同一
+	 * 总预算（ASK_TIMEOUT_MS）——超时按「任务可能已在后端运行」处理，绝不重跑。
 	 */
 	private async tryStream(prompt: string, started: number): Promise<boolean> {
+		const ctrl = new AbortController();
+		this.abort = ctrl;
+		let timedOut = false;
+		const timeout = window.setTimeout(() => {
+			timedOut = true;
+			ctrl.abort();
+		}, ASK_TIMEOUT_MS);
+		try {
+			return await this.streamOnce(prompt, started, ctrl, () => timedOut);
+		} finally {
+			window.clearTimeout(timeout);
+		}
+	}
+
+	private async streamOnce(
+		prompt: string,
+		started: number,
+		ctrl: AbortController,
+		timedOut: () => boolean,
+	): Promise<boolean> {
 		const url = this.plugin.api.baseUrl() + "/api/ask/stream";
-		this.abort = new AbortController();
+		const headers: Record<string, string> = { "Content-Type": "application/json" };
+		const token = this.plugin.settings.token.trim();
+		if (token) headers["Authorization"] = `Bearer ${token}`;
 		let resp: Response;
 		try {
 			resp = await fetch(url, {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
+				headers,
 				body: JSON.stringify({ prompt, analyst_id: this.analystId || null }),
-				signal: this.abort.signal,
+				signal: ctrl.signal,
 			});
 		} catch (e) {
-			if (this.abort.signal.aborted) return true; // user hit 停止 during connect
+			if (ctrl.signal.aborted) {
+				if (timedOut()) {
+					this.status(
+						`流式请求超时（${Math.round(ASK_TIMEOUT_MS / 60_000)} 分钟）— 任务可能已在后端运行，结果见任务记录。`,
+					);
+				}
+				return true; // user hit 停止 during connect, or the total budget expired
+			}
 			// TypeError: CORS preflight rejected / network refused — fall back
 			this.status(`流式不可用（${errMsg(e).slice(0, 120)}）— 回落同步模式…`);
 			return false;
+		}
+		if (resp.status === 401) {
+			// the endpoint answered: the token was rejected — don't re-run
+			this.append(
+				"鉴权失败：HTTP 401 — 后端启用了 INSTITUTE_TOKEN，请在插件设置中填写或核对访问令牌 (bearer token)。\n",
+				"stderr",
+			);
+			this.status("鉴权失败（401）— 请检查访问令牌。");
+			new Notice(
+				"Institute: 流式提问鉴权失败（401）— 请在设置中检查访问令牌 (bearer token)。",
+				8000,
+			);
+			return true;
 		}
 		if (resp.status === 404 || resp.status === 405 || resp.status === 501) {
 			this.status(`后端无流式端点（HTTP ${resp.status}）— 回落同步模式…`);
@@ -284,7 +328,16 @@ export class AskStreamView extends ItemView {
 			buf += decoder.decode();
 			if (buf.trim()) handleLine(buf);
 		} catch (e) {
-			if (this.abort.signal.aborted) return true; // user-initiated stop
+			if (ctrl.signal.aborted) {
+				if (timedOut()) {
+					this.append(
+						`\n[流超时（${Math.round(ASK_TIMEOUT_MS / 60_000)} 分钟）— 完整输出在后端任务记录]\n`,
+						"stderr",
+					);
+					this.status("流超时。");
+				}
+				return true; // user-initiated stop, or the total budget expired
+			}
 			this.append(`\n[流中断：${errMsg(e)} — 完整输出在后端任务记录]\n`, "stderr");
 			this.status("流中断。");
 			return true; // the run is already submitted server-side: never re-run

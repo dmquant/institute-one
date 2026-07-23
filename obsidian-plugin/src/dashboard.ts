@@ -105,6 +105,9 @@ const TREE_NODE_STATUS_ZH: Record<string, string> = {
 export class InstituteDashboardView extends ItemView {
 	private plugin: InstituteOnePlugin;
 	private refreshing = false;
+	/** details sections expanded at least once — collapsed ones are not fetched
+	 * before their first expand (see watchExtra) */
+	private extrasOpened = new Set<string>();
 
 	// events cursor (durable ids from the backend events table)
 	private cursor = 0;
@@ -188,6 +191,13 @@ export class InstituteDashboardView extends ItemView {
 		[this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] =
 			this.collapsible(root, "纸面账本");
 
+		// collapsed <details> fetch nothing until their first expand
+		this.watchExtra("inbox", this.inboxWrapEl, () => this.refreshOperatorInbox());
+		this.watchExtra("forecasts", this.forecastsWrapEl, () => this.refreshForecasts());
+		this.watchExtra("trees", this.treesWrapEl, () => this.refreshResearchTrees());
+		this.watchExtra("triage", this.triageWrapEl, () => this.refreshTriage());
+		this.watchExtra("book", this.bookWrapEl, () => this.refreshBook());
+
 		this.eventsEl = this.section(root, "最近事件");
 
 		// quick actions
@@ -201,8 +211,9 @@ export class InstituteDashboardView extends ItemView {
 		this.actionButton(actions, "路线图", () => void this.plugin.activateRoadmap());
 		this.actionButton(actions, "打开操作台", () => this.plugin.openOperatorUi());
 
-		// auto-poll while visible; registerInterval is cleared when the view unloads
-		void this.refresh();
+		// auto-poll while visible (isShown() === false skips the fetch);
+		// registerInterval is cleared when the view unloads
+		void this.refresh(true); // first paint even if the leaf is still attaching
 		const everyMs = Math.max(5, this.plugin.settings.pollIntervalS || 10) * 1000;
 		this.registerInterval(window.setInterval(() => void this.refresh(), everyMs));
 	}
@@ -273,13 +284,32 @@ export class InstituteDashboardView extends ItemView {
 
 	// ---- polling ---------------------------------------------------------------
 
-	private async refresh(): Promise<void> {
+	/**
+	 * Lazy-load a collapsible section: a collapsed <details> is not fetched
+	 * until the user expands it the first time; afterwards the regular poll
+	 * keeps it fresh (also when re-collapsed).
+	 */
+	private watchExtra(key: string, wrap: HTMLDetailsElement, load: () => Promise<void>): void {
+		wrap.addEventListener("toggle", () => {
+			if (wrap.open && !this.extrasOpened.has(key)) {
+				this.extrasOpened.add(key);
+				void load();
+			}
+		});
+	}
+
+	private extraReady(key: string, wrap: HTMLDetailsElement): boolean {
+		return wrap.open || this.extrasOpened.has(key);
+	}
+
+	private async refresh(force = false): Promise<void> {
 		if (this.refreshing) return;
+		if (!force && !this.containerEl.isShown()) return; // hidden leaf: skip the network round
 		this.refreshing = true;
 		try {
 			let meta: MetaResult;
 			try {
-				meta = await this.plugin.api.meta();
+				meta = await this.plugin.getMeta();
 			} catch (e) {
 				this.bannerEl.style.display = "block";
 				this.bannerEl.setText(
@@ -300,7 +330,7 @@ export class InstituteDashboardView extends ItemView {
 			}
 
 			const [daily, running, queued] = await Promise.all([
-				this.plugin.api.dailyStatus().catch(() => null),
+				this.plugin.getDailyStatus().catch(() => null),
 				this.plugin.api.listTasks("running").catch(() => [] as TaskRow[]),
 				this.plugin.api.listTasks("queued").catch(() => [] as TaskRow[]),
 			]);
@@ -329,6 +359,7 @@ export class InstituteDashboardView extends ItemView {
 	// ---- Operator 收件箱（裁决仍只在 SPA 中进行） ------------------------------------
 
 	private async refreshOperatorInbox(): Promise<void> {
+		if (!this.extraReady("inbox", this.inboxWrapEl)) return;
 		let result: OperatorActionsResult;
 		try {
 			result = await this.plugin.api.operatorActions("open", 1000);
@@ -378,6 +409,7 @@ export class InstituteDashboardView extends ItemView {
 	// ---- 预测账本速览（API 无 stats；聚合近 5 条的 detail verdict） ----------------------
 
 	private async refreshForecasts(): Promise<void> {
+		if (!this.extraReady("forecasts", this.forecastsWrapEl)) return;
 		let rows: ForecastRow[];
 		try {
 			const recent = await this.plugin.api.forecasts(5);
@@ -439,6 +471,7 @@ export class InstituteDashboardView extends ItemView {
 	// ---- 研究树监控 ----------------------------------------------------------------
 
 	private async refreshResearchTrees(): Promise<void> {
+		if (!this.extraReady("trees", this.treesWrapEl)) return;
 		let active: ResearchTreeRow[];
 		let activeTruncated = false;
 		let detail: ResearchTreeDetail | null;
@@ -635,6 +668,7 @@ export class InstituteDashboardView extends ItemView {
 	private async runAllDailies(): Promise<void> {
 		try {
 			await this.plugin.api.runAllDailies();
+			this.plugin.invalidateStatusCaches();
 			new Notice("Institute: 已启动全员日报（后台运行，完成后自动导出）。", 6000);
 		} catch (e) {
 			new Notice(`Institute: 启动全员日报失败 — ${errMsg(e)}`, 8000);
@@ -644,6 +678,7 @@ export class InstituteDashboardView extends ItemView {
 	// ---- 操作台 triage（Phase 6；旧后端 404 时整块隐藏） -------------------------------
 
 	private async refreshTriage(): Promise<void> {
+		if (!this.extraReady("triage", this.triageWrapEl)) return;
 		let t: TriageResult;
 		try {
 			t = await this.plugin.api.triage();
@@ -707,6 +742,7 @@ export class InstituteDashboardView extends ItemView {
 	// ---- 纸面账本（paper book；旧后端 404 时整块隐藏） -----------------------------------
 
 	private async refreshBook(): Promise<void> {
+		if (!this.extraReady("book", this.bookWrapEl)) return;
 		let nav: NavRow[];
 		let positions: PaperPositionRow[];
 		try {
@@ -820,6 +856,7 @@ export class InstituteDashboardView extends ItemView {
 					: `Institute: 任务 ${taskId} 无法取消（可能已结束）。`,
 				5000,
 			);
+			this.plugin.invalidateStatusCaches();
 			void this.refresh();
 		} catch (e) {
 			new Notice(`Institute: 取消失败 — ${errMsg(e)}`, 8000);

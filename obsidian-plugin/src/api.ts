@@ -382,7 +382,8 @@ export interface PaperPositionRow {
 	realized_pnl: number | null;
 }
 
-/** GET /api/forecasts — forecast ledger row. */
+/** GET /api/forecasts — forecast ledger row. The settlement row is inlined
+ * on BOTH list and detail responses (full row or null). */
 export interface ForecastRow {
 	id: string;
 	thesis_id: string;
@@ -400,7 +401,7 @@ export interface ForecastRow {
 	settlement?: ForecastSettlement | null;
 }
 
-/** GET /api/forecasts/{id} — settlement is present on the detail response. */
+/** forecast_settlements row — inlined as `settlement` on forecast responses. */
 export interface ForecastSettlement {
 	id: string;
 	forecast_id: string;

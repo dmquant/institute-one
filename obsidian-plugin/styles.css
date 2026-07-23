@@ -1,0 +1,346 @@
+/* Institute One — roadmap view styles (moved out of src/roadmap.ts).
+   Obsidian loads/unloads this file automatically with the plugin. */
+.institute-roadmap {
+	padding: 12px;
+	font-size: 13px;
+	--ir-border: var(--background-modifier-border);
+	--ir-panel: var(--background-secondary);
+	--ir-panel-2: var(--background-primary);
+	--ir-muted: var(--text-muted);
+}
+.ir-head, .ir-detail-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 12px;
+}
+.ir-head h2, .ir-detail h3, .ir-gates h3 {
+	margin: 0;
+	font-size: 18px;
+}
+.ir-subtitle {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin-top: 2px;
+}
+.ir-subtitle.offline {
+	color: var(--color-orange);
+}
+.ir-modal-actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+	margin-top: 12px;
+}
+.ir-modal-input {
+	display: block;
+	width: 100%;
+	margin-top: 8px;
+}
+.ir-sessions-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.ir-sessions-head h4 {
+	margin: 0 0 5px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-session {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	background: var(--ir-panel-2);
+	padding: 8px;
+	margin-bottom: 8px;
+}
+.ir-pill.session-active {
+	color: var(--color-blue);
+}
+.ir-pill.session-blocked, .ir-pill.session-cancelled {
+	color: var(--color-orange);
+}
+.ir-pill.session-completed {
+	color: var(--color-green);
+}
+.ir-session-goal {
+	font-weight: 650;
+	margin-top: 6px;
+	line-height: 1.35;
+}
+.ir-session-summary {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin: 5px 0 6px;
+	white-space: pre-wrap;
+}
+.ir-session-summary.is-missing {
+	color: var(--color-orange);
+}
+.ir-actions, .ir-status-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.ir-tabs {
+	display: flex;
+	gap: 6px;
+	margin-bottom: 12px;
+}
+.ir-tab {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px 8px 0 0;
+	background: var(--ir-panel);
+	color: var(--text-muted);
+	padding: 4px 14px;
+	cursor: pointer;
+}
+.ir-tab.is-active {
+	background: var(--ir-panel-2);
+	color: var(--text-normal);
+	font-weight: 700;
+	border-bottom-color: transparent;
+}
+.ir-process {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 12px;
+	margin-bottom: 12px;
+}
+.ir-card-link {
+	font-family: var(--font-monospace);
+	font-weight: 700;
+	cursor: pointer;
+}
+.ir-pill.gate-ready {
+	color: var(--color-green);
+}
+.ir-pill.gate-open, .ir-pill.decision-open {
+	color: var(--color-orange);
+}
+.ir-gate-blockers {
+	color: var(--color-orange);
+	margin-top: 4px;
+}
+.ir-summary {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(88px, 1fr));
+	gap: 8px;
+	margin-bottom: 12px;
+}
+.ir-stat {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px 10px;
+}
+.ir-stat-value {
+	font-family: var(--font-monospace);
+	font-weight: 700;
+	font-size: 18px;
+}
+.ir-stat-label {
+	color: var(--text-muted);
+	font-size: 11px;
+}
+.ir-filters {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	align-items: center;
+	margin-bottom: 12px;
+}
+.ir-filters input {
+	min-width: min(280px, 100%);
+}
+.ir-select {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	color: var(--text-muted);
+	font-size: 12px;
+}
+.ir-board {
+	display: grid;
+	grid-auto-flow: column;
+	grid-auto-columns: minmax(250px, 300px);
+	gap: 10px;
+	overflow-x: auto;
+	padding-bottom: 10px;
+	margin-bottom: 14px;
+}
+.ir-column {
+	min-height: 220px;
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 8px;
+}
+.ir-column-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	font-weight: 700;
+	margin-bottom: 8px;
+}
+.ir-count {
+	color: var(--text-muted);
+	font-family: var(--font-monospace);
+	font-size: 11px;
+}
+.ir-card {
+	border: 1px solid var(--ir-border);
+	border-left: 3px solid var(--color-blue);
+	background: var(--ir-panel-2);
+	border-radius: 8px;
+	padding: 8px;
+	margin-bottom: 8px;
+	cursor: pointer;
+}
+.ir-card.is-selected {
+	outline: 2px solid var(--text-accent);
+}
+.ir-card.is-blocked {
+	border-left-color: var(--color-orange);
+}
+.ir-card.status-done {
+	border-left-color: var(--color-green);
+}
+.ir-card.status-parked {
+	border-left-color: var(--text-faint);
+}
+.ir-card-meta, .ir-card-foot {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px;
+	align-items: center;
+	color: var(--text-muted);
+	font-size: 11px;
+}
+.ir-id {
+	font-family: var(--font-monospace);
+	color: var(--text-normal);
+	font-weight: 700;
+}
+.ir-pill {
+	border: 1px solid var(--ir-border);
+	border-radius: 999px;
+	padding: 0 6px;
+	font-family: var(--font-monospace);
+}
+.ir-pill.priority-p0, .ir-pill.blocked {
+	color: var(--color-red);
+}
+.ir-pill.priority-p1 {
+	color: var(--color-orange);
+}
+.ir-card-title {
+	font-weight: 650;
+	margin-top: 6px;
+	line-height: 1.35;
+}
+.ir-card-summary {
+	color: var(--text-muted);
+	font-size: 12px;
+	margin: 5px 0 6px;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+.ir-detail, .ir-gates {
+	border: 1px solid var(--ir-border);
+	background: var(--ir-panel);
+	border-radius: 8px;
+	padding: 12px;
+	margin-bottom: 12px;
+}
+.ir-detail-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+	gap: 14px;
+}
+.ir-block {
+	margin-bottom: 12px;
+}
+.ir-block h4 {
+	margin: 0 0 5px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+.ir-block ul {
+	margin: 0;
+	padding-left: 18px;
+}
+.ir-block li {
+	margin: 3px 0;
+}
+.ir-block code, .ir-block pre {
+	font-family: var(--font-monospace);
+	font-size: 12px;
+	white-space: pre-wrap;
+}
+.ir-block pre {
+	max-height: 260px;
+	overflow: auto;
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	padding: 8px;
+	background: var(--background-primary);
+}
+.ir-dep {
+	display: flex;
+	justify-content: space-between;
+	gap: 10px;
+	border-bottom: 1px solid var(--ir-border);
+	padding: 3px 0;
+	font-family: var(--font-monospace);
+}
+.ir-dep.ok {
+	color: var(--color-green);
+}
+.ir-dep.blocked, .ir-warning {
+	color: var(--color-orange);
+}
+.ir-warning {
+	border: 1px solid rgba(var(--color-orange-rgb), 0.45);
+	border-radius: 8px;
+	padding: 8px;
+}
+.ir-gate-grid {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 10px;
+}
+.ir-gate {
+	border: 1px solid var(--ir-border);
+	border-radius: 8px;
+	padding: 9px;
+	background: var(--background-primary);
+}
+.ir-gate-name {
+	font-weight: 700;
+}
+.ir-gate-desc, .ir-gate-meta, .ir-empty {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+.ir-progress {
+	height: 6px;
+	background: var(--background-modifier-border);
+	border-radius: 999px;
+	margin: 8px 0;
+	overflow: hidden;
+}
+.ir-progress-bar {
+	height: 100%;
+	background: var(--color-green);
+}
+@media (max-width: 900px) {
+	.ir-summary, .ir-gate-grid, .ir-detail-grid {
+		grid-template-columns: 1fr;
+	}
+}

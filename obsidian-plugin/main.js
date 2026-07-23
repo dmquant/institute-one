@@ -578,22 +578,59 @@ var AskStreamView = class extends import_obsidian2.ItemView {
   /**
    * fetch + NDJSON 流式路径。返回 false = 环境/后端不支持流式（CORS 拦截、
    * 404/405/501），调用方回落同步；其他错误（含中途断流）就地报告，不回落。
+   * 设置了访问令牌时带 Authorization Bearer；整个流与同步 /api/ask 共享同一
+   * 总预算（ASK_TIMEOUT_MS）——超时按「任务可能已在后端运行」处理，绝不重跑。
    */
   async tryStream(prompt, started) {
+    const ctrl = new AbortController();
+    this.abort = ctrl;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, ASK_TIMEOUT_MS);
+    try {
+      return await this.streamOnce(prompt, started, ctrl, () => timedOut);
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+  async streamOnce(prompt, started, ctrl, timedOut) {
     const url = this.plugin.api.baseUrl() + "/api/ask/stream";
-    this.abort = new AbortController();
+    const headers = { "Content-Type": "application/json" };
+    const token = this.plugin.settings.token.trim();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
     let resp;
     try {
       resp = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ prompt, analyst_id: this.analystId || null }),
-        signal: this.abort.signal
+        signal: ctrl.signal
       });
     } catch (e) {
-      if (this.abort.signal.aborted) return true;
+      if (ctrl.signal.aborted) {
+        if (timedOut()) {
+          this.status(
+            `\u6D41\u5F0F\u8BF7\u6C42\u8D85\u65F6\uFF08${Math.round(ASK_TIMEOUT_MS / 6e4)} \u5206\u949F\uFF09\u2014 \u4EFB\u52A1\u53EF\u80FD\u5DF2\u5728\u540E\u7AEF\u8FD0\u884C\uFF0C\u7ED3\u679C\u89C1\u4EFB\u52A1\u8BB0\u5F55\u3002`
+          );
+        }
+        return true;
+      }
       this.status(`\u6D41\u5F0F\u4E0D\u53EF\u7528\uFF08${errMsg(e).slice(0, 120)}\uFF09\u2014 \u56DE\u843D\u540C\u6B65\u6A21\u5F0F\u2026`);
       return false;
+    }
+    if (resp.status === 401) {
+      this.append(
+        "\u9274\u6743\u5931\u8D25\uFF1AHTTP 401 \u2014 \u540E\u7AEF\u542F\u7528\u4E86 INSTITUTE_TOKEN\uFF0C\u8BF7\u5728\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u586B\u5199\u6216\u6838\u5BF9\u8BBF\u95EE\u4EE4\u724C (bearer token)\u3002\n",
+        "stderr"
+      );
+      this.status("\u9274\u6743\u5931\u8D25\uFF08401\uFF09\u2014 \u8BF7\u68C0\u67E5\u8BBF\u95EE\u4EE4\u724C\u3002");
+      new import_obsidian2.Notice(
+        "Institute: \u6D41\u5F0F\u63D0\u95EE\u9274\u6743\u5931\u8D25\uFF08401\uFF09\u2014 \u8BF7\u5728\u8BBE\u7F6E\u4E2D\u68C0\u67E5\u8BBF\u95EE\u4EE4\u724C (bearer token)\u3002",
+        8e3
+      );
+      return true;
     }
     if (resp.status === 404 || resp.status === 405 || resp.status === 501) {
       this.status(`\u540E\u7AEF\u65E0\u6D41\u5F0F\u7AEF\u70B9\uFF08HTTP ${resp.status}\uFF09\u2014 \u56DE\u843D\u540C\u6B65\u6A21\u5F0F\u2026`);
@@ -646,7 +683,18 @@ var AskStreamView = class extends import_obsidian2.ItemView {
       buf += decoder.decode();
       if (buf.trim()) handleLine(buf);
     } catch (e) {
-      if (this.abort.signal.aborted) return true;
+      if (ctrl.signal.aborted) {
+        if (timedOut()) {
+          this.append(
+            `
+[\u6D41\u8D85\u65F6\uFF08${Math.round(ASK_TIMEOUT_MS / 6e4)} \u5206\u949F\uFF09\u2014 \u5B8C\u6574\u8F93\u51FA\u5728\u540E\u7AEF\u4EFB\u52A1\u8BB0\u5F55]
+`,
+            "stderr"
+          );
+          this.status("\u6D41\u8D85\u65F6\u3002");
+        }
+        return true;
+      }
       this.append(`
 [\u6D41\u4E2D\u65AD\uFF1A${errMsg(e)} \u2014 \u5B8C\u6574\u8F93\u51FA\u5728\u540E\u7AEF\u4EFB\u52A1\u8BB0\u5F55]
 `, "stderr");
@@ -782,6 +830,9 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.refreshing = false;
+    /** details sections expanded at least once — collapsed ones are not fetched
+     * before their first expand (see watchExtra) */
+    this.extrasOpened = /* @__PURE__ */ new Set();
     // events cursor (durable ids from the backend events table)
     this.cursor = 0;
     this.bootstrapped = false;
@@ -823,6 +874,11 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
     [this.treesWrapEl, this.treesSummaryEl, this.treesBodyEl] = this.collapsible(root, "\u7814\u7A76\u6811\u76D1\u63A7");
     [this.triageWrapEl, this.triageSummaryEl, this.triageBodyEl] = this.collapsible(root, "\u64CD\u4F5C\u53F0 triage");
     [this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] = this.collapsible(root, "\u7EB8\u9762\u8D26\u672C");
+    this.watchExtra("inbox", this.inboxWrapEl, () => this.refreshOperatorInbox());
+    this.watchExtra("forecasts", this.forecastsWrapEl, () => this.refreshForecasts());
+    this.watchExtra("trees", this.treesWrapEl, () => this.refreshResearchTrees());
+    this.watchExtra("triage", this.triageWrapEl, () => this.refreshTriage());
+    this.watchExtra("book", this.bookWrapEl, () => this.refreshBook());
     this.eventsEl = this.section(root, "\u6700\u8FD1\u4E8B\u4EF6");
     const actions = root.createDiv();
     actions.style.display = "flex";
@@ -833,7 +889,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
     this.actionButton(actions, "\u6DF1\u5EA6\u7814\u7A76", () => this.plugin.openResearchPrompt());
     this.actionButton(actions, "\u8DEF\u7EBF\u56FE", () => void this.plugin.activateRoadmap());
     this.actionButton(actions, "\u6253\u5F00\u64CD\u4F5C\u53F0", () => this.plugin.openOperatorUi());
-    void this.refresh();
+    void this.refresh(true);
     const everyMs = Math.max(5, this.plugin.settings.pollIntervalS || 10) * 1e3;
     this.registerInterval(window.setInterval(() => void this.refresh(), everyMs));
   }
@@ -893,13 +949,30 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
     s.setAttribute("title", title);
   }
   // ---- polling ---------------------------------------------------------------
-  async refresh() {
+  /**
+   * Lazy-load a collapsible section: a collapsed <details> is not fetched
+   * until the user expands it the first time; afterwards the regular poll
+   * keeps it fresh (also when re-collapsed).
+   */
+  watchExtra(key, wrap, load) {
+    wrap.addEventListener("toggle", () => {
+      if (wrap.open && !this.extrasOpened.has(key)) {
+        this.extrasOpened.add(key);
+        void load();
+      }
+    });
+  }
+  extraReady(key, wrap) {
+    return wrap.open || this.extrasOpened.has(key);
+  }
+  async refresh(force = false) {
     if (this.refreshing) return;
+    if (!force && !this.containerEl.isShown()) return;
     this.refreshing = true;
     try {
       let meta;
       try {
-        meta = await this.plugin.api.meta();
+        meta = await this.plugin.getMeta();
       } catch (e) {
         this.bannerEl.style.display = "block";
         this.bannerEl.setText(
@@ -917,7 +990,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
       } catch {
       }
       const [daily, running, queued] = await Promise.all([
-        this.plugin.api.dailyStatus().catch(() => null),
+        this.plugin.getDailyStatus().catch(() => null),
         this.plugin.api.listTasks("running").catch(() => []),
         this.plugin.api.listTasks("queued").catch(() => [])
       ]);
@@ -941,6 +1014,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   }
   // ---- Operator 收件箱（裁决仍只在 SPA 中进行） ------------------------------------
   async refreshOperatorInbox() {
+    if (!this.extraReady("inbox", this.inboxWrapEl)) return;
     let result;
     try {
       result = await this.plugin.api.operatorActions("open", 1e3);
@@ -984,6 +1058,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   }
   // ---- 预测账本速览（API 无 stats；聚合近 5 条的 detail verdict） ----------------------
   async refreshForecasts() {
+    if (!this.extraReady("forecasts", this.forecastsWrapEl)) return;
     let rows;
     try {
       const recent = await this.plugin.api.forecasts(5);
@@ -1038,6 +1113,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   }
   // ---- 研究树监控 ----------------------------------------------------------------
   async refreshResearchTrees() {
+    if (!this.extraReady("trees", this.treesWrapEl)) return;
     let active;
     let activeTruncated = false;
     let detail;
@@ -1210,6 +1286,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   async runAllDailies() {
     try {
       await this.plugin.api.runAllDailies();
+      this.plugin.invalidateStatusCaches();
       new import_obsidian3.Notice("Institute: \u5DF2\u542F\u52A8\u5168\u5458\u65E5\u62A5\uFF08\u540E\u53F0\u8FD0\u884C\uFF0C\u5B8C\u6210\u540E\u81EA\u52A8\u5BFC\u51FA\uFF09\u3002", 6e3);
     } catch (e) {
       new import_obsidian3.Notice(`Institute: \u542F\u52A8\u5168\u5458\u65E5\u62A5\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
@@ -1217,6 +1294,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   }
   // ---- 操作台 triage（Phase 6；旧后端 404 时整块隐藏） -------------------------------
   async refreshTriage() {
+    if (!this.extraReady("triage", this.triageWrapEl)) return;
     let t;
     try {
       t = await this.plugin.api.triage();
@@ -1271,6 +1349,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
   }
   // ---- 纸面账本（paper book；旧后端 404 时整块隐藏） -----------------------------------
   async refreshBook() {
+    if (!this.extraReady("book", this.bookWrapEl)) return;
     let nav;
     let positions;
     try {
@@ -1366,6 +1445,7 @@ var InstituteDashboardView = class extends import_obsidian3.ItemView {
         res.cancelled ? `Institute: \u5DF2\u53D6\u6D88\u4EFB\u52A1 ${taskId}\u3002` : `Institute: \u4EFB\u52A1 ${taskId} \u65E0\u6CD5\u53D6\u6D88\uFF08\u53EF\u80FD\u5DF2\u7ED3\u675F\uFF09\u3002`,
         5e3
       );
+      this.plugin.invalidateStatusCaches();
       void this.refresh();
     } catch (e) {
       new import_obsidian3.Notice(`Institute: \u53D6\u6D88\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
@@ -2413,8 +2493,7 @@ var backlog_default = {
         "app/institute/roadmap.py",
         "app/api/roadmap.py",
         "obsidian-plugin/src/roadmap.ts",
-        "tests/test_roadmap.py",
-        "roadmap/operator-acceptance-2026-07-21.md"
+        "tests/test_roadmap.py"
       ],
       dependencies: [
         "M7-001",
@@ -2443,7 +2522,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P0-01 (R2 B1, the only PARTIALLY of 75 must-fix): _skip_add_column() only compares type/NOT NULL/DEFAULT, so a crash-recovered column whose migration declares CHECK or REFERENCES can be silently recorded as applied. Parse sqlite_master for the table DDL and compare (or fail closed on constraint declarations the parser cannot prove). Coordinate with the round-5 E1 partition before starting \u2014 verify it is still open.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/db.py",
@@ -2469,7 +2548,7 @@ var backlog_default = {
       risk: "low",
       summary: "S4-P0-02 (second half; the marker split over test_market_thesis_import.py belongs to the round-5 E1 partition): the D4 restart-recovery probe still skips with exploratory schema guesses ('could not seed a running research-tree row'). Replace the probe with a deterministic running-tree fixture against the real 0020 schema so orphan recovery is actually asserted on every run.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "tests/test_restart_recovery.py"
@@ -2493,7 +2572,7 @@ var backlog_default = {
       risk: "high",
       summary: "S4-P1-01 (A1/F1): retry does not persist the original fallback chain/lineage, so a cross-process retry after restart loses hand confinement and has no idempotency key; rate_limited tasks still terminate permanently after one fallback retry (ROADMAP Phase 2 'Executor depth'). Persist retry lineage + idempotency key, add the cooldown-expiry resurrection job, and lock the exact output-cap/marker boundary with tests.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/router/executor.py",
@@ -2521,7 +2600,7 @@ var backlog_default = {
       risk: "low",
       summary: "ROADMAP Phase 1a acceptance debt: the whiteboard similarity gate (0.85/14d skip, 0.65/30d build-on) shipped with uncalibrated default thresholds \u2014 the one-off distribution sanity check against ~50 known duplicate/related/unrelated pairs with real bge-m3 embeddings was never run. Run it against local Ollama, record the distribution, and adjust the config-row thresholds if the defaults misclassify.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/vectors.py",
@@ -2546,7 +2625,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P1-08 (B3/C8) + ROADMAP Phase 2 gap: analyst standing memory is injected only at the four workflow prompt-assembly points; ad-hoc /api/ask, ask_stream, sessions and MCP asks run memory-less, and concurrent compacts can double-burn the model. Decide the unified injection entrypoint first, then wire the remaining callers and add a conditional-claim around compact_one.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/memory.py",
@@ -2575,7 +2654,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-05 + ROADMAP Phase 6 partials: feature switches are stored/displayed but never enforced and PUT is not CAS; the SPA has no operator route, so the actions kanban and triage page exist only as backend JSON. Deliver switch enforcement + compare-and-swap PUT, the operator kanban/triage SPA pages, and define the human-auth boundary and shadow-exit policy before any unshadow.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/api/operator.py",
@@ -2605,7 +2684,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-10 (C7/S3): useSSE has no automated tests for bootstrap, pagination, reconnect-with-cursor, ring eviction or the watchdog; event grouping staleness and error rendering are unlocked. Introduce a frontend test runner (vitest) and lock the cursor state machine and UI edges.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "frontend/package.json",
@@ -2633,7 +2712,7 @@ var backlog_default = {
       risk: "high",
       summary: "ROADMAP Phase 6 L item, still schema-only (0018 recipes placeholder): recurring fixes become recipes; observations feed proposals; proposals require explicit human approval in the web UI (never via vault frontmatter or MCP \u2014 proposal \xA78.2 invariant); parameter history + effect measurement close the self-improvement loop.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "migrations/*.sql",
@@ -2663,13 +2742,13 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-13/14/15 + ROADMAP Phase 7 partial: the BFS engine is server-side only \u2014 no SSE tree viewer page, failed nodes have no retry policy, the score column is never written (no ranking), child replay is only exact-topic idempotent (normalized child key or documented contract), the daily booked counter is never cleaned and cap refusal returns 200 instead of 429.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/research_tree.py",
         "app/api/research_tree.py",
         "frontend/src/App.tsx",
-        "frontend/src/pages/ResearchTree.tsx",
+        "frontend/src/pages/Research.tsx",
         "tests/test_research_tree.py"
       ],
       dependencies: [],
@@ -2694,7 +2773,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-16/17 + ROADMAP Phase 7 partial: projects are backend containers only \u2014 no SPA page, no archive/unlink API routes, no project digest endpoint; MCP research_queue_add has no optional project_id so the write side cannot attach a project (keep the 3-write-tool boundary).",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/projects.py",
@@ -2726,7 +2805,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-18 + ROADMAP Phase 7 partial: bilingual twins ship as by-reference events only \u2014 no per-run+locale read endpoint or twin index, no SPA/admin locale toggle, failed translations are not retried, and replayed events can duplicate work. Add a stable read API, the locale toggle UI, and a bounded retry/idempotency policy.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/bilingual.py",
@@ -2755,7 +2834,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-06/07 + ROADMAP Phase 7 partial: multi-agent runs have no persistent group/run rows (no reconnect or partial-spawn recovery), committee has no Committee Vault export or input snapshot, workflow output files are not an engine contract, and majority verdicts stay free-text. Unify the group/run/file/verdict persistence protocol and add the missing API contract tests.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/multi_agent.py",
@@ -2784,7 +2863,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-01 (C1/S3): the factcheck disputed handler is best-effort \u2014 a crash between verdict and mailbox/vault delivery loses the dispute notification. Add a durable outbox with idempotent retry; optionally split extract/verify hand config and extend the parser oracle with production-shaped adversarial cases.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/factcheck.py",
@@ -2810,7 +2889,7 @@ var backlog_default = {
       risk: "high",
       summary: "S4-P1-10 + S4-P2-03 (B6/C3/S3): scheduled forecast seeding, batch settlement reconciliation (repeatable command over history), benchmark-base backfill, historical MTM/backfill-price recomputation, strict risk/cap enforcement and the forecast Vault export are all incomplete. Split into seeding / reconciliation / risk-enforcement work items when claimed.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/forecasts.py",
@@ -2839,7 +2918,7 @@ var backlog_default = {
       risk: "low",
       summary: "S4-P2-08 (C6/S3): the launchd service is installed and running but no long soak has validated install \u2192 crash \u2192 KeepAlive restart \u2192 stop \u2192 uninstall, log rotation/growth, or failure-retention plist behavior. Run the soak on the real machine and record evidence; do not fake results from a read-only audit.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "scripts/install-service.sh",
@@ -2867,7 +2946,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P1-03 (A5/F1): a failed board transaction can orphan the session/workspace it created, and a hard kill leaves a used topic claim with no lease/recovery. Add a claim lease + reaper (or widen the session+board atomic boundary) so crashes never leak workspaces or strand topics.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/whiteboard.py",
@@ -2892,7 +2971,7 @@ var backlog_default = {
       risk: "low",
       summary: "S4-P1-04 (A8/S1): vector search mode cannot distinguish a healthy zero-hit from a degraded (Ollama-down) result; identical content embedded via different paths is not reused; superseded-model projections are hidden but never garbage-collected. Add a degradation reason/health surface, content-addressed embedding reuse, and old-model GC.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/vectors.py",
@@ -2918,7 +2997,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P2-19 + S4-P2-15 (partial): the events table has no global retention (long-run growth), and per-day research-tree booked counters accumulate forever. Define the audit-retention requirement first, then extend the janitor with age-based event retention and 30-day counter cleanup.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/institute/scheduler.py",
@@ -2943,7 +3022,7 @@ var backlog_default = {
       risk: "medium",
       summary: "S4-P3-01 = the two remaining ROADMAP Phase 0 opens: interactive asks still queue behind long workflow steps with no timeout/cancel/recoverable-task protocol (busy-hand preference or an interactive lane for source=api), and there is no optional INSTITUTE_TOKEN bearer middleware while INSTITUTE_HOST is settable.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/router/executor.py",
@@ -2971,7 +3050,7 @@ var backlog_default = {
       risk: "low",
       summary: "S4-P2-12 + S4-P1-05/02/06/07 + S4-P2-04 rolled up: burn down FastAPI lifespan/Pydantic v2/timezone-aware datetime/httpx transport deprecation warnings in batches; remove stale comments (e.g. the outdated 'A2 patch not landed' note in app/mcp.py) and re-verify README/CLAUDE/test-mount claims; converge internal APIs \u2014 public scheduler.inflight_jobs(), scorecard_time config instead of hardcoded 00:05, shared sync/stream ask prepare helper, one shared price helper for _usable_price/_adj_close. Facts-only sweep, never mixed with feature patches.",
       design_links: [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       expected_files: [
         "app/mcp.py",
@@ -3516,7 +3595,9 @@ var RoadmapView = class extends import_obsidian5.ItemView {
     this.sessionsFetched = /* @__PURE__ */ new Set();
     /** null = the fetch failed; the panel renders a retry row instead of 加载中 */
     this.sessionsByCard = /* @__PURE__ */ new Map();
-    /** backend-generated agent prompts (GET /cards/{id}/prompt), keyed by card id */
+    /** backend-generated agent prompts (GET /cards/{id}/prompt), keyed by card id;
+     * null = the fetch failed — the panel keeps the local template and renders an
+     * explicit retry button (same pattern as sessionsByCard) */
     this.promptsByCard = /* @__PURE__ */ new Map();
     /** undefined = not loaded yet; null = the fetch failed (retry row) */
     this.processData = void 0;
@@ -3533,7 +3614,6 @@ var RoadmapView = class extends import_obsidian5.ItemView {
     return "columns-3";
   }
   async onOpen() {
-    ensureRoadmapStyles();
     const root = this.contentEl;
     root.empty();
     root.addClass("institute-roadmap");
@@ -3849,7 +3929,8 @@ var RoadmapView = class extends import_obsidian5.ItemView {
   }
   /** API mode: lazily fetch the backend's deterministic agent prompt
    * (GET /cards/{id}/prompt, M7-007) so the panel previews what 复制 copies.
-   * Offline keeps the local seed-derived template as the fallback. */
+   * Offline keeps the local seed-derived template as the fallback; a failed
+   * fetch stores null (retry button) instead of refetching on every render. */
   hydratePrompt(card) {
     if (this.mode !== "api" || this.promptsByCard.has(card.id)) return;
     void this.plugin.api.cardPrompt(card.id).then(
@@ -3858,8 +3939,14 @@ var RoadmapView = class extends import_obsidian5.ItemView {
         if (this.selectedId === card.id) this.renderDetail();
       },
       () => {
+        this.promptsByCard.set(card.id, null);
+        if (this.selectedId === card.id) this.renderDetail();
       }
     );
+  }
+  refreshPrompt(card) {
+    this.promptsByCard.delete(card.id);
+    this.renderDetail();
   }
   /** Agent prompt panel (M7-007): preview + a copy button. API mode copies the
    * backend's deterministic prompt; offline copies the bundled-seed template. */
@@ -3873,7 +3960,12 @@ var RoadmapView = class extends import_obsidian5.ItemView {
       "\u751F\u6210\u5E76\u590D\u5236\u8BE5\u5361\u7684 agent prompt \u5230\u526A\u8D34\u677F",
       () => void this.copyAgentPrompt(card)
     );
-    box.createEl("pre", { text: this.promptsByCard.get(card.id) ?? agentPrompt(card) });
+    const prompt = this.promptsByCard.get(card.id);
+    box.createEl("pre", { text: prompt ?? agentPrompt(card) });
+    if (prompt === null) {
+      box.createDiv({ cls: "ir-empty", text: "\u540E\u7AEF prompt \u52A0\u8F7D\u5931\u8D25\uFF0C\u4E0A\u65B9\u4E3A\u672C\u5730\u6A21\u677F\u3002" });
+      this.button(box, "\u91CD\u8BD5", "\u91CD\u65B0\u83B7\u53D6\u540E\u7AEF Agent Prompt", () => this.refreshPrompt(card));
+    }
   }
   async copyAgentPrompt(card) {
     let prompt;
@@ -4423,8 +4515,8 @@ var RELEASE_GATES = [
   { name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
   { name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] },
   { name: "Release D", description: "Post-Audit Hardening", prefixes: ["M8"] },
-  { name: "Release E", description: "North Star Systems", prefixes: ["M9"] },
-  { name: "Release F", description: "Bounded Autonomy", prefixes: ["M10"] }
+  { name: "Release E", description: "North Star R1", prefixes: ["M9"] },
+  { name: "Release F", description: "Bounded-Autonomy Loop", prefixes: ["M10"] }
 ];
 function localReleaseGates(cards) {
   return RELEASE_GATES.map((gate) => {
@@ -4548,358 +4640,6 @@ function buildKanbanMarkdown(cards, source) {
   );
   return lines.join("\n");
 }
-function ensureRoadmapStyles() {
-  if (document.getElementById("institute-roadmap-style")) return;
-  const style = document.createElement("style");
-  style.id = "institute-roadmap-style";
-  style.textContent = `
-.institute-roadmap {
-	padding: 12px;
-	font-size: 13px;
-	--ir-border: var(--background-modifier-border);
-	--ir-panel: var(--background-secondary);
-	--ir-panel-2: var(--background-primary);
-	--ir-muted: var(--text-muted);
-}
-.ir-head, .ir-detail-head {
-	display: flex;
-	align-items: flex-start;
-	justify-content: space-between;
-	gap: 12px;
-	margin-bottom: 12px;
-}
-.ir-head h2, .ir-detail h3, .ir-gates h3 {
-	margin: 0;
-	font-size: 18px;
-}
-.ir-subtitle {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin-top: 2px;
-}
-.ir-subtitle.offline {
-	color: var(--color-orange);
-}
-.ir-modal-actions {
-	display: flex;
-	gap: 8px;
-	justify-content: flex-end;
-	margin-top: 12px;
-}
-.ir-modal-input {
-	display: block;
-	width: 100%;
-	margin-top: 8px;
-}
-.ir-sessions-head {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 8px;
-}
-.ir-sessions-head h4 {
-	margin: 0 0 5px;
-	font-size: 12px;
-	color: var(--text-muted);
-}
-.ir-session {
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	background: var(--ir-panel-2);
-	padding: 8px;
-	margin-bottom: 8px;
-}
-.ir-pill.session-active {
-	color: var(--color-blue);
-}
-.ir-pill.session-blocked, .ir-pill.session-cancelled {
-	color: var(--color-orange);
-}
-.ir-pill.session-completed {
-	color: var(--color-green);
-}
-.ir-session-goal {
-	font-weight: 650;
-	margin-top: 6px;
-	line-height: 1.35;
-}
-.ir-session-summary {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin: 5px 0 6px;
-	white-space: pre-wrap;
-}
-.ir-session-summary.is-missing {
-	color: var(--color-orange);
-}
-.ir-actions, .ir-status-actions {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 6px;
-}
-.ir-tabs {
-	display: flex;
-	gap: 6px;
-	margin-bottom: 12px;
-}
-.ir-tab {
-	border: 1px solid var(--ir-border);
-	border-radius: 8px 8px 0 0;
-	background: var(--ir-panel);
-	color: var(--text-muted);
-	padding: 4px 14px;
-	cursor: pointer;
-}
-.ir-tab.is-active {
-	background: var(--ir-panel-2);
-	color: var(--text-normal);
-	font-weight: 700;
-	border-bottom-color: transparent;
-}
-.ir-process {
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 12px;
-	margin-bottom: 12px;
-}
-.ir-card-link {
-	font-family: var(--font-monospace);
-	font-weight: 700;
-	cursor: pointer;
-}
-.ir-pill.gate-ready {
-	color: var(--color-green);
-}
-.ir-pill.gate-open, .ir-pill.decision-open {
-	color: var(--color-orange);
-}
-.ir-gate-blockers {
-	color: var(--color-orange);
-	margin-top: 4px;
-}
-.ir-summary {
-	display: grid;
-	grid-template-columns: repeat(5, minmax(88px, 1fr));
-	gap: 8px;
-	margin-bottom: 12px;
-}
-.ir-stat {
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 8px 10px;
-}
-.ir-stat-value {
-	font-family: var(--font-monospace);
-	font-weight: 700;
-	font-size: 18px;
-}
-.ir-stat-label {
-	color: var(--text-muted);
-	font-size: 11px;
-}
-.ir-filters {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 8px;
-	align-items: center;
-	margin-bottom: 12px;
-}
-.ir-filters input {
-	min-width: min(280px, 100%);
-}
-.ir-select {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	color: var(--text-muted);
-	font-size: 12px;
-}
-.ir-board {
-	display: grid;
-	grid-auto-flow: column;
-	grid-auto-columns: minmax(250px, 300px);
-	gap: 10px;
-	overflow-x: auto;
-	padding-bottom: 10px;
-	margin-bottom: 14px;
-}
-.ir-column {
-	min-height: 220px;
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 8px;
-}
-.ir-column-head {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	font-weight: 700;
-	margin-bottom: 8px;
-}
-.ir-count {
-	color: var(--text-muted);
-	font-family: var(--font-monospace);
-	font-size: 11px;
-}
-.ir-card {
-	border: 1px solid var(--ir-border);
-	border-left: 3px solid var(--color-blue);
-	background: var(--ir-panel-2);
-	border-radius: 8px;
-	padding: 8px;
-	margin-bottom: 8px;
-	cursor: pointer;
-}
-.ir-card.is-selected {
-	outline: 2px solid var(--text-accent);
-}
-.ir-card.is-blocked {
-	border-left-color: var(--color-orange);
-}
-.ir-card.status-done {
-	border-left-color: var(--color-green);
-}
-.ir-card.status-parked {
-	border-left-color: var(--text-faint);
-}
-.ir-card-meta, .ir-card-foot {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 5px;
-	align-items: center;
-	color: var(--text-muted);
-	font-size: 11px;
-}
-.ir-id {
-	font-family: var(--font-monospace);
-	color: var(--text-normal);
-	font-weight: 700;
-}
-.ir-pill {
-	border: 1px solid var(--ir-border);
-	border-radius: 999px;
-	padding: 0 6px;
-	font-family: var(--font-monospace);
-}
-.ir-pill.priority-p0, .ir-pill.blocked {
-	color: var(--color-red);
-}
-.ir-pill.priority-p1 {
-	color: var(--color-orange);
-}
-.ir-card-title {
-	font-weight: 650;
-	margin-top: 6px;
-	line-height: 1.35;
-}
-.ir-card-summary {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin: 5px 0 6px;
-	display: -webkit-box;
-	-webkit-line-clamp: 3;
-	-webkit-box-orient: vertical;
-	overflow: hidden;
-}
-.ir-detail, .ir-gates {
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 12px;
-	margin-bottom: 12px;
-}
-.ir-detail-grid {
-	display: grid;
-	grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
-	gap: 14px;
-}
-.ir-block {
-	margin-bottom: 12px;
-}
-.ir-block h4 {
-	margin: 0 0 5px;
-	font-size: 12px;
-	color: var(--text-muted);
-}
-.ir-block ul {
-	margin: 0;
-	padding-left: 18px;
-}
-.ir-block li {
-	margin: 3px 0;
-}
-.ir-block code, .ir-block pre {
-	font-family: var(--font-monospace);
-	font-size: 12px;
-	white-space: pre-wrap;
-}
-.ir-block pre {
-	max-height: 260px;
-	overflow: auto;
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	padding: 8px;
-	background: var(--background-primary);
-}
-.ir-dep {
-	display: flex;
-	justify-content: space-between;
-	gap: 10px;
-	border-bottom: 1px solid var(--ir-border);
-	padding: 3px 0;
-	font-family: var(--font-monospace);
-}
-.ir-dep.ok {
-	color: var(--color-green);
-}
-.ir-dep.blocked, .ir-warning {
-	color: var(--color-orange);
-}
-.ir-warning {
-	border: 1px solid rgba(var(--color-orange-rgb), 0.45);
-	border-radius: 8px;
-	padding: 8px;
-}
-.ir-gate-grid {
-	display: grid;
-	grid-template-columns: repeat(3, minmax(0, 1fr));
-	gap: 10px;
-}
-.ir-gate {
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	padding: 9px;
-	background: var(--background-primary);
-}
-.ir-gate-name {
-	font-weight: 700;
-}
-.ir-gate-desc, .ir-gate-meta, .ir-empty {
-	color: var(--text-muted);
-	font-size: 12px;
-}
-.ir-progress {
-	height: 6px;
-	background: var(--background-modifier-border);
-	border-radius: 999px;
-	margin: 8px 0;
-	overflow: hidden;
-}
-.ir-progress-bar {
-	height: 100%;
-	background: var(--color-green);
-}
-@media (max-width: 900px) {
-	.ir-summary, .ir-gate-grid, .ir-detail-grid {
-		grid-template-columns: 1fr;
-	}
-}
-`;
-  document.head.appendChild(style);
-}
 
 // src/main.ts
 var DEFAULT_SETTINGS = {
@@ -4917,6 +4657,10 @@ var InstituteOnePlugin = class extends import_obsidian6.Plugin {
     this.settings = { ...DEFAULT_SETTINGS };
     this.roster = null;
     this.rosterAt = 0;
+    this.metaCache = null;
+    this.metaAt = 0;
+    this.dailyCache = null;
+    this.dailyAt = 0;
   }
   async onload() {
     await this.loadSettings();
@@ -5175,6 +4919,29 @@ var InstituteOnePlugin = class extends import_obsidian6.Plugin {
   analystById(id) {
     return this.roster?.find((a) => a.id === id) ?? null;
   }
+  // ---- status caches (shared by the status bar and the dashboard) ---------------
+  /** Short-TTL /api/meta cache — same shape as getRoster. */
+  async getMeta(maxAgeMs = 5e3) {
+    const now = Date.now();
+    if (this.metaCache && now - this.metaAt < maxAgeMs) return this.metaCache;
+    this.metaCache = await this.api.meta();
+    this.metaAt = now;
+    return this.metaCache;
+  }
+  /** Short-TTL /api/analysts/daily/status cache — same shape as getRoster. */
+  async getDailyStatus(maxAgeMs = 5e3) {
+    const now = Date.now();
+    if (this.dailyCache && now - this.dailyAt < maxAgeMs) return this.dailyCache;
+    this.dailyCache = await this.api.dailyStatus();
+    this.dailyAt = now;
+    return this.dailyCache;
+  }
+  /** Drop the status caches after a mutation (ask / research enqueue / daily
+   * run / task cancel / base-URL change) so the next refresh refetches. */
+  invalidateStatusCaches() {
+    this.metaCache = null;
+    this.dailyCache = null;
+  }
   // ---- 提问 (Ask) ----------------------------------------------------------------
   openAskModal() {
     const editor = this.app.workspace.activeEditor?.editor ?? null;
@@ -5194,8 +4961,10 @@ var InstituteOnePlugin = class extends import_obsidian6.Plugin {
       const s = Math.round((Date.now() - started) / 1e3);
       notice.setMessage(`Institute: ${who} \u601D\u8003\u4E2D\u2026 ${s}s`);
     }, 1e3);
+    this.registerInterval(tick);
     try {
       const task = await this.api.ask(prompt, analyst?.id ?? null);
+      this.invalidateStatusCaches();
       const out = (task.output ?? "").trim();
       let text;
       if (!out) {
@@ -5208,18 +4977,24 @@ var InstituteOnePlugin = class extends import_obsidian6.Plugin {
         text = out;
       }
       if (editor) {
-        const cursor = editor.getCursor("to");
-        const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
-        editor.replaceRange(`
+        try {
+          const cursor = editor.getCursor("to");
+          const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
+          editor.replaceRange(`
 
 ${text}
 `, lineEnd);
+        } catch {
+          await this.createAskNote(prompt, analyst, text);
+          new import_obsidian6.Notice("Institute: \u539F\u7F16\u8F91\u5668\u5DF2\u5931\u6548\uFF0C\u56DE\u7B54\u5DF2\u5199\u5165\u65B0\u7684 Ask \u7B14\u8BB0\u3002", 6e3);
+        }
       } else {
         await this.createAskNote(prompt, analyst, text);
       }
       const s = Math.round((Date.now() - started) / 1e3);
       notice.setMessage(`Institute: \u5B8C\u6210\uFF08\u4EFB\u52A1 ${task.id}\uFF0C${task.status}\uFF0C${s}s\uFF09\u3002`);
-      window.setTimeout(() => notice.hide(), 5e3);
+      const hideTimer = window.setTimeout(() => notice.hide(), 5e3);
+      this.register(() => window.clearTimeout(hideTimer));
     } catch (e) {
       notice.hide();
       new import_obsidian6.Notice(`Institute: \u63D0\u95EE\u5931\u8D25 \u2014 ${errMsg(e)}`, 8e3);
@@ -5275,6 +5050,7 @@ ${output}
     }
     try {
       const res = await this.api.enqueueResearch(topic);
+      this.invalidateStatusCaches();
       if (res.refused === "cooldown") {
         new import_obsidian6.Notice(
           `Institute: \u300C${topic}\u300D\u88AB\u62D2 \u2014 \u51B7\u5374\u4E2D\uFF08\u4E0A\u6B21\u5B8C\u6210\u4E8E ${res.last_completed_at ?? "\u6700\u8FD1"}\uFF09\u3002`,
@@ -5458,7 +5234,7 @@ ${output}
       return;
     }
     try {
-      marks = (await this.api.dailyStatus()).analysts ?? {};
+      marks = (await this.getDailyStatus()).analysts ?? {};
     } catch {
     }
     const items = roster.filter((a) => a.category !== "ops");
@@ -5481,6 +5257,7 @@ ${output}
   async runOneDaily(a) {
     try {
       await this.api.runAnalystDaily(a.id);
+      this.invalidateStatusCaches();
       new import_obsidian6.Notice(
         `Institute: \u5DF2\u542F\u52A8 ${a.emoji} ${a.name} \u7684\u65E5\u62A5\uFF08\u540E\u53F0\u8FD0\u884C\uFF0C\u5B8C\u6210\u540E\u81EA\u52A8\u5BFC\u51FA\uFF09\u3002`,
         6e3
@@ -5552,13 +5329,13 @@ ${output}
   // ---- Status bar ----------------------------------------------------------
   async refreshStatus() {
     try {
-      const meta = await this.api.meta();
+      const meta = await this.getMeta();
       const by = meta.queue?.by_status ?? {};
       const running = by["running"] ?? 0;
       const queued = by["queued"] ?? 0;
       let dailyTxt = "";
       try {
-        const ds = await this.api.dailyStatus();
+        const ds = await this.getDailyStatus();
         const vals = Object.values(ds.analysts ?? {});
         const done = vals.filter((v) => v === "completed").length;
         if (vals.length > 0 && done < vals.length) dailyTxt = ` \xB7\u65E5\u62A5${done}/${vals.length}`;
@@ -5617,18 +5394,45 @@ function firstContentLine(body) {
   }
   return "";
 }
+function parseBaseUrl(value) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return DEFAULT_SETTINGS.baseUrl;
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
 var InstituteSettingTab = class extends import_obsidian6.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    /** debounce for the invalid-base-URL warning (one Notice per pause, not per keystroke) */
+    this.baseUrlWarnTimer = 0;
   }
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian6.Setting(containerEl).setName("\u540E\u7AEF\u5730\u5740 (base URL)").setDesc("Institute One \u540E\u7AEF\u8FD0\u884C\u7684\u5730\u5740\u3002").addText(
+    new import_obsidian6.Setting(containerEl).setName("\u540E\u7AEF\u5730\u5740 (base URL)").setDesc("Institute One \u540E\u7AEF\u8FD0\u884C\u7684\u5730\u5740\u3002\u4EC5\u652F\u6301 http(s)\uFF0C\u5982 http://127.0.0.1:8100\u3002").addText(
       (t) => t.setPlaceholder(DEFAULT_SETTINGS.baseUrl).setValue(this.plugin.settings.baseUrl).onChange(async (v) => {
-        this.plugin.settings.baseUrl = v.trim().replace(/\/+$/, "") || DEFAULT_SETTINGS.baseUrl;
+        const parsed = parseBaseUrl(v);
+        if (parsed === null) {
+          window.clearTimeout(this.baseUrlWarnTimer);
+          this.baseUrlWarnTimer = window.setTimeout(() => {
+            if (parseBaseUrl(t.inputEl.value) === null) {
+              new import_obsidian6.Notice(
+                "Institute: \u540E\u7AEF\u5730\u5740\u65E0\u6548 \u2014 \u4EC5\u652F\u6301 http(s) URL\uFF08\u5982 http://127.0.0.1:8100\uFF09\uFF0C\u672A\u4FDD\u5B58\u3002",
+                8e3
+              );
+            }
+          }, 1200);
+          return;
+        }
+        this.plugin.settings.baseUrl = parsed;
         await this.plugin.saveSettings();
+        this.plugin.invalidateStatusCaches();
         void this.plugin.refreshStatus();
       })
     );

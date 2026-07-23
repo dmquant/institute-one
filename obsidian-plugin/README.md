@@ -20,12 +20,12 @@ Desktop only. The backend must be running (default `http://127.0.0.1:8100`).
 
    ```sh
    mkdir -p "<YourVault>/.obsidian/plugins/institute-one"
-   cp manifest.json main.js "<YourVault>/.obsidian/plugins/institute-one/"
+   cp manifest.json main.js styles.css "<YourVault>/.obsidian/plugins/institute-one/"
    ```
 
    (Copying the whole `obsidian-plugin` folder as
    `<YourVault>/.obsidian/plugins/institute-one` also works — Obsidian only
-   needs `manifest.json` and `main.js`.)
+   needs `manifest.json`, `main.js` and `styles.css`.)
 
 3. In Obsidian: **Settings → Community plugins** → turn off Restricted mode if
    needed → enable **Institute One**.

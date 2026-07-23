@@ -12,7 +12,9 @@ import {
 import {
 	Analyst,
 	ArchiveHit,
+	DailyStatus,
 	InstituteApi,
+	MetaResult,
 	ResearchQueueItem,
 	VaultIndexRow,
 	errMsg,
@@ -77,6 +79,10 @@ export default class InstituteOnePlugin extends Plugin {
 	private statusBar!: HTMLElement;
 	private roster: Analyst[] | null = null;
 	private rosterAt = 0;
+	private metaCache: MetaResult | null = null;
+	private metaAt = 0;
+	private dailyCache: DailyStatus | null = null;
+	private dailyAt = 0;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -367,6 +373,33 @@ export default class InstituteOnePlugin extends Plugin {
 		return this.roster?.find((a) => a.id === id) ?? null;
 	}
 
+	// ---- status caches (shared by the status bar and the dashboard) ---------------
+
+	/** Short-TTL /api/meta cache — same shape as getRoster. */
+	async getMeta(maxAgeMs = 5_000): Promise<MetaResult> {
+		const now = Date.now();
+		if (this.metaCache && now - this.metaAt < maxAgeMs) return this.metaCache;
+		this.metaCache = await this.api.meta();
+		this.metaAt = now;
+		return this.metaCache;
+	}
+
+	/** Short-TTL /api/analysts/daily/status cache — same shape as getRoster. */
+	async getDailyStatus(maxAgeMs = 5_000): Promise<DailyStatus> {
+		const now = Date.now();
+		if (this.dailyCache && now - this.dailyAt < maxAgeMs) return this.dailyCache;
+		this.dailyCache = await this.api.dailyStatus();
+		this.dailyAt = now;
+		return this.dailyCache;
+	}
+
+	/** Drop the status caches after a mutation (ask / research enqueue / daily
+	 * run / task cancel / base-URL change) so the next refresh refetches. */
+	invalidateStatusCaches(): void {
+		this.metaCache = null;
+		this.dailyCache = null;
+	}
+
 	// ---- 提问 (Ask) ----------------------------------------------------------------
 
 	openAskModal(): void {
@@ -388,8 +421,10 @@ export default class InstituteOnePlugin extends Plugin {
 			const s = Math.round((Date.now() - started) / 1000);
 			notice.setMessage(`Institute: ${who} 思考中… ${s}s`);
 		}, 1000);
+		this.registerInterval(tick); // also cleared if the plugin unloads mid-run
 		try {
 			const task = await this.api.ask(prompt, analyst?.id ?? null);
+			this.invalidateStatusCaches(); // a task ran: the queue numbers changed
 			const out = (task.output ?? "").trim();
 			let text: string;
 			if (!out) {
@@ -403,15 +438,24 @@ export default class InstituteOnePlugin extends Plugin {
 				text = out;
 			}
 			if (editor) {
-				const cursor = editor.getCursor("to");
-				const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
-				editor.replaceRange(`\n\n${text}\n`, lineEnd);
+				try {
+					const cursor = editor.getCursor("to");
+					const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
+					editor.replaceRange(`\n\n${text}\n`, lineEnd);
+				} catch {
+					// the captured editor can go stale while the task runs (note
+					// closed / view reloaded) — the answer itself succeeded, so fall
+					// back to a note instead of misreporting 提问失败
+					await this.createAskNote(prompt, analyst, text);
+					new Notice("Institute: 原编辑器已失效，回答已写入新的 Ask 笔记。", 6000);
+				}
 			} else {
 				await this.createAskNote(prompt, analyst, text);
 			}
 			const s = Math.round((Date.now() - started) / 1000);
 			notice.setMessage(`Institute: 完成（任务 ${task.id}，${task.status}，${s}s）。`);
-			window.setTimeout(() => notice.hide(), 5000);
+			const hideTimer = window.setTimeout(() => notice.hide(), 5000);
+			this.register(() => window.clearTimeout(hideTimer)); // cleared on unload too
 		} catch (e) {
 			notice.hide();
 			new Notice(`Institute: 提问失败 — ${errMsg(e)}`, 8000);
@@ -471,6 +515,7 @@ export default class InstituteOnePlugin extends Plugin {
 		}
 		try {
 			const res = await this.api.enqueueResearch(topic);
+			this.invalidateStatusCaches();
 			if (res.refused === "cooldown") {
 				new Notice(
 					`Institute: 「${topic}」被拒 — 冷却中（上次完成于 ${res.last_completed_at ?? "最近"}）。`,
@@ -663,7 +708,7 @@ export default class InstituteOnePlugin extends Plugin {
 			return;
 		}
 		try {
-			marks = (await this.api.dailyStatus()).analysts ?? {};
+			marks = (await this.getDailyStatus()).analysts ?? {};
 		} catch {
 			/* marks are cosmetic */
 		}
@@ -688,6 +733,7 @@ export default class InstituteOnePlugin extends Plugin {
 	private async runOneDaily(a: Analyst): Promise<void> {
 		try {
 			await this.api.runAnalystDaily(a.id);
+			this.invalidateStatusCaches();
 			new Notice(
 				`Institute: 已启动 ${a.emoji} ${a.name} 的日报（后台运行，完成后自动导出）。`,
 				6000,
@@ -773,13 +819,13 @@ export default class InstituteOnePlugin extends Plugin {
 
 	async refreshStatus(): Promise<void> {
 		try {
-			const meta = await this.api.meta();
+			const meta = await this.getMeta();
 			const by = meta.queue?.by_status ?? {};
 			const running = by["running"] ?? 0;
 			const queued = by["queued"] ?? 0;
 			let dailyTxt = "";
 			try {
-				const ds = await this.api.dailyStatus();
+				const ds = await this.getDailyStatus();
 				const vals = Object.values(ds.analysts ?? {});
 				const done = vals.filter((v) => v === "completed").length;
 				if (vals.length > 0 && done < vals.length) dailyTxt = ` ·日报${done}/${vals.length}`;
@@ -853,11 +899,31 @@ function firstContentLine(body: string): string {
 	return "";
 }
 
+/**
+ * Normalize a base-URL setting value before saving: "" resets to the default;
+ * only absolute http(s) URLs are accepted (null = reject, keep the last valid
+ * value). Trailing slashes are stripped like before.
+ */
+function parseBaseUrl(value: string): string | null {
+	const trimmed = value.trim().replace(/\/+$/, "");
+	if (!trimmed) return DEFAULT_SETTINGS.baseUrl;
+	try {
+		const u = new URL(trimmed);
+		if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+		return trimmed;
+	} catch {
+		return null;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Settings tab
 // ---------------------------------------------------------------------------
 
 class InstituteSettingTab extends PluginSettingTab {
+	/** debounce for the invalid-base-URL warning (one Notice per pause, not per keystroke) */
+	private baseUrlWarnTimer = 0;
+
 	constructor(
 		app: App,
 		private plugin: InstituteOnePlugin,
@@ -871,15 +937,30 @@ class InstituteSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("后端地址 (base URL)")
-			.setDesc("Institute One 后端运行的地址。")
+			.setDesc("Institute One 后端运行的地址。仅支持 http(s)，如 http://127.0.0.1:8100。")
 			.addText((t) =>
 				t
 					.setPlaceholder(DEFAULT_SETTINGS.baseUrl)
 					.setValue(this.plugin.settings.baseUrl)
 					.onChange(async (v) => {
-						this.plugin.settings.baseUrl =
-							v.trim().replace(/\/+$/, "") || DEFAULT_SETTINGS.baseUrl;
+						const parsed = parseBaseUrl(v);
+						if (parsed === null) {
+							// reject: keep the last valid value; warn once the user stops
+							// typing instead of stacking a Notice per keystroke
+							window.clearTimeout(this.baseUrlWarnTimer);
+							this.baseUrlWarnTimer = window.setTimeout(() => {
+								if (parseBaseUrl(t.inputEl.value) === null) {
+									new Notice(
+										"Institute: 后端地址无效 — 仅支持 http(s) URL（如 http://127.0.0.1:8100），未保存。",
+										8000,
+									);
+								}
+							}, 1200);
+							return;
+						}
+						this.plugin.settings.baseUrl = parsed;
 						await this.plugin.saveSettings();
+						this.plugin.invalidateStatusCaches(); // cached meta belongs to the old backend
 						void this.plugin.refreshStatus();
 					}),
 			);
