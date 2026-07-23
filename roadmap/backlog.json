@@ -532,8 +532,7 @@
         "app/institute/roadmap.py",
         "app/api/roadmap.py",
         "obsidian-plugin/src/roadmap.ts",
-        "tests/test_roadmap.py",
-        "roadmap/operator-acceptance-2026-07-21.md"
+        "tests/test_roadmap.py"
       ],
       "dependencies": [
         "M7-001",
@@ -562,7 +561,7 @@
       "risk": "medium",
       "summary": "S4-P0-01 (R2 B1, the only PARTIALLY of 75 must-fix): _skip_add_column() only compares type/NOT NULL/DEFAULT, so a crash-recovered column whose migration declares CHECK or REFERENCES can be silently recorded as applied. Parse sqlite_master for the table DDL and compare (or fail closed on constraint declarations the parser cannot prove). Coordinate with the round-5 E1 partition before starting — verify it is still open.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/db.py",
@@ -588,7 +587,7 @@
       "risk": "low",
       "summary": "S4-P0-02 (second half; the marker split over test_market_thesis_import.py belongs to the round-5 E1 partition): the D4 restart-recovery probe still skips with exploratory schema guesses ('could not seed a running research-tree row'). Replace the probe with a deterministic running-tree fixture against the real 0020 schema so orphan recovery is actually asserted on every run.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "tests/test_restart_recovery.py"
@@ -612,7 +611,7 @@
       "risk": "high",
       "summary": "S4-P1-01 (A1/F1): retry does not persist the original fallback chain/lineage, so a cross-process retry after restart loses hand confinement and has no idempotency key; rate_limited tasks still terminate permanently after one fallback retry (ROADMAP Phase 2 'Executor depth'). Persist retry lineage + idempotency key, add the cooldown-expiry resurrection job, and lock the exact output-cap/marker boundary with tests.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/router/executor.py",
@@ -640,7 +639,7 @@
       "risk": "low",
       "summary": "ROADMAP Phase 1a acceptance debt: the whiteboard similarity gate (0.85/14d skip, 0.65/30d build-on) shipped with uncalibrated default thresholds — the one-off distribution sanity check against ~50 known duplicate/related/unrelated pairs with real bge-m3 embeddings was never run. Run it against local Ollama, record the distribution, and adjust the config-row thresholds if the defaults misclassify.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/vectors.py",
@@ -665,7 +664,7 @@
       "risk": "medium",
       "summary": "S4-P1-08 (B3/C8) + ROADMAP Phase 2 gap: analyst standing memory is injected only at the four workflow prompt-assembly points; ad-hoc /api/ask, ask_stream, sessions and MCP asks run memory-less, and concurrent compacts can double-burn the model. Decide the unified injection entrypoint first, then wire the remaining callers and add a conditional-claim around compact_one.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/memory.py",
@@ -694,7 +693,7 @@
       "risk": "medium",
       "summary": "S4-P2-05 + ROADMAP Phase 6 partials: feature switches are stored/displayed but never enforced and PUT is not CAS; the SPA has no operator route, so the actions kanban and triage page exist only as backend JSON. Deliver switch enforcement + compare-and-swap PUT, the operator kanban/triage SPA pages, and define the human-auth boundary and shadow-exit policy before any unshadow.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/api/operator.py",
@@ -724,7 +723,7 @@
       "risk": "medium",
       "summary": "S4-P2-10 (C7/S3): useSSE has no automated tests for bootstrap, pagination, reconnect-with-cursor, ring eviction or the watchdog; event grouping staleness and error rendering are unlocked. Introduce a frontend test runner (vitest) and lock the cursor state machine and UI edges.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "frontend/package.json",
@@ -752,7 +751,7 @@
       "risk": "high",
       "summary": "ROADMAP Phase 6 L item, still schema-only (0018 recipes placeholder): recurring fixes become recipes; observations feed proposals; proposals require explicit human approval in the web UI (never via vault frontmatter or MCP — proposal §8.2 invariant); parameter history + effect measurement close the self-improvement loop.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "migrations/*.sql",
@@ -782,13 +781,13 @@
       "risk": "medium",
       "summary": "S4-P2-13/14/15 + ROADMAP Phase 7 partial: the BFS engine is server-side only — no SSE tree viewer page, failed nodes have no retry policy, the score column is never written (no ranking), child replay is only exact-topic idempotent (normalized child key or documented contract), the daily booked counter is never cleaned and cap refusal returns 200 instead of 429.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/research_tree.py",
         "app/api/research_tree.py",
         "frontend/src/App.tsx",
-        "frontend/src/pages/ResearchTree.tsx",
+        "frontend/src/pages/Research.tsx",
         "tests/test_research_tree.py"
       ],
       "dependencies": [],
@@ -813,7 +812,7 @@
       "risk": "medium",
       "summary": "S4-P2-16/17 + ROADMAP Phase 7 partial: projects are backend containers only — no SPA page, no archive/unlink API routes, no project digest endpoint; MCP research_queue_add has no optional project_id so the write side cannot attach a project (keep the 3-write-tool boundary).",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/projects.py",
@@ -845,7 +844,7 @@
       "risk": "medium",
       "summary": "S4-P2-18 + ROADMAP Phase 7 partial: bilingual twins ship as by-reference events only — no per-run+locale read endpoint or twin index, no SPA/admin locale toggle, failed translations are not retried, and replayed events can duplicate work. Add a stable read API, the locale toggle UI, and a bounded retry/idempotency policy.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/bilingual.py",
@@ -874,7 +873,7 @@
       "risk": "medium",
       "summary": "S4-P2-06/07 + ROADMAP Phase 7 partial: multi-agent runs have no persistent group/run rows (no reconnect or partial-spawn recovery), committee has no Committee Vault export or input snapshot, workflow output files are not an engine contract, and majority verdicts stay free-text. Unify the group/run/file/verdict persistence protocol and add the missing API contract tests.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/multi_agent.py",
@@ -903,7 +902,7 @@
       "risk": "medium",
       "summary": "S4-P2-01 (C1/S3): the factcheck disputed handler is best-effort — a crash between verdict and mailbox/vault delivery loses the dispute notification. Add a durable outbox with idempotent retry; optionally split extract/verify hand config and extend the parser oracle with production-shaped adversarial cases.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/factcheck.py",
@@ -929,7 +928,7 @@
       "risk": "high",
       "summary": "S4-P1-10 + S4-P2-03 (B6/C3/S3): scheduled forecast seeding, batch settlement reconciliation (repeatable command over history), benchmark-base backfill, historical MTM/backfill-price recomputation, strict risk/cap enforcement and the forecast Vault export are all incomplete. Split into seeding / reconciliation / risk-enforcement work items when claimed.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/forecasts.py",
@@ -958,7 +957,7 @@
       "risk": "low",
       "summary": "S4-P2-08 (C6/S3): the launchd service is installed and running but no long soak has validated install → crash → KeepAlive restart → stop → uninstall, log rotation/growth, or failure-retention plist behavior. Run the soak on the real machine and record evidence; do not fake results from a read-only audit.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "scripts/install-service.sh",
@@ -986,7 +985,7 @@
       "risk": "medium",
       "summary": "S4-P1-03 (A5/F1): a failed board transaction can orphan the session/workspace it created, and a hard kill leaves a used topic claim with no lease/recovery. Add a claim lease + reaper (or widen the session+board atomic boundary) so crashes never leak workspaces or strand topics.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/whiteboard.py",
@@ -1011,7 +1010,7 @@
       "risk": "low",
       "summary": "S4-P1-04 (A8/S1): vector search mode cannot distinguish a healthy zero-hit from a degraded (Ollama-down) result; identical content embedded via different paths is not reused; superseded-model projections are hidden but never garbage-collected. Add a degradation reason/health surface, content-addressed embedding reuse, and old-model GC.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/vectors.py",
@@ -1037,7 +1036,7 @@
       "risk": "medium",
       "summary": "S4-P2-19 + S4-P2-15 (partial): the events table has no global retention (long-run growth), and per-day research-tree booked counters accumulate forever. Define the audit-retention requirement first, then extend the janitor with age-based event retention and 30-day counter cleanup.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/institute/scheduler.py",
@@ -1062,7 +1061,7 @@
       "risk": "medium",
       "summary": "S4-P3-01 = the two remaining ROADMAP Phase 0 opens: interactive asks still queue behind long workflow steps with no timeout/cancel/recoverable-task protocol (busy-hand preference or an interactive lane for source=api), and there is no optional INSTITUTE_TOKEN bearer middleware while INSTITUTE_HOST is settable.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/router/executor.py",
@@ -1090,7 +1089,7 @@
       "risk": "low",
       "summary": "S4-P2-12 + S4-P1-05/02/06/07 + S4-P2-04 rolled up: burn down FastAPI lifespan/Pydantic v2/timezone-aware datetime/httpx transport deprecation warnings in batches; remove stale comments (e.g. the outdated 'A2 patch not landed' note in app/mcp.py) and re-verify README/CLAUDE/test-mount claims; converge internal APIs — public scheduler.inflight_jobs(), scorecard_time config instead of hardcoded 00:05, shared sync/stream ask prepare helper, one shared price helper for _usable_price/_adj_close. Facts-only sweep, never mixed with feature patches.",
       "design_links": [
-        "ROUND4-AUDIT-S4.md"
+        "docs/history/ROUND4-AUDIT-S4.md"
       ],
       "expected_files": [
         "app/mcp.py",

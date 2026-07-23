@@ -8,11 +8,12 @@ phase:
 status: inbox
 priority: P1
 risk: medium
-owner:
-tags: []
+summary:
 design_links: []
 expected_files: []
 dependencies: []
+acceptance: []
+verification: []
 ```
 
 ## Summary
