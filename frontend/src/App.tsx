@@ -1,29 +1,33 @@
-import { useRef } from "react";
+import { lazy, Suspense, useRef } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { getMeta } from "./api";
 import { useSSE } from "./useSSE";
-import { useLoad } from "./ui";
+import { Loading, useLoad } from "./ui";
 import Dashboard from "./pages/Dashboard";
-import Tasks from "./pages/Tasks";
-import Ask from "./pages/Ask";
-import Workflows from "./pages/Workflows";
-import RunDetail from "./pages/RunDetail";
-import Whiteboard from "./pages/Whiteboard";
-import BoardDetail from "./pages/BoardDetail";
-import Mailbox from "./pages/Mailbox";
-import ThreadDetail from "./pages/ThreadDetail";
-import Research from "./pages/Research";
-import Trees from "./pages/Trees";
-import Projects from "./pages/Projects";
-import Forecasts from "./pages/Forecasts";
-import MultiAgent from "./pages/MultiAgent";
-import Sessions from "./pages/Sessions";
-import Analysts from "./pages/Analysts";
-import Hands from "./pages/Hands";
-import CronHealth from "./pages/CronHealth";
-import Operator from "./pages/Operator";
-import Insights from "./pages/Insights";
-import Settings from "./pages/Settings";
+
+// Route-level code splitting: the Dashboard landing page stays in the main
+// bundle; every other page is lazy-loaded behind the <Suspense> boundary
+// that wraps <Routes> below.
+const Tasks = lazy(() => import("./pages/Tasks"));
+const Ask = lazy(() => import("./pages/Ask"));
+const Workflows = lazy(() => import("./pages/Workflows"));
+const RunDetail = lazy(() => import("./pages/RunDetail"));
+const Whiteboard = lazy(() => import("./pages/Whiteboard"));
+const BoardDetail = lazy(() => import("./pages/BoardDetail"));
+const Mailbox = lazy(() => import("./pages/Mailbox"));
+const ThreadDetail = lazy(() => import("./pages/ThreadDetail"));
+const Research = lazy(() => import("./pages/Research"));
+const Trees = lazy(() => import("./pages/Trees"));
+const Projects = lazy(() => import("./pages/Projects"));
+const Forecasts = lazy(() => import("./pages/Forecasts"));
+const MultiAgent = lazy(() => import("./pages/MultiAgent"));
+const Sessions = lazy(() => import("./pages/Sessions"));
+const Analysts = lazy(() => import("./pages/Analysts"));
+const Hands = lazy(() => import("./pages/Hands"));
+const CronHealth = lazy(() => import("./pages/CronHealth"));
+const Operator = lazy(() => import("./pages/Operator"));
+const Insights = lazy(() => import("./pages/Insights"));
+const Settings = lazy(() => import("./pages/Settings"));
 
 const NAV: { to: string; zh: string; en: string }[] = [
   { to: "/", zh: "总览", en: "Dashboard" },
@@ -125,34 +129,36 @@ export default function App() {
       <div className="main">
         <Topbar />
         <main className="content">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/tasks" element={<Tasks />} />
-            <Route path="/ask" element={<Ask />} />
-            <Route path="/workflows" element={<Workflows />} />
-            <Route path="/workflows/runs/:runId" element={<RunDetail />} />
-            <Route path="/whiteboard" element={<Whiteboard />} />
-            <Route path="/whiteboard/:boardId" element={<BoardDetail />} />
-            <Route path="/mailbox" element={<Mailbox />} />
-            <Route path="/mailbox/:threadId" element={<ThreadDetail />} />
-            <Route path="/research" element={<Research />} />
-            <Route path="/research/:itemId" element={<Research />} />
-            <Route path="/trees" element={<Trees />} />
-            <Route path="/trees/:treeId" element={<Trees />} />
-            <Route path="/projects" element={<Projects />} />
-            <Route path="/projects/:projectId" element={<Projects />} />
-            <Route path="/forecasts" element={<Forecasts />} />
-            <Route path="/multi-agent" element={<MultiAgent />} />
-            <Route path="/sessions" element={<Sessions />} />
-            <Route path="/sessions/:sessionId" element={<Sessions />} />
-            <Route path="/analysts" element={<Analysts />} />
-            <Route path="/hands" element={<Hands />} />
-            <Route path="/cron" element={<CronHealth />} />
-            <Route path="/operator" element={<Operator />} />
-            <Route path="/insights" element={<Insights />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <Suspense fallback={<Loading />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/ask" element={<Ask />} />
+              <Route path="/workflows" element={<Workflows />} />
+              <Route path="/workflows/runs/:runId" element={<RunDetail />} />
+              <Route path="/whiteboard" element={<Whiteboard />} />
+              <Route path="/whiteboard/:boardId" element={<BoardDetail />} />
+              <Route path="/mailbox" element={<Mailbox />} />
+              <Route path="/mailbox/:threadId" element={<ThreadDetail />} />
+              <Route path="/research" element={<Research />} />
+              <Route path="/research/:itemId" element={<Research />} />
+              <Route path="/trees" element={<Trees />} />
+              <Route path="/trees/:treeId" element={<Trees />} />
+              <Route path="/projects" element={<Projects />} />
+              <Route path="/projects/:projectId" element={<Projects />} />
+              <Route path="/forecasts" element={<Forecasts />} />
+              <Route path="/multi-agent" element={<MultiAgent />} />
+              <Route path="/sessions" element={<Sessions />} />
+              <Route path="/sessions/:sessionId" element={<Sessions />} />
+              <Route path="/analysts" element={<Analysts />} />
+              <Route path="/hands" element={<Hands />} />
+              <Route path="/cron" element={<CronHealth />} />
+              <Route path="/operator" element={<Operator />} />
+              <Route path="/insights" element={<Insights />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Suspense>
         </main>
       </div>
     </div>

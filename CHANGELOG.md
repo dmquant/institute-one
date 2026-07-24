@@ -2,6 +2,13 @@
 
 Notable changes to institute-one, grouped by push batch (dates are SGT work dates). Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-07-23 — Frontend render performance batch
+
+### Changed
+- Dashboard event-driven refetches throttled to a 5s minimum gap (same pattern as the Topbar): busy-bus periods no longer fire two requests per event; the 15s/30s polls and the live `EventFeed` are unaffected. The per-second `useNow` tick moved out of the page into a small `HandCooldown` badge component — the 299-line page no longer re-renders every second for two countdown badges.
+- Route-level code splitting: 20 of 21 pages are `React.lazy` behind a `Suspense` boundary (Dashboard stays eager for first paint). Main bundle 310.55 → 197.75 kB (−36%), gzip 95.84 → 65.69 kB (−31%); pages load on demand.
+- Insights chart aggregations (`EventStackChart`, `TaskSuccessChart`, `ResearchTrendChart`) and the Forecasts `favoriteIds` set are memoized against their data inputs.
+
 ## 2026-07-23 — Audit follow-through batch 3 (functional bugs, consistency, hygiene)
 
 ### Added

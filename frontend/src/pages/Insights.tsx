@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   listEvents,
@@ -215,39 +215,42 @@ export default function Insights() {
 
 
 function EventStackChart({ events }: { events: BusEvent[] }) {
-  const days = recentDayKeys();
-  const daySet = new Set(days);
-  const buckets = new Map<string, Record<string, number>>();
-  const totals = new Map<string, number>();
-  for (const day of days) buckets.set(day, {});
-  for (const event of events) {
-    const day = localDayKey(event.created_at);
-    if (!daySet.has(day)) continue;
-    const family = event.type || "other";
-    const bucket = buckets.get(day);
-    if (!bucket) continue;
-    bucket[family] = (bucket[family] ?? 0) + 1;
-    totals.set(family, (totals.get(family) ?? 0) + 1);
-  }
-  const top = [...totals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([family]) => family);
-  const topSet = new Set(top);
-  const hasOther = [...totals.keys()].some((family) => !topSet.has(family));
-  const series = hasOther ? [...top, "other"] : top;
-  const values = days.map((day) => {
-    const source = buckets.get(day) ?? {};
-    const row: Record<string, number> = Object.fromEntries(top.map((family) => [family, source[family] ?? 0]));
-    if (hasOther) {
-      row.other = Object.entries(source)
-        .filter(([family]) => !topSet.has(family))
-        .reduce((sum, [, count]) => sum + count, 0);
+  const { days, series, values, max } = useMemo(() => {
+    const days = recentDayKeys();
+    const daySet = new Set(days);
+    const buckets = new Map<string, Record<string, number>>();
+    const totals = new Map<string, number>();
+    for (const day of days) buckets.set(day, {});
+    for (const event of events) {
+      const day = localDayKey(event.created_at);
+      if (!daySet.has(day)) continue;
+      const family = event.type || "other";
+      const bucket = buckets.get(day);
+      if (!bucket) continue;
+      bucket[family] = (bucket[family] ?? 0) + 1;
+      totals.set(family, (totals.get(family) ?? 0) + 1);
     }
-    return row;
-  });
-  const dailyTotals = values.map((row) => Object.values(row).reduce((sum, count) => sum + count, 0));
-  const max = Math.max(0, ...dailyTotals);
+    const top = [...totals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([family]) => family);
+    const topSet = new Set(top);
+    const hasOther = [...totals.keys()].some((family) => !topSet.has(family));
+    const series = hasOther ? [...top, "other"] : top;
+    const values = days.map((day) => {
+      const source = buckets.get(day) ?? {};
+      const row: Record<string, number> = Object.fromEntries(top.map((family) => [family, source[family] ?? 0]));
+      if (hasOther) {
+        row.other = Object.entries(source)
+          .filter(([family]) => !topSet.has(family))
+          .reduce((sum, [, count]) => sum + count, 0);
+      }
+      return row;
+    });
+    const dailyTotals = values.map((row) => Object.values(row).reduce((sum, count) => sum + count, 0));
+    const max = Math.max(0, ...dailyTotals);
+    return { days, series, values, max };
+  }, [events]);
   if (max === 0) return <Empty text="近 30 天没有事件" />;
 
   const width = 900;
@@ -341,16 +344,18 @@ function EventStackChart({ events }: { events: BusEvent[] }) {
 
 
 function TaskSuccessChart({ tasks }: { tasks: TaskRow[] }) {
-  const grouped = new Map<string, { total: number; completed: number }>();
-  for (const task of tasks) {
-    if (!TERMINAL_TASKS.has(task.status)) continue;
-    const hand = task.hand || task.requested_hand || "unknown";
-    const row = grouped.get(hand) ?? { total: 0, completed: 0 };
-    row.total += 1;
-    if (task.status === "completed") row.completed += 1;
-    grouped.set(hand, row);
-  }
-  const rows = [...grouped.entries()].sort((a, b) => b[1].total - a[1].total);
+  const rows = useMemo(() => {
+    const grouped = new Map<string, { total: number; completed: number }>();
+    for (const task of tasks) {
+      if (!TERMINAL_TASKS.has(task.status)) continue;
+      const hand = task.hand || task.requested_hand || "unknown";
+      const row = grouped.get(hand) ?? { total: 0, completed: 0 };
+      row.total += 1;
+      if (task.status === "completed") row.completed += 1;
+      grouped.set(hand, row);
+    }
+    return [...grouped.entries()].sort((a, b) => b[1].total - a[1].total);
+  }, [tasks]);
   if (rows.length === 0) return <Empty text="还没有终态任务" />;
 
   return (
@@ -402,16 +407,19 @@ function TaskSuccessChart({ tasks }: { tasks: TaskRow[] }) {
 
 
 function ResearchTrendChart({ items }: { items: ResearchItem[] }) {
-  const days = recentDayKeys();
-  const daySet = new Set(days);
-  const counts = Object.fromEntries(days.map((day) => [day, 0])) as Record<string, number>;
-  for (const item of items) {
-    if (item.status !== "completed" || !item.finished_at) continue;
-    const day = localDayKey(item.finished_at);
-    if (daySet.has(day)) counts[day] += 1;
-  }
-  const values = days.map((day) => counts[day]);
-  const total = values.reduce((sum, count) => sum + count, 0);
+  const { days, values, total } = useMemo(() => {
+    const days = recentDayKeys();
+    const daySet = new Set(days);
+    const counts = Object.fromEntries(days.map((day) => [day, 0])) as Record<string, number>;
+    for (const item of items) {
+      if (item.status !== "completed" || !item.finished_at) continue;
+      const day = localDayKey(item.finished_at);
+      if (daySet.has(day)) counts[day] += 1;
+    }
+    const values = days.map((day) => counts[day]);
+    const total = values.reduce((sum, count) => sum + count, 0);
+    return { days, values, total };
+  }, [items]);
   if (total === 0) return <Empty text="近 30 天没有完成的研究" />;
 
   const width = 560;

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   clearHandCooldown,
@@ -11,6 +11,7 @@ import {
   listTasks,
   setMaintenance,
 } from "../api";
+import type { HandStatus } from "../api";
 import { EventFeed } from "../events";
 import { useSSE } from "../useSSE";
 import {
@@ -45,11 +46,34 @@ const VECTOR_REASON_ZH: Record<string, string> = {
   vector_error: "向量服务异常",
 };
 
+// Event-driven meta/task refreshes are throttled: on a busy bus, keying the
+// fetches off every event id would refetch (and re-render) nonstop — same
+// pattern as the App.tsx Topbar.
+const META_EVENT_MIN_GAP_MS = 5_000;
+
 export default function Dashboard() {
-  const now = useNow(1000);
-  const { events, connected, lastEvent } = useSSE({ max: 60 });
-  const meta = useLoad(getMeta, [lastEvent?.id ?? 0], 15000);
-  const todays = useLoad(() => listTasks({ limit: 30 }), [lastEvent?.id ?? 0], 30000);
+  // mount time ≈ the initial fetch, so the first events don't double-fetch
+  const lastFetchAt = useRef(Date.now());
+  const meta = useLoad(async () => {
+    const m = await getMeta();
+    lastFetchAt.current = Date.now();
+    return m;
+  }, [], 15000);
+  const todays = useLoad(async () => {
+    const rows = await listTasks({ limit: 30 });
+    lastFetchAt.current = Date.now();
+    return rows;
+  }, [], 30000);
+  const { events, connected } = useSSE({
+    max: 60,
+    onEvent: () => {
+      const now = Date.now();
+      if (now - lastFetchAt.current < META_EVENT_MIN_GAP_MS) return;
+      lastFetchAt.current = now;
+      meta.reload();
+      todays.reload();
+    },
+  });
   const admin = useLoad(getAdminState, [], 30000);
   const triage = useLoad(getOperatorTriage, [], 30000);
   const forecastHitRate = useLoad(getForecastStats, [], 300000);
@@ -223,28 +247,18 @@ export default function Dashboard() {
         <ErrorNote error={meta.error} />
         {meta.loading && !meta.data && <Loading />}
         <div className="stat-row">
-          {(meta.data?.hands ?? []).map((h) => {
-            const cooling = h.cooldown_until !== null && h.cooldown_until > now / 1000;
-            return (
-              <div className="chip" key={h.name} title={h.cooldown_reason ?? h.type}>
-                <span className={`dot ${h.available ? "on" : "off"}`} />
-                <span className="name">{h.name}</span>
-                {!h.installed && <span className="faint">未安装</span>}
-                {h.degraded && <span className="hand-cooldown">降级</span>}
-                {cooling && h.cooldown_until !== null && (
-                  <span className="hand-cooldown">冷却 {countdown(h.cooldown_until, now)}</span>
-                )}
-                {cooling && (
-                  <button
-                    className="small ghost"
-                    onClick={() => clearHandCooldown(h.name).then(meta.reload)}
-                  >
-                    解除
-                  </button>
-                )}
-              </div>
-            );
-          })}
+          {(meta.data?.hands ?? []).map((h) => (
+            <div className="chip" key={h.name} title={h.cooldown_reason ?? h.type}>
+              <span className={`dot ${h.available ? "on" : "off"}`} />
+              <span className="name">{h.name}</span>
+              {!h.installed && <span className="faint">未安装</span>}
+              {h.degraded && <span className="hand-cooldown">降级</span>}
+              <HandCooldown
+                hand={h}
+                onClear={() => clearHandCooldown(h.name).then(meta.reload)}
+              />
+            </div>
+          ))}
         </div>
         {meta.data?.hands.length === 0 && !meta.loading && <Empty text="没有可用的执行手信息" />}
       </div>
@@ -294,6 +308,21 @@ export default function Dashboard() {
           {todays.data?.length === 0 && !todays.loading && <Empty text="今天还没有任务" />}
         </div>
       </div>
+    </>
+  );
+}
+
+/** Cooldown badge + clear button for one hand. Owns the 1s ticker so the page
+ * doesn't re-render every second just to tick the countdown text. */
+function HandCooldown({ hand, onClear }: { hand: HandStatus; onClear: () => void }) {
+  const now = useNow(1000);
+  if (hand.cooldown_until === null || hand.cooldown_until <= now / 1000) return null;
+  return (
+    <>
+      <span className="hand-cooldown">冷却 {countdown(hand.cooldown_until, now)}</span>
+      <button className="small ghost" onClick={onClear}>
+        解除
+      </button>
     </>
   );
 }

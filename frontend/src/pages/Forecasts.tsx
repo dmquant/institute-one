@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   addFavorite,
   ApiError,
@@ -62,7 +62,10 @@ function ForecastsCard() {
   const [status, setStatus] = useState("");
   const rows = useLoad(() => listAllForecasts(status || undefined), [status], 30000);
   const favorites = useLoad(() => listFavorites("forecast"), [], 30000);
-  const favoriteIds = new Set((favorites.data ?? []).map((favorite) => favorite.ref_id));
+  const favoriteIds = useMemo(
+    () => new Set((favorites.data ?? []).map((favorite) => favorite.ref_id)),
+    [favorites.data],
+  );
   const [err, setErr] = useState<string | null>(null);
   const [settling, setSettling] = useState<string | null>(null);
   const [favoriteBusy, setFavoriteBusy] = useState<string | null>(null);
