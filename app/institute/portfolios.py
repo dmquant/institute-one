@@ -172,6 +172,7 @@ async def _tier_changes(
     candidates: list[dict[str, Any]],
     wd: str,
     now: str,
+    marks: dict[str, tuple[str, float] | None] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """(changes, n skipped for missing price) for one portfolio.
 
@@ -179,7 +180,12 @@ async def _tier_changes(
     arithmetic below (closes free slots) is honest. Positions whose security
     was deleted are never proposed for close — closing needs a usable price
     (fails closed); they surface through valuation's n_unpriced instead.
+
+    ``marks`` is a run-scoped {security_id: latest_mark} cache (``wd`` is
+    constant for a proposal run, and the same candidate security recurs across
+    analysts) — it dedupes the PIT reads. A fresh dict is used when omitted.
     """
+    marks = {} if marks is None else marks
     spec = TIER_SPECS[portfolio["tier"]]
     open_rows = await db.query(
         "SELECT p.*, f.status AS fc_status, f.expires_at AS fc_expires_at "
@@ -212,7 +218,10 @@ async def _tier_changes(
             break
         if fc["security_id"] in open_secs or fc["id"] in held_forecasts:
             continue
-        mark = await paper_book._latest_mark(fc["security_id"], wd)
+        sid = fc["security_id"]
+        if sid not in marks:
+            marks[sid] = await paper_book._latest_mark(sid, wd)
+        mark = marks[sid]
         if mark is None:
             skipped_unpriced += 1  # no usable PIT price now — retry next Sunday
             continue
@@ -264,6 +273,9 @@ async def generate_proposals(wd: str | None = None) -> dict[str, Any]:
     """
     wd = wd or work_date()
     now = bus.now_iso()
+    # run-scoped PIT-mark cache: wd is constant here, and the same candidate
+    # security recurs across analysts — share one cache across every tier call.
+    marks: dict[str, tuple[str, float] | None] = {}
     summary: dict[str, Any] = {
         "work_date": wd, "analysts": 0, "proposals": 0,
         "skipped_existing": 0, "skipped_empty": 0, "skipped_unpriced": 0, "errors": 0,
@@ -280,7 +292,7 @@ async def generate_proposals(wd: str | None = None) -> dict[str, Any]:
                 by_tier[tier_for_conviction(fc["conviction"])].append(fc)
             for pf in await list_portfolios(analyst_id=analyst.id):
                 changes, skipped_unpriced = await _tier_changes(
-                    pf, by_tier[pf["tier"]], wd, now)
+                    pf, by_tier[pf["tier"]], wd, now, marks)
                 summary["skipped_unpriced"] += skipped_unpriced
                 if not changes:
                     summary["skipped_empty"] += 1

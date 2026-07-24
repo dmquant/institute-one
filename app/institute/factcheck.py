@@ -61,6 +61,7 @@ import re
 import struct
 import uuid
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import Any
 
 from .. import bus, db
@@ -1921,6 +1922,17 @@ def _tokens(text: str) -> set[str]:
     return toks
 
 
+@lru_cache(maxsize=4096)
+def _claim_tokens(claim: str) -> frozenset[str]:
+    """Cached tokenization of a verdict claim for the claim_check keyword leg.
+
+    Verdict claims are stable text, so their token sets are memoizable —
+    keying on the claim string means an edited claim simply re-tokenizes under
+    a new key. Without this, claim_check re-tokenizes the whole live verdict
+    set (<= _verdict_rows' LIMIT) on every writing-time call."""
+    return frozenset(_tokens(claim))
+
+
 async def _verdict_rows(limit: int = 2000) -> list[dict[str, Any]]:
     """Live actionable verdicts (the claim_check candidate set): VERIFIED /
     DISPUTED only (UNVERIFIABLE is a non-answer, not a writing-time hint) and
@@ -1944,7 +1956,7 @@ async def _keyword_hits(text: str, k: int) -> list[dict[str, Any]]:
         return []
     hits: list[dict[str, Any]] = []
     for r in await _verdict_rows():
-        ctok = _tokens(r["claim"])
+        ctok = _claim_tokens(r["claim"])
         if not ctok:
             continue
         overlap = len(qtok & ctok) / len(ctok)  # claim-token coverage by the draft
