@@ -410,13 +410,14 @@ async def _execute(
             else:
                 nxt, _ = registry.resolve_chain(candidates)
             if nxt is not None and nxt.name != hand.name:
-                await db.execute(
+                # conditional requeue: the UPDATE's rowcount is the arbiter —
+                # 1 means we flipped running->queued (retry); 0 means the row
+                # left 'running' first (e.g. cancelled -> terminal) so we don't.
+                requeued = await db.execute(
                     "UPDATE tasks SET status='queued', hand=NULL, started_at=NULL WHERE id=? AND status='running'",
                     (task_id,),
                 )
-                # row may already be terminal if cancelled; only retry if requeue succeeded
-                check = await db.query_one("SELECT status FROM tasks WHERE id = ?", (task_id,))
-                if check and check["status"] == "queued":
+                if requeued:
                     return await _execute(
                         task_id,
                         on_chunk=on_chunk,

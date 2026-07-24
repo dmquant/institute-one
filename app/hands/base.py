@@ -31,6 +31,11 @@ log = logging.getLogger("institute.hands")
 Chunk = dict  # {"type": "stdout"|"stderr"|"status", "text": str}
 OnChunk = Callable[[Chunk], None]
 
+# asyncio's StreamReader defaults to a 64 KiB line limit; a CLI that emits a
+# long unbroken line (JSON blob, base64, minified data) would overrun it and
+# crash the pump. Raise it generously — output is truncated downstream anyway.
+_STREAM_LIMIT = 8 * 1024 * 1024
+
 
 @dataclass
 class RateLimitInfo:
@@ -162,8 +167,16 @@ def get_cli_env() -> dict[str, str]:
     return env
 
 
+@lru_cache(maxsize=None)
 def resolve_cli_path(name: str) -> str | None:
-    """Find a CLI binary using the login-shell PATH."""
+    """Find a CLI binary using the login-shell PATH.
+
+    Cached: PATH is fixed for the process (``get_cli_env`` is itself cached), so
+    the ``shutil.which`` filesystem scan runs at most once per binary name —
+    every registry ``is_available()`` check and dispatch would otherwise re-walk
+    PATH on the event loop. A CLI (un)installed mid-run is only reflected after a
+    restart, the accepted tradeoff.
+    """
     return shutil.which(name, path=get_cli_env().get("PATH"))
 
 
@@ -190,6 +203,7 @@ async def run_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=_STREAM_LIMIT,
     )
 
     stdout_parts: list[str] = []
@@ -197,7 +211,14 @@ async def run_subprocess(
 
     async def _pump(stream: asyncio.StreamReader, parts: list[str], kind: str) -> None:
         while True:
-            line = await stream.readline()
+            try:
+                line = await stream.readline()
+            except (asyncio.LimitOverrunError, ValueError):
+                # A line longer than _STREAM_LIMIT would otherwise crash the
+                # pump and fail an otherwise-successful run. readline has already
+                # dropped the oversized buffer, so log once and keep draining.
+                log.warning("subprocess %s line exceeded %d bytes; segment dropped", kind, _STREAM_LIMIT)
+                continue
             if not line:
                 break
             text = line.decode("utf-8", errors="replace")

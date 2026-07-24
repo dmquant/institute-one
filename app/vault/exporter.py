@@ -323,15 +323,20 @@ async def export_board(board_id: str) -> str | None:
     parts = [f"# {topic}"]
     if question:
         parts.append(f"> {question}")
-    for n, card in enumerate(sorted(cards, key=lambda c: _get(c, "idx") or 0), start=1):
+    ordered = sorted(cards, key=lambda c: _get(c, "idx") or 0)
+
+    async def _card_text(card) -> str | None:
+        output_file = _get(card, "output_file")
+        return await _read_text_async(ws / str(output_file)) if ws and output_file else None
+
+    card_texts = await asyncio.gather(*(_card_text(c) for c in ordered))
+    for n, (card, file_text) in enumerate(zip(ordered, card_texts), start=1):
         analyst_id = str(_get(card, "analyst_id") or "")
         analyst = get_analyst(analyst_id) if analyst_id else None
         who = analyst.name if analyst else (analyst_id or "未知分析师")
         idx = _get(card, "idx")
         idx = idx if isinstance(idx, int) and idx > 0 else n
-        output_file = _get(card, "output_file")
-        text = await _read_text_async(ws / str(output_file)) if ws and output_file else None
-        text = (text or str(_get(card, "summary") or "")).strip() or "（无产出）"
+        text = (file_text or str(_get(card, "summary") or "")).strip() or "（无产出）"
         parts.append(f"## card-{idx:02d} · {who}\n\n{text}")
 
     # source dossier warning callout (same contract as the research branch):

@@ -94,6 +94,12 @@ async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     await db.init()
     init_registry(settings)
+    # Pre-warm the login-shell env capture OFF the loop: the first get_cli_env()
+    # spawns a login shell and blocks up to 10s. Doing it here (not lazily during
+    # the first dispatch, under the hand mutex) keeps that one-time stall off the
+    # request/execution path.
+    from .hands.base import get_cli_env
+    await asyncio.to_thread(get_cli_env)
     # load persisted hand weights into the registry's process cache — without
     # this, saved weights silently degrade to neutral 1.0 until a weights API
     # call happens (registry is sync and never reads the DB itself)
