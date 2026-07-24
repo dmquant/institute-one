@@ -235,7 +235,8 @@ async def _apply_followups(analyst: Analyst, ws: Path, filename: str) -> tuple[i
     path = ws / filename
     if not path.is_file():
         return 0, 0
-    followups = parse_followups(path.read_text(encoding="utf-8", errors="replace"))
+    raw = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    followups = parse_followups(raw)
     topics = followups["whiteboard_topics"][:MAX_TOPICS_PER_DAILY]
     mails = [
         m for m in followups["mailbox_followups"]

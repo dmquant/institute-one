@@ -41,6 +41,7 @@ relative to the winner's cursors).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -179,7 +180,9 @@ async def _daily_items(analyst_id: str, after_id: int) -> tuple[list[str], int]:
                 f = Path(row["workspace_dir"]) / str(p.get("file") or f"{analyst_id}.md")
                 try:
                     if f.is_file():
-                        text = f.read_text(encoding="utf-8", errors="replace")
+                        text = await asyncio.to_thread(
+                            f.read_text, encoding="utf-8", errors="replace"
+                        )
                 except OSError:
                     log.warning("could not read daily file %s", f)
         if not (text and text.strip()) and p.get("task_id"):

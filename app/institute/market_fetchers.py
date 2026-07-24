@@ -759,18 +759,19 @@ async def match_topic_securities(topic: str, cap: int = BUNDLE_MAX_SECURITIES) -
             "SELECT * FROM securities WHERE symbol = ? AND market = 'CN_A' LIMIT 1", (m.group(0),)
         ), 400)
 
+    rows = await db.query("SELECT * FROM securities")
+    by_id: dict[str, dict[str, Any]] = {r["id"]: r for r in rows}
     named: list[tuple[str, str]] = [
         (r["alias"], r["security_id"]) for r in await db.query("SELECT alias, security_id FROM security_aliases")
     ]
     named += [
         (r[k], r["id"])
-        for r in await db.query("SELECT id, name_zh, name_en FROM securities")
+        for r in rows
         for k in ("name_zh", "name_en") if r.get(k)
     ]
     for name, sid in named:
         if _name_in_topic(name, t):
-            row = await db.query_one("SELECT * FROM securities WHERE id = ?", (sid,))
-            _add(row, min(len(name), 100))
+            _add(by_id.get(sid), min(len(name), 100))
 
     ranked = sorted(hits.values(), key=lambda pair: (-pair[0], pair[1]["id"]))
     return [row for _, row in ranked[:cap]]
@@ -846,13 +847,23 @@ async def build_data_bundle(topic: str) -> str:
     """Render the ≤4KB plain-text data bundle for a research topic.
 
     Local reads only (PIT latest known) — no network on the prompt path.
-    Non-empty renders are upserted into shared_data (topic, work_date).
-    Returns "" when the topic matches nothing or nothing has data (the
-    ${DATA_BUNDLE} substitution then degrades without a trace).
+    A non-empty same-day render is cached in shared_data (topic, work_date)
+    and returned verbatim on repeat calls that day, skipping the topic match
+    and per-security reads. The bundle is a day-scoped projection (lag is
+    expected), so an intra-day data refresh is only reflected on the next
+    work_date. Returns "" when the topic matches nothing or nothing has data
+    (the ${DATA_BUNDLE} substitution then degrades without a trace); empty
+    results are not cached.
     """
     topic = (topic or "").strip()
     if not topic:
         return ""
+    cached = await db.query_one(
+        "SELECT content FROM shared_data WHERE topic = ? AND work_date = ?",
+        (topic, work_date()),
+    )
+    if cached and cached["content"]:
+        return cached["content"]
     matched = await match_topic_securities(topic)
     if not matched:
         return ""

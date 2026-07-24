@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..config import get_settings
 from ..institute import memory, sessions
@@ -53,8 +53,11 @@ async def list_messages(session_id: str):
     return await sessions.list_messages(session_id)
 
 
+MAX_CONTENT_LEN = 16000    # chars; a chat turn, not a document
+
+
 class MessageBody(BaseModel):
-    content: str
+    content: str = Field(max_length=MAX_CONTENT_LEN)
     hand: str | None = None
 
 

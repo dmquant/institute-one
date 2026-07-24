@@ -593,6 +593,22 @@ async def test_bundle_renders_summary_and_benchmark(caplog):
     assert len(await db.query("SELECT id FROM shared_data")) == 1
 
 
+async def test_bundle_same_day_cache_short_circuits():
+    await _seed_maotai_with_bars(6)
+    first = await market_fetchers.build_data_bundle("贵州茅台提价逻辑")
+    assert "600519.SH" in first
+
+    # overwrite the cached row for (topic, today): a same-day rebuild must
+    # return the cached content verbatim (recompute skipped), not re-render.
+    await db.execute(
+        "UPDATE shared_data SET content = ? WHERE topic = ? AND work_date = ?",
+        ("SENTINEL-CACHED", "贵州茅台提价逻辑", market_fetchers.work_date()),
+    )
+    again = await market_fetchers.build_data_bundle("贵州茅台提价逻辑")
+    assert again == "SENTINEL-CACHED"
+    assert len(await db.query("SELECT id FROM shared_data")) == 1
+
+
 async def test_bundle_empty_degradations():
     # unknown topic -> ""
     assert await market_fetchers.build_data_bundle("完全无关的宏观主题") == ""

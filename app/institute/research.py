@@ -548,7 +548,8 @@ async def _apply_followups(item_id: str, topic: str, session_id: str | None) -> 
     if not path.is_file():
         log.info("research %s: no %s — skipping follow-ups", item_id, FOLLOWUPS_FILE)
         return
-    followups = parse_followups(path.read_text(encoding="utf-8", errors="replace"))
+    raw = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    followups = parse_followups(raw)
 
     from .analysts import get_analyst
     from . import mailbox, whiteboard  # lazy: domain peers

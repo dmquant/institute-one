@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import get_settings
@@ -101,12 +101,16 @@ async def retry_task(task_id: str):
     return {"task_id": new_id, "retried_from": task_id, "lineage_root": lineage_root}
 
 
+MAX_PROMPT_LEN = 16000     # chars; a prompt block, not a document (mirrors prompt_overrides)
+MAX_TIMEOUT_S = 3600       # per-task executor timeout cap (mirrors multi_agent)
+
+
 class AskBody(BaseModel):
-    prompt: str
+    prompt: str = Field(max_length=MAX_PROMPT_LEN)
     analyst_id: str | None = None
     hand: str | None = None
     model: str | None = None
-    timeout_s: int | None = None
+    timeout_s: int | None = Field(default=None, gt=0, le=MAX_TIMEOUT_S)
 
 
 def _prefer_idle_hand(hand: str) -> str:
