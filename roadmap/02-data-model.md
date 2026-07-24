@@ -153,9 +153,17 @@ Rules:
 
 - upsert by `id`;
 - preserve local status unless import says `force`;
+- preview the full reconciliation with `dry_run=true` (zero rows and events written);
+- use `new_card_status_policy="inbox"` for an operator reconciliation so new
+  seed cards cannot enter `review` or `done` without lifecycle evidence;
 - merge checklist items by text;
 - validate dependencies refer to known ids;
+- reject self-dependencies and cycles before any write;
 - reject unknown status/type/priority.
+
+The compatibility default remains `new_card_status_policy="seed"` for initial
+bootstrap. It is not the formal-acceptance path: operator acceptance checks
+criteria, attaches pass evidence, and advances each card through `POST /move`.
 
 ## API Routes
 

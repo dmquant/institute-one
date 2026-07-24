@@ -10,16 +10,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..hands.registry import get_registry
 from ..router import executor
+from ..util import new_id
 from . import sessions
-from .analysts import get_analyst
+from .analysts import get_analyst, roster
+from .claims import claim_admin_state, release_admin_state
 from .prompts import (
-    build_analyst_prompt,
     extract_summary,
     previous_steps_block,
     substitute_variables,
@@ -28,11 +30,47 @@ from .prompts import (
 
 log = logging.getLogger("institute.workflows")
 
+# workflow_runs.status enum — canonical code constant mirroring the CHECK in
+# migrations/0001_init.sql. Import point for API surfaces (/api/contract).
+RUN_STATUSES = ("running", "completed", "failed", "cancelled")
+
 # keep strong references to fire-and-forget drivers
 _driving: set[asyncio.Task] = set()
 
+# ${WEEK_DISPUTES} rendering caps (committee workflow, Phase 7)
+WEEK_DISPUTES_DAYS = 7
+WEEK_DISPUTES_MAX_BYTES = 3072      # UTF-8 bytes, like the ${DATA_BUNDLE} cap
+WEEK_DISPUTES_MAX_BOARDS = 50       # backstop; the byte cap bites first
+
 
 # ---- definitions ---------------------------------------------------------
+
+def _normalize_steps(workflow_id: str, steps: list[Any]) -> list[Any]:
+    """Fold the legacy ``analyst`` step key into the canonical ``analyst_id``.
+
+    Unknown analyst ids get a loud warning (runs fall back to chief-strategist,
+    documented behaviour) but never raise — reconcile happens at boot.
+    """
+    out: list[Any] = []
+    for step in steps:
+        if not isinstance(step, dict):  # malformed step: keep as-is, _drive deals with it
+            out.append(step)
+            continue
+        step = dict(step)
+        legacy = step.pop("analyst", None)
+        # canonical analyst_id wins over the legacy alias when both are present
+        # (matches the runtime lookup order in _drive)
+        aid = str(step.get("analyst_id") or legacy or "").strip()
+        if aid:
+            step["analyst_id"] = aid
+            if get_analyst(aid) is None:
+                log.warning(
+                    "workflow %s step %s: unknown analyst %r — runs will fall back to chief-strategist",
+                    workflow_id, step.get("id"), aid,
+                )
+        out.append(step)
+    return out
+
 
 async def reconcile_from_disk() -> int:
     """Upsert every workflows/*.json into the workflows table. Never raises."""
@@ -44,6 +82,7 @@ async def reconcile_from_disk() -> int:
     for path in sorted(wf_dir.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            steps = _normalize_steps(data["id"], data["steps"])
             await db.execute(
                 """INSERT INTO workflows (id, name, description, variables, steps, updated_at)
                    VALUES (?,?,?,?,?,?)
@@ -54,7 +93,7 @@ async def reconcile_from_disk() -> int:
                 (
                     data["id"], data["name"], data.get("description", ""),
                     json.dumps(data.get("variables", []), ensure_ascii=False),
-                    json.dumps(data["steps"], ensure_ascii=False),
+                    json.dumps(steps, ensure_ascii=False),
                     bus.now_iso(),
                 ),
             )
@@ -82,7 +121,82 @@ async def get_workflow(workflow_id: str) -> dict[str, Any] | None:
     return _parse_workflow(row) if row else None
 
 
+# ---- lazy prompt variables --------------------------------------------------
+
+# Variables the engine computes lazily inside _drive — only when a step prompt
+# references them and the caller passed no explicit value. Callers never have
+# to supply them, so run-variable validation exempts them.
+LAZY_VARIABLES = ("DATA_BUNDLE", "WEEK_DISPUTES", "ANALYST_CATALOG")
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+    cut = raw[: max_bytes - len("…".encode("utf-8"))].decode("utf-8", errors="ignore")
+    return cut + "…"
+
+
+async def week_disputes_variable() -> str:
+    """${WEEK_DISPUTES} value: topics + closing summaries of whiteboard boards
+    completed in the last WEEK_DISPUTES_DAYS days (newest first), ≤3KB UTF-8.
+
+    Reads the whiteboard tables directly (read-only projection; whiteboard.py
+    owns the write path and stays untouched). The closing summary is the
+    highest-idx completed card's summary — the board's wrap-up card. Never
+    raises — no boards / no data renders as "" so the committee prompt
+    degrades to its documented「材料为空」branch.
+    """
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=WEEK_DISPUTES_DAYS)
+        ).isoformat(timespec="seconds")
+        boards = await db.query(
+            "SELECT b.topic, b.work_date, "
+            "       (SELECT c.summary FROM whiteboard_cards c "
+            "         WHERE c.board_id = b.id AND c.status = 'completed' "
+            "           AND c.summary IS NOT NULL AND c.summary != '' "
+            "         ORDER BY c.idx DESC LIMIT 1) AS closing_summary "
+            "FROM whiteboard_boards b "
+            "WHERE b.status = 'completed' AND b.updated_at >= ? "
+            "ORDER BY b.updated_at DESC LIMIT ?",
+            (cutoff, WEEK_DISPUTES_MAX_BOARDS),
+        )
+        lines = []
+        for b in boards:
+            summary = (b["closing_summary"] or "").replace("\n", " ").strip() or "（无收尾摘要）"
+            lines.append(f"- 「{b['topic']}」（{b['work_date']} 研讨）：{summary}")
+        return _truncate_utf8("\n".join(lines), WEEK_DISPUTES_MAX_BYTES)
+    except Exception:  # noqa: BLE001 - the prompt path must never break on data
+        log.exception("week disputes render failed")
+        return ""
+
+
+def analyst_catalog_variable() -> str:
+    """${ANALYST_CATALOG} value: the closed-list roster catalog the research
+    follow-ups step picks mailbox recipients from. Sync like the roster read
+    itself (catalog JSON, no DB)."""
+    return "\n".join(f"- {a.id}：{a.name}（{a.focus}）" for a in roster())
+
+
 # ---- runs -----------------------------------------------------------------
+
+def _validate_variables(wf: dict[str, Any], variables: dict[str, str]) -> None:
+    """Reject a run missing a declared, non-lazy variable (blank included).
+
+    substitute_variables() leaves ``${NAME}`` literally in the prompt when no
+    value was passed, so e.g. a manual research trigger without TOPIC would
+    otherwise feed the model the raw "${TOPIC}" placeholder. Lazy variables
+    (LAZY_VARIABLES) are computed in _drive and exempt; WORK_DATE is already
+    defaulted by the caller. Raises ValueError — the API layer maps it to 400.
+    """
+    missing = [
+        name for name in wf["variables"]
+        if name not in LAZY_VARIABLES and not str(variables.get(name) or "").strip()
+    ]
+    if missing:
+        raise ValueError(f"workflow {wf['id']} requires variable(s): {', '.join(missing)}")
+
 
 async def _create_run(workflow_id: str, variables: dict[str, str] | None, source: str) -> str:
     wf = await get_workflow(workflow_id)
@@ -90,7 +204,8 @@ async def _create_run(workflow_id: str, variables: dict[str, str] | None, source
         raise ValueError(f"unknown workflow {workflow_id}")
     variables = dict(variables or {})
     variables.setdefault("WORK_DATE", work_date())
-    run_id = uuid.uuid4().hex[:12]
+    _validate_variables(wf, variables)
+    run_id = new_id()
     session = await sessions.create_session(f"{wf['name']} {work_date()}", kind="workflow")
     await db.execute(
         """INSERT INTO workflow_runs (id, workflow_id, session_id, status, variables, source, started_at)
@@ -120,6 +235,86 @@ async def run_workflow_and_wait(
     run_id = await _create_run(workflow_id, variables, source)
     await _drive(run_id)
     return await get_run(run_id)  # type: ignore[return-value]
+
+
+# ---- committee (Phase 7): once-per-week idempotent kickoff -------------------
+
+COMMITTEE_WORKFLOW_ID = "committee"
+COMMITTEE_CLAIM_PREFIX = "committee"
+# a claim that never recorded a run_id (kickoff crashed between claim and
+# insert) is retryable after this long
+COMMITTEE_CLAIM_STALE_S = 3600
+
+
+def committee_week(wd: str | None = None) -> str:
+    """ISO-week key for the committee claim, from the SGT work date."""
+    y, w, _ = date.fromisoformat(wd or work_date()).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+async def _committee_claim_stale(value: str, key: str) -> bool:
+    """A claimed week is retryable when its recorded run failed/was cancelled
+    (or the run row vanished), or when it never recorded a run_id and is older
+    than COMMITTEE_CLAIM_STALE_S; a corrupt claim must not wedge the week."""
+    try:
+        held = json.loads(value)
+        run_id = held.get("run_id")
+        if run_id:
+            run = await db.query_one(
+                "SELECT status FROM workflow_runs WHERE id = ?", (run_id,)
+            )
+            return run is None or run["status"] in ("failed", "cancelled")
+        claimed_at = datetime.fromisoformat(held["claimed_at"])
+        return (
+            datetime.now(timezone.utc) - claimed_at
+        ).total_seconds() > COMMITTEE_CLAIM_STALE_S
+    except (ValueError, KeyError, TypeError):
+        return True  # a corrupt claim must not wedge the week forever
+
+
+async def run_committee_once(*, source: str = "scheduler") -> str | None:
+    """Idempotent committee kickoff: at most ONE run per ISO week (SGT).
+
+    Durable atomic claim (hard rule 2): the shared claims.py idiom on the
+    admin_state row ``committee:<iso-week>`` makes one winner per week —
+    scheduler misfires/coalesce replays, restarts and manual run-now triggers
+    all collapse into it. Retry semantics: if the claimed week's run ended
+    'failed'/'cancelled' (or the claim never recorded a run_id and is older
+    than COMMITTEE_CLAIM_STALE_S), the claim is taken over via CAS UPDATE and
+    the week reruns; a running/completed run keeps the week closed. Returns
+    the new run id, or None when the week is already taken.
+
+    Escape hatch: POST /api/workflows/committee/run bypasses this guard (the
+    operator's explicit intent), same as the generic run endpoint vs
+    daily.py's _ran_today guard.
+    """
+    week = committee_week()
+    key = f"{COMMITTEE_CLAIM_PREFIX}:{week}"
+    claim = await claim_admin_state(
+        key,
+        make_token=lambda: json.dumps({"status": "claimed", "claimed_at": bus.now_iso()}),
+        is_stale=_committee_claim_stale,
+    )
+    if claim is None:  # live claim, or lost the takeover race — exactly one retryer wins
+        log.info("committee already ran/running for %s; skipping", week)
+        return None
+    _, token = claim
+    try:
+        run_id = await run_workflow(
+            COMMITTEE_WORKFLOW_ID, variables={"WORK_DATE": work_date()}, source=source,
+        )
+    except Exception:
+        # release our own claim (CAS) so the week stays retryable
+        await release_admin_state(key, token)
+        raise
+    recorded = await db.execute(
+        "UPDATE admin_state SET value = ? WHERE key = ? AND value = ?",
+        (json.dumps({"status": "started", "run_id": run_id, "claimed_at": bus.now_iso()}),
+         key, token),
+    )
+    if not recorded:  # taken over mid-kickoff (only possible after the stale window)
+        log.warning("committee claim %s changed under us; run %s continues anyway", key, run_id)
+    return run_id
 
 
 async def _finish_run(run_id: str, status: str, *, error: str | None = None) -> None:
@@ -152,6 +347,13 @@ def _workflow_hand_policy(
     settings = get_settings()
     if workflow_id == "research":
         hands = settings.research_hand_names
+        # opt-in weighted pick (settings.enable_hand_weights, default False = the
+        # round-robin below): the pool is intersected with research_hand_names
+        # (hard rule 10 — weights only reorder INSIDE the chain); an explicit
+        # step hand still wins and the fallback chain is unchanged either way.
+        picked = get_registry().pick_weighted("research", explicit=step.get("hand"), pool=hands)
+        if picked:
+            return picked, hands
         return str(step.get("hand") or hands[step_index % len(hands)]), hands
     return str(step.get("hand") or analyst_hand or settings.default_hand), None
 
@@ -173,6 +375,50 @@ async def _drive(run_id: str) -> None:
             return
         workspace = sessions.workspace_path(session)
         variables: dict[str, str] = json.loads(run["variables"] or "{}")
+        # ${DATA_BUNDLE}: local market-data digest for ${TOPIC} (Phase 1b).
+        # Computed lazily — only when some step prompt references it and the
+        # caller did not pass an explicit value; missing/failed data renders
+        # as "" so prompts degrade without a trace (never raises).
+        if "DATA_BUNDLE" not in variables and any(
+            isinstance(s, dict) and "${DATA_BUNDLE}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            from . import market_fetchers  # lazy: engine stays importable without the fetcher stack
+            variables["DATA_BUNDLE"] = await market_fetchers.data_bundle_variable(variables)
+            # persist the computed value on the run row so what the prompts
+            # actually saw stays inspectable. json_set touches ONLY this key —
+            # a whole-blob write would clobber keys landed by a concurrent
+            # writer (REVIEW-C5 P2 lost update); the status guard still keeps
+            # terminal rows immutable (cancel-safety, not concurrency safety).
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.DATA_BUNDLE', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["DATA_BUNDLE"], run_id),
+            )
+        # ${WEEK_DISPUTES}: last-7-days completed whiteboard digest (Phase 7
+        # committee). Same lazy contract as ${DATA_BUNDLE}: only computed when
+        # a step prompt references it and no explicit value was passed; empty
+        # data renders as "" so the prompt degrades without a trace.
+        if "WEEK_DISPUTES" not in variables and any(
+            isinstance(s, dict) and "${WEEK_DISPUTES}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            variables["WEEK_DISPUTES"] = await week_disputes_variable()
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.WEEK_DISPUTES', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["WEEK_DISPUTES"], run_id),
+            )
+        # ${ANALYST_CATALOG}: closed-list roster catalog (research follow-ups
+        # step). Same lazy contract as ${WEEK_DISPUTES}: only computed when a
+        # step prompt references it and no explicit value was passed.
+        if "ANALYST_CATALOG" not in variables and any(
+            isinstance(s, dict) and "${ANALYST_CATALOG}" in str(s.get("prompt", "")) for s in wf["steps"]
+        ):
+            variables["ANALYST_CATALOG"] = analyst_catalog_variable()
+            await db.execute(
+                "UPDATE workflow_runs SET variables = json_set(variables, '$.ANALYST_CATALOG', ?) "
+                "WHERE id = ? AND status = 'running'",
+                (variables["ANALYST_CATALOG"], run_id),
+            )
         prior: list[tuple[str, str]] = []
         results: list[dict[str, Any]] = []
 
@@ -182,11 +428,20 @@ async def _drive(run_id: str) -> None:
                 return  # cancelled between steps
 
             prompt = substitute_variables(step.get("prompt", ""), variables)
-            analyst = get_analyst(step.get("analyst") or step.get("analyst_id") or "") or get_analyst("chief-strategist")
+            # canonical key first; 'analyst' tolerated for rows predating normalization
+            aid = str(step.get("analyst_id") or step.get("analyst") or "").strip()
+            analyst = get_analyst(aid) if aid else None
+            if analyst is None and aid:
+                log.warning(
+                    "run %s step %s: unknown analyst %r; falling back to chief-strategist",
+                    run_id, step.get("id"), aid,
+                )
+            analyst = analyst or get_analyst("chief-strategist")
             if analyst is None:
                 await _finish_run(run_id, "failed", error=f"step {step.get('id')}: no analyst available")
                 return
-            full_prompt = build_analyst_prompt(
+            from . import memory
+            full_prompt = await memory.prompt_with_memory(
                 analyst, prompt,
                 context_blocks=[previous_steps_block(prior)],
                 output_file=step.get("output_file"),

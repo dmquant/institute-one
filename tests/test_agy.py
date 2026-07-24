@@ -4,8 +4,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
-
 from app.config import get_settings
 from app.hands.agy_hand import AgyHand, agy_data_root, capture_artifacts, parse_conversation_id
 from app.hands.rate_limit import detect_rate_limit

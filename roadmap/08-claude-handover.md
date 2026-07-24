@@ -176,7 +176,7 @@ Implemented behavior:
 - persists local status overrides in plugin settings under `roadmapStatusOverrides`;
 - prevents moving a card to `done` when dependencies are incomplete;
 - shows card details: summary, acceptance, verification commands, expected files, design links, dependencies, and deterministic agent prompt;
-- shows release gate progress for Release A/B/C;
+- shows release gate progress for Release A–F (M0–M10);
 - exports a markdown-backed Kanban note to `Institute/Roadmap/Implementation Kanban.md` through `plugin.subPath(...)`.
 
 External reference used: existing Obsidian Kanban plugins were treated as UX/format inspiration only. Do not copy GPL code from community plugins.

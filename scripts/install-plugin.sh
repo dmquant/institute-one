@@ -14,14 +14,26 @@ if [ ! -d "$VAULT/.obsidian" ]; then
   exit 1
 fi
 
-# build if needed
-if [ ! -f obsidian-plugin/main.js ] || [ obsidian-plugin/src/main.ts -nt obsidian-plugin/main.js ]; then
+# build if needed: rebuild when ANY bundled input is newer than main.js —
+# every src/*.ts plus roadmap/backlog.json (inlined at build time)
+needs_build=0
+if [ ! -f obsidian-plugin/main.js ]; then
+  needs_build=1
+else
+  for f in obsidian-plugin/src/*.ts roadmap/backlog.json; do
+    if [ "$f" -nt obsidian-plugin/main.js ]; then
+      needs_build=1
+      break
+    fi
+  done
+fi
+if [ "$needs_build" -eq 1 ]; then
   echo "building plugin…"
   (cd obsidian-plugin && npm install --silent && npm run build)
 fi
 
 DEST="$VAULT/.obsidian/plugins/institute-one"
 mkdir -p "$DEST"
-cp obsidian-plugin/manifest.json obsidian-plugin/main.js "$DEST/"
+cp obsidian-plugin/manifest.json obsidian-plugin/main.js obsidian-plugin/styles.css "$DEST/"
 echo "installed to $DEST"
 echo "→ In Obsidian: Settings → Community plugins → enable “Institute One” (toggle off/on to update)."

@@ -1,11 +1,35 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { Task, cancelTask, getTask, listTasks } from "../api";
+import { cancelTask, getTask, listTasks, type Task } from "../api";
 import { useSSE } from "../useSSE";
 import { Empty, ErrorNote, Loading, PageHead, StatusBadge, fmtTime, useLoad } from "../ui";
 
-const STATUSES = ["", "queued", "running", "completed", "failed", "rate_limited", "cancelled", "expired"];
+const KNOWN_STATUSES = [
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "overcommitted",
+  "rate_limited",
+  "cancelled",
+  "expired",
+];
+const STATUS_LABELS: Record<string, string> = {
+  queued: "排队",
+  running: "运行中",
+  completed: "完成",
+  failed: "失败",
+  overcommitted: "过载拒绝",
+  rate_limited: "限流",
+  cancelled: "已取消",
+  expired: "超时",
+};
 const SOURCES = ["", "api", "workflow", "whiteboard", "mailbox", "research", "daily", "obsidian", "mcp", "test"];
+
+type TaskWithRouting = Task & {
+  fallback_chain?: string[] | null;
+  lineage_root?: string | null;
+};
 
 export default function Tasks() {
   const [params, setParams] = useSearchParams();
@@ -13,6 +37,7 @@ export default function Tasks() {
   const hand = params.get("hand") ?? "";
   const source = params.get("source") ?? "";
   const selectedId = params.get("id");
+  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(() => new Set());
 
   const { lastEvent } = useSSE({ types: ["task"], max: 1 });
   const rows = useLoad(
@@ -27,20 +52,56 @@ export default function Tasks() {
     setParams(next, { replace: true });
   };
 
-  const hands = Array.from(new Set((rows.data ?? []).map((t) => t.hand ?? t.requested_hand))).sort();
+  const hands = Array.from(
+    new Set([...(rows.data ?? []).map((t) => t.hand ?? t.requested_hand), ...(hand ? [hand] : [])]),
+  ).sort();
+  const unknownStatuses = Array.from(
+    new Set([...(rows.data ?? []).map((task) => String(task.status)), status].filter(Boolean)),
+  ).filter((value) => !KNOWN_STATUSES.includes(value));
+  const statusOptions = ["", ...KNOWN_STATUSES, ...unknownStatuses];
+
+  const toggleError = (taskId: string) => {
+    setExpandedErrors((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  };
 
   return (
     <>
       <PageHead zh="任务" en="Tasks" />
 
       <div className="filter-bar">
-        <select value={status} onChange={(e) => setFilter("status", e.target.value)}>
-          {STATUSES.map((s) => (
-            <option key={s} value={s}>
-              {s === "" ? "全部状态" : s}
-            </option>
-          ))}
-        </select>
+        <span className="faint" style={{ fontSize: 12 }}>
+          状态
+        </span>
+        {statusOptions.map((value) => {
+          const active = status === value;
+          return (
+            <button
+              aria-pressed={active}
+              className="small ghost"
+              key={value || "all"}
+              onClick={() => setFilter("status", value)}
+              style={
+                active
+                  ? {
+                      background: "var(--accent-soft)",
+                      borderColor: "var(--accent)",
+                      color: "var(--accent)",
+                    }
+                  : undefined
+              }
+              title={value && !(value in STATUS_LABELS) ? `后端返回的未知状态：${value}` : undefined}
+            >
+              {value ? (STATUS_LABELS[value] ?? value) : "全部"}
+            </button>
+          );
+        })}
+      </div>
+      <div className="filter-bar">
         <select value={source} onChange={(e) => setFilter("source", e.target.value)}>
           {SOURCES.map((s) => (
             <option key={s} value={s}>
@@ -65,67 +126,114 @@ export default function Tasks() {
       <div className="card">
         <ErrorNote error={rows.error} />
         {rows.loading && !rows.data && <Loading />}
-        <table className="data">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>状态</th>
-              <th>执行手</th>
-              <th>来源</th>
-              <th>错误</th>
-              <th>创建时间</th>
-              <th>结束时间</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(rows.data ?? []).map((t) => (
-              <tr key={t.id} className="clickable" onClick={() => setFilter("id", t.id)}>
-                <td className="mono">{t.id}</td>
-                <td>
-                  <StatusBadge status={t.status} />
-                </td>
-                <td className="mono">
-                  {t.hand ?? t.requested_hand}
-                  {t.hand && t.hand !== t.requested_hand && (
-                    <span className="faint"> (请求 {t.requested_hand})</span>
-                  )}
-                </td>
-                <td className="dim">{t.source}</td>
-                <td className="dim ellipsis">{t.error ?? ""}</td>
-                <td className="dim mono nowrap">{fmtTime(t.created_at)}</td>
-                <td className="dim mono nowrap">{fmtTime(t.finished_at)}</td>
+        {rows.data && rows.data.length > 0 && (
+          <table className="data">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>状态</th>
+                <th>执行手</th>
+                <th>来源</th>
+                <th>错误</th>
+                <th>创建时间</th>
+                <th>结束时间</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        {rows.data?.length === 0 && <Empty text="没有符合条件的任务" />}
+            </thead>
+            <tbody>
+              {rows.data.map((t) => {
+                const errorExpanded = expandedErrors.has(t.id);
+                return (
+                  <tr key={t.id} className="clickable" onClick={() => setFilter("id", t.id)}>
+                    <td className="mono">{t.id}</td>
+                    <td>
+                      <StatusBadge status={String(t.status)} />
+                    </td>
+                    <td className="mono">
+                      {t.hand ?? t.requested_hand}
+                      {t.hand && t.hand !== t.requested_hand && (
+                        <span className="faint"> (请求 {t.requested_hand})</span>
+                      )}
+                    </td>
+                    <td className="dim">{t.source}</td>
+                    <td className="dim" style={{ maxWidth: 360 }}>
+                      {t.error && (
+                        <>
+                          <div
+                            title={errorExpanded ? undefined : t.error}
+                            style={{
+                              overflow: errorExpanded ? "visible" : "hidden",
+                              textOverflow: errorExpanded ? undefined : "ellipsis",
+                              whiteSpace: errorExpanded ? "pre-wrap" : "nowrap",
+                              wordBreak: errorExpanded ? "break-word" : undefined,
+                            }}
+                          >
+                            {t.error}
+                          </div>
+                          {t.status === "failed" && (
+                            <button
+                              aria-expanded={errorExpanded}
+                              className="small ghost"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleError(t.id);
+                              }}
+                              style={{ marginTop: 4 }}
+                            >
+                              {errorExpanded ? "收起错误" : "展开错误"}
+                            </button>
+                          )}
+                        </>
+                      )}
+                    </td>
+                    <td className="dim mono nowrap">{fmtTime(t.created_at)}</td>
+                    <td className="dim mono nowrap">{fmtTime(t.finished_at)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        {rows.data?.length === 0 && !rows.loading && <Empty text="没有符合条件的任务" />}
       </div>
 
-      {selectedId && <TaskDrawer taskId={selectedId} onClose={() => setFilter("id", "")} />}
+      {selectedId && <TaskDrawer key={selectedId} taskId={selectedId} onClose={() => setFilter("id", "")} />}
     </>
   );
 }
 
 function TaskDrawer({ taskId, onClose }: { taskId: string; onClose: () => void }) {
-  const [task, setTask] = useState<Task | null>(null);
+  const [task, setTask] = useState<TaskWithRouting | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const { lastEvent } = useSSE({ types: ["task"], max: 1 });
 
   useEffect(() => {
+    setTask(null);
+    setError(null);
+  }, [taskId]);
+
+  useEffect(() => {
+    let alive = true;
     getTask(taskId)
       .then((t) => {
-        setTask(t);
-        setError(null);
+        if (alive) {
+          setTask(t as TaskWithRouting);
+          setError(null);
+        }
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e: unknown) => {
+        if (alive) setError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      alive = false;
+    };
   }, [taskId, lastEvent?.id]);
 
   const doCancel = async () => {
     setCancelling(true);
     try {
       await cancelTask(taskId);
-      setTask(await getTask(taskId));
+      setTask((await getTask(taskId)) as TaskWithRouting);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -170,6 +278,22 @@ function TaskDrawer({ taskId, onClose }: { taskId: string; onClose: () => void }
               <dd>{task.model ?? "—"}</dd>
               <dt>来源</dt>
               <dd>{task.source}</dd>
+              <dt>重试链根</dt>
+              <dd className="mono">
+                {task.lineage_root ? (
+                  <Link to={`/tasks?id=${encodeURIComponent(task.lineage_root)}`}>{task.lineage_root}</Link>
+                ) : (
+                  "—（原始任务）"
+                )}
+              </dd>
+              <dt>回退链</dt>
+              <dd className="mono">
+                {task.fallback_chain === undefined || task.fallback_chain === null
+                  ? "注册表默认策略"
+                  : task.fallback_chain.length > 0
+                    ? task.fallback_chain.join(" → ")
+                    : "无（仅请求执行手）"}
+              </dd>
               <dt>退出码</dt>
               <dd>{task.exit_code ?? "—"}</dd>
               <dt>会话</dt>

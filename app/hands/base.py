@@ -31,6 +31,11 @@ log = logging.getLogger("institute.hands")
 Chunk = dict  # {"type": "stdout"|"stderr"|"status", "text": str}
 OnChunk = Callable[[Chunk], None]
 
+# asyncio's StreamReader defaults to a 64 KiB line limit; a CLI that emits a
+# long unbroken line (JSON blob, base64, minified data) would overrun it and
+# crash the pump. Raise it generously — output is truncated downstream anyway.
+_STREAM_LIMIT = 8 * 1024 * 1024
+
 
 @dataclass
 class RateLimitInfo:
@@ -86,14 +91,45 @@ class EchoHand(Hand):
     hand_type = "cli"
 
     async def execute(self, prompt, workspace, *, model=None, timeout_s=1800, on_chunk=None) -> HandResult:
-        artifacts: list[str] = []
+        def refuse_path(name: str, reason: str) -> HandResult:
+            out = f"[echo] refused WRITE_FILE {name!r}: {reason}"
+            if on_chunk:
+                on_chunk({"type": "stderr", "text": out})
+            return HandResult(output=out, exit_code=2)
+
+        try:
+            workspace_root = workspace.resolve(strict=False)
+        except (OSError, RuntimeError):
+            return refuse_path(str(workspace), "workspace cannot be resolved")
+
+        # Preflight every directive before creating anything. This prevents a
+        # prompt containing one valid target followed by an unsafe target from
+        # leaving a partially written workspace.
+        planned: list[tuple[Path, str]] = []
         for line in prompt.splitlines():
-            if line.startswith("WRITE_FILE: "):
-                fname = line.split("WRITE_FILE: ", 1)[1].strip()
-                target = workspace / fname
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(prompt, encoding="utf-8")
-                artifacts.append(fname)
+            if not line.startswith("WRITE_FILE: "):
+                continue
+            name = line.split("WRITE_FILE: ", 1)[1].strip()
+            relative = Path(name)
+            if not name:
+                return refuse_path(name, "path is empty")
+            if relative.is_absolute():
+                return refuse_path(name, "absolute paths are not allowed")
+            if ".." in relative.parts:
+                return refuse_path(name, "parent traversal is not allowed")
+            try:
+                target = (workspace / relative).resolve(strict=False)
+            except (OSError, RuntimeError):
+                return refuse_path(name, "path cannot be resolved")
+            if target == workspace_root or not target.is_relative_to(workspace_root):
+                return refuse_path(name, "path escapes the workspace")
+            planned.append((target, target.relative_to(workspace_root).as_posix()))
+
+        artifacts: list[str] = []
+        for target, artifact in planned:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(prompt, encoding="utf-8")
+            artifacts.append(artifact)
         out = f"[echo] {prompt[:4000]}"
         if on_chunk:
             on_chunk({"type": "stdout", "text": out})
@@ -131,8 +167,16 @@ def get_cli_env() -> dict[str, str]:
     return env
 
 
+@lru_cache(maxsize=None)
 def resolve_cli_path(name: str) -> str | None:
-    """Find a CLI binary using the login-shell PATH."""
+    """Find a CLI binary using the login-shell PATH.
+
+    Cached: PATH is fixed for the process (``get_cli_env`` is itself cached), so
+    the ``shutil.which`` filesystem scan runs at most once per binary name —
+    every registry ``is_available()`` check and dispatch would otherwise re-walk
+    PATH on the event loop. A CLI (un)installed mid-run is only reflected after a
+    restart, the accepted tradeoff.
+    """
     return shutil.which(name, path=get_cli_env().get("PATH"))
 
 
@@ -159,6 +203,7 @@ async def run_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=_STREAM_LIMIT,
     )
 
     stdout_parts: list[str] = []
@@ -166,7 +211,14 @@ async def run_subprocess(
 
     async def _pump(stream: asyncio.StreamReader, parts: list[str], kind: str) -> None:
         while True:
-            line = await stream.readline()
+            try:
+                line = await stream.readline()
+            except (asyncio.LimitOverrunError, ValueError):
+                # A line longer than _STREAM_LIMIT would otherwise crash the
+                # pump and fail an otherwise-successful run. readline has already
+                # dropped the oversized buffer, so log once and keep draining.
+                log.warning("subprocess %s line exceeded %d bytes; segment dropped", kind, _STREAM_LIMIT)
+                continue
             if not line:
                 break
             text = line.decode("utf-8", errors="replace")

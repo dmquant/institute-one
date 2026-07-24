@@ -73,7 +73,10 @@ class _ApiHand(Hand):
     ) -> HandResult:
         url, headers, body = self._request(prompt, model)
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
+            # trust_env=False: ignore HTTP(S)_PROXY/ALL_PROXY — base URLs point at
+            # official endpoints or a local gateway; any upstream proxying is the
+            # gateway's job, and SOCKS env vars would otherwise break loopback calls.
+            async with httpx.AsyncClient(timeout=timeout_s, trust_env=False) as client:
                 resp = await client.post(url, headers=headers, json=body)
         except httpx.HTTPError as exc:
             return HandResult(output=f"{self.name} request failed: {exc}", exit_code=1)
@@ -119,7 +122,7 @@ class ClaudeApiHand(_ApiHand):
 
     def _request(self, prompt: str, model: str | None) -> tuple[str, dict[str, str], dict[str, Any]]:
         return (
-            "https://api.anthropic.com/v1/messages",
+            f"{self.settings.anthropic_api_base_url.rstrip('/')}/v1/messages",
             {
                 "x-api-key": self._api_key() or "",
                 "anthropic-version": "2023-06-01",
@@ -146,7 +149,7 @@ class OpenAiApiHand(_ApiHand):
 
     def _request(self, prompt: str, model: str | None) -> tuple[str, dict[str, str], dict[str, Any]]:
         return (
-            "https://api.openai.com/v1/chat/completions",
+            f"{self.settings.openai_api_base_url.rstrip('/')}/chat/completions",
             {
                 "Authorization": f"Bearer {self._api_key()}",
                 "content-type": "application/json",
@@ -170,7 +173,7 @@ class GeminiApiHand(_ApiHand):
     def _request(self, prompt: str, model: str | None) -> tuple[str, dict[str, str], dict[str, Any]]:
         effective_model = model or self.settings.google_api_model
         return (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.settings.google_api_base_url.rstrip('/')}/v1beta/models/"
             f"{effective_model}:generateContent?key={self._api_key()}",
             {"content-type": "application/json"},
             {"contents": [{"role": "user", "parts": [{"text": prompt}]}]},

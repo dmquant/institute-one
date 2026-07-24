@@ -21,8 +21,15 @@ from .. import bus, db
 from ..config import get_settings
 from ..hands.registry import get_registry
 from ..router import executor
+from ..util import new_id
 from .analysts import Analyst, get_analyst, roster
-from .prompts import build_analyst_prompt, work_date
+from .claims import (
+    claim_admin_state,
+    heartbeat_admin_state,
+    lease_stale_checker,
+    release_admin_state,
+)
+from .prompts import work_date
 from .research import parse_followups
 
 log = logging.getLogger("institute.analyst_daily")
@@ -32,47 +39,154 @@ SKIP_CATEGORIES = {"ops"}          # editors compile; they don't file field repo
 MAX_TOPICS_PER_DAILY = 2
 MAX_MAILS_PER_DAILY = 1
 ROTATION_HANDS = ("claude", "codex", "gemini")
+# The sweep claim is renewed by a heartbeat while run_all is alive, so the
+# lease does NOT need to exceed the worst-case sweep duration (which is
+# unbounded anyway: with one available hand the per-hand mutex serializes all
+# analysts — 9 x (1800s timeout + 30s belt) ≈ 4h35m today, and it grows with
+# the roster). The lease only bounds how long a HARD-KILLED sweep (heartbeat
+# stopped, finally never ran) wedges the day: lease/heartbeat = 6 missed
+# beats before a live-but-unlucky owner could be taken over.
+SWEEP_LEASE_S = 30 * 60
+SWEEP_HEARTBEAT_S = 5 * 60
 
 _background: set[asyncio.Task] = set()
 
+# per-loop lock for _today_session's check-then-create (asyncio.Lock binds to
+# the running loop on first acquire, so tests — one loop per test — get a
+# fresh lock instead of a cross-loop RuntimeError)
+_session_lock: asyncio.Lock | None = None
+_session_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_session_lock() -> asyncio.Lock:
+    global _session_lock, _session_lock_loop
+    loop = asyncio.get_running_loop()
+    if _session_lock is None or _session_lock_loop is not loop:
+        _session_lock = asyncio.Lock()
+        _session_lock_loop = loop
+    return _session_lock
+
 
 # ---- per-day state ---------------------------------------------------------
+# One admin_state row per analyst per day (analyst_daily:<date>:<analyst_id>).
+# A single-row UPSERT is atomic, so concurrent finishes under asyncio.gather
+# can't erase each other's marks (the old one-blob-per-day read-modify-write
+# lost updates). _get_record still merges a legacy per-day blob, if present,
+# so an upgrade mid-day doesn't forget already-completed analysts.
 
-def _guard_key(date: str | None = None) -> str:
+def _guard_prefix(date: str | None = None) -> str:
     return f"analyst_daily:{date or work_date()}"
 
 
+def _guard_key(analyst_id: str, date: str | None = None) -> str:
+    return f"{_guard_prefix(date)}:{analyst_id}"
+
+
 async def _get_record(date: str | None = None) -> dict[str, Any]:
-    row = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (_guard_key(date),))
-    if row is None:
-        return {}
-    try:
-        return json.loads(row["value"])
-    except ValueError:
-        return {}
+    """Aggregate {analyst_id: status} for the day; per-analyst rows win over the legacy blob."""
+    prefix = _guard_prefix(date)
+    record: dict[str, Any] = {}
+    legacy = await db.query_one("SELECT value FROM admin_state WHERE key = ?", (prefix,))
+    if legacy is not None:
+        try:
+            data = json.loads(legacy["value"])
+            if isinstance(data, dict):
+                record.update(data)
+        except ValueError:
+            pass
+    # literal prefix compare — GLOB/LIKE would treat metacharacters in an
+    # externally supplied date (e.g. "2026-07-??" via the status API) as a
+    # pattern and cross-match other days' rows
+    rows = await db.query(
+        "SELECT key, value FROM admin_state WHERE substr(key, 1, ?) = ?",
+        (len(prefix) + 1, prefix + ":"),
+    )
+    for row in rows:
+        try:
+            record[row["key"][len(prefix) + 1:]] = json.loads(row["value"])
+        except ValueError:
+            record[row["key"][len(prefix) + 1:]] = row["value"]
+    return record
 
 
 async def _mark(analyst_id: str, status: str) -> None:
-    record = await _get_record()
-    record[analyst_id] = status
     await db.execute(
         "INSERT INTO admin_state (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (_guard_key(), json.dumps(record, ensure_ascii=False)),
+        (_guard_key(analyst_id), json.dumps(status, ensure_ascii=False)),
     )
 
 
 async def _today_session() -> dict[str, Any]:
-    """One shared session per day holds every analyst's note."""
+    """One shared session per day holds every analyst's note.
+
+    check-then-create runs under a per-loop lock: a single sweep's
+    asyncio.gather used to race every run_one through the SELECT window and
+    create one session per analyst (F1-1), breaking the one-shared-session-
+    per-day invariant. In-process mutual exclusion is sufficient — this is a
+    single-process system and sessions has no UNIQUE(kind, title) to lean on
+    (adding one now could wedge migration on already-duplicated legacy rows).
+    """
     from . import sessions
 
     title = f"分析师日报 {work_date()}"
-    row = await db.query_one(
-        "SELECT * FROM sessions WHERE kind = 'daily' AND title = ? LIMIT 1", (title,)
+    async with _get_session_lock():
+        row = await db.query_one(
+            "SELECT * FROM sessions WHERE kind = 'daily' AND title = ? LIMIT 1", (title,)
+        )
+        if row:
+            return row
+        return await sessions.create_session(title, kind="daily")
+
+
+# ---- sweep mutual exclusion --------------------------------------------------
+# run_all used to double-run wholesale (F1-1 top1): the 19:00 cron overlapping
+# a manual run-now (or two clicks) ran every analyst twice — 2x quota — and
+# minted duplicate sessions. The shared conditional-claim idiom (claims.py) on
+# an admin_state row makes one winner; the loser skips. While the winner runs,
+# a heartbeat task renews claimed_at every SWEEP_HEARTBEAT_S, so a LIVE sweep
+# is never taken over no matter how long it runs (REVIEW-B1 M1); only a
+# hard-killed sweep (heartbeat stopped, finally never ran) goes stale and is
+# taken over after SWEEP_LEASE_S. Escape hatches while a claim is held: the
+# per-analyst force endpoint bypasses the sweep entirely; deleting the row
+# frees it.
+
+def _sweep_key(date: str | None = None) -> str:
+    # deliberately NOT under _guard_prefix(): _get_record scans the
+    # "analyst_daily:<date>:*" namespace and would read a sweep claim row
+    # as per-analyst status for an analyst literally named "sweep"
+    return f"analyst_daily_sweep:{date or work_date()}"
+
+
+def _claim_token(owner: str) -> str:
+    return json.dumps({"owner": owner, "claimed_at": bus.now_iso()})
+
+
+async def _claim_sweep() -> tuple[str, str] | None:
+    """Conditionally claim today's sweep; (key, token) for the winner, else None.
+
+    The shared idiom (claims.claim_admin_state) picks one winner by rowcount
+    and takes over stale claims via exact-value CAS. SWEEP_LEASE_S is read
+    per call so tests can shrink it.
+    """
+    return await claim_admin_state(
+        _sweep_key(),
+        make_token=lambda: _claim_token(new_id()),
+        is_stale=lease_stale_checker(SWEEP_LEASE_S, label="sweep claim"),
     )
-    if row:
-        return row
-    return await sessions.create_session(title, kind="daily")
+
+
+async def _heartbeat_loop(key: str, holder: dict[str, str], stop: asyncio.Event) -> None:
+    """Renew the sweep claim every SWEEP_HEARTBEAT_S until told to stop
+    (claims.heartbeat_admin_state carries the renewal/loss semantics)."""
+    await heartbeat_admin_state(
+        key, holder, stop, interval_s=SWEEP_HEARTBEAT_S, renew_token=_claim_token,
+    )
+
+
+async def _release_sweep(key: str, token: str) -> None:
+    # CAS delete — only our own claim (claims.release_admin_state)
+    await release_admin_state(key, token)
 
 
 # ---- prompt -----------------------------------------------------------------
@@ -102,10 +216,14 @@ def _daily_task(analyst: Analyst, filename: str) -> str:
 
 
 def _pick_hand(analyst: Analyst, index: int) -> str:
-    if analyst.hand:
-        return analyst.hand
     registry = get_registry()
     available = [h for h in ROTATION_HANDS if registry.is_available(h)]
+    # opt-in weighted pick (settings.enable_hand_weights, default False): reorders
+    # the SAME rotation pool by hand_weights 'daily' scope; off = byte-identical
+    # rotation. An explicit analyst hand always wins (weights never override it).
+    picked = registry.pick_weighted("daily", explicit=analyst.hand, pool=available)
+    if picked:
+        return picked
     if available:
         return available[index % len(available)]
     return get_settings().default_hand
@@ -117,7 +235,8 @@ async def _apply_followups(analyst: Analyst, ws: Path, filename: str) -> tuple[i
     path = ws / filename
     if not path.is_file():
         return 0, 0
-    followups = parse_followups(path.read_text(encoding="utf-8", errors="replace"))
+    raw = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+    followups = parse_followups(raw)
     topics = followups["whiteboard_topics"][:MAX_TOPICS_PER_DAILY]
     mails = [
         m for m in followups["mailbox_followups"]
@@ -162,7 +281,10 @@ async def run_one(analyst_id: str, *, force: bool = False, rotation_index: int =
     session = await _today_session()
     ws = Path(session["workspace_dir"])
     filename = f"{analyst.id}.md"
-    prompt = build_analyst_prompt(analyst, _daily_task(analyst, filename), output_file=filename)
+    from . import memory
+    prompt = await memory.prompt_with_memory(
+        analyst, _daily_task(analyst, filename), output_file=filename,
+    )
 
     task = await executor.submit(
         _pick_hand(analyst, rotation_index), prompt,
@@ -196,35 +318,70 @@ async def run_one(analyst_id: str, *, force: bool = False, rotation_index: int =
 
 
 async def run_all() -> dict[str, Any]:
-    """Scheduler entry: run every working analyst's daily, skipping done ones. Never raises."""
-    record = await _get_record()
-    pending = [
-        a for a in roster()
-        if a.category not in SKIP_CATEGORIES and record.get(a.id) != "completed"
-    ]
-    if not pending:
-        return {"date": work_date(), "ran": 0, "skipped": "all done"}
+    """Scheduler entry: run every working analyst's daily, skipping done ones. Never raises.
 
-    log.info("analyst dailies starting: %s", [a.id for a in pending])
+    Guarded by the per-day sweep claim: the 19:00 cron overlapping a manual
+    run-now (or two overlapping run-nows) gets ONE running sweep; the loser
+    returns a skip marker instead of double-spending quota (F1-1).
+    """
+    claim = await _claim_sweep()
+    if claim is None:
+        log.info("analyst dailies sweep already running today; skipping duplicate")
+        return {"date": work_date(), "ran": 0, "skipped": "sweep already running"}
+    key, token = claim
+    holder = {"token": token}
+    stop_heartbeat = asyncio.Event()
+    heartbeat = asyncio.create_task(_heartbeat_loop(key, holder, stop_heartbeat))
+    try:
+        record = await _get_record()
+        pending = [
+            a for a in roster()
+            if a.category not in SKIP_CATEGORIES and record.get(a.id) != "completed"
+        ]
+        if not pending:
+            return {"date": work_date(), "ran": 0, "skipped": "all done"}
 
-    async def _safe(analyst: Analyst, i: int) -> dict[str, Any]:
+        log.info("analyst dailies starting: %s", [a.id for a in pending])
+
+        async def _safe(analyst: Analyst, i: int) -> dict[str, Any]:
+            try:
+                return await run_one(analyst.id, rotation_index=i)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("analyst daily crashed for %s", analyst.id)
+                return {"analyst_id": analyst.id, "status": "crashed", "error": str(exc)[:200]}
+
+        # Bounded fan-out: the executor caps each model call, but a wedged
+        # hand mutex / lost driver would hang this gather forever while the
+        # heartbeat keeps renewing the claim ("alive but not working"). The
+        # budget assumes full serialization on one hand plus margin; a timeout
+        # cancels the stragglers (their executor drivers mark rows cancelled).
+        budget_s = len(pending) * (get_settings().default_timeout_s + 120) + 60
         try:
-            return await run_one(analyst.id, rotation_index=i)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("analyst daily crashed for %s", analyst.id)
-            return {"analyst_id": analyst.id, "status": "crashed", "error": str(exc)[:200]}
-
-    results = await asyncio.gather(*(_safe(a, i) for i, a in enumerate(pending)))
-    summary = {
-        "date": work_date(),
-        "ran": len(results),
-        "completed": sum(1 for r in results if r.get("status") == "completed"),
-        "results": results,
-    }
-    await bus.emit("analyst_daily.sweep_completed", "daily", work_date(), {
-        "ran": summary["ran"], "completed": summary["completed"],
-    })
-    return summary
+            results = await asyncio.wait_for(
+                asyncio.gather(*(_safe(a, i) for i, a in enumerate(pending))),
+                timeout=budget_s,
+            )
+        except asyncio.TimeoutError:
+            log.error("analyst dailies sweep exceeded its %.0fs budget; stragglers cancelled", budget_s)
+            return {"date": work_date(), "ran": len(pending),
+                    "error": f"sweep timed out after {budget_s:.0f}s"}
+        summary = {
+            "date": work_date(),
+            "ran": len(results),
+            "completed": sum(1 for r in results if r.get("status") == "completed"),
+            "results": results,
+        }
+        await bus.emit("analyst_daily.sweep_completed", "daily", work_date(), {
+            "ran": summary["ran"], "completed": summary["completed"],
+        })
+        return summary
+    finally:
+        stop_heartbeat.set()
+        try:
+            await heartbeat  # brief: it exits at its next stop-check
+        except Exception:  # noqa: BLE001 - the release below must still run
+            log.exception("sweep heartbeat task errored during shutdown")
+        await _release_sweep(key, holder["token"])
 
 
 def spawn_all() -> None:

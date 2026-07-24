@@ -1,0 +1,15 @@
+-- LOOP-P3: poison-card bound for fact-check verification retries.
+--
+-- A verification failure used to release the card straight back to 'pending';
+-- with ORDER BY created_at ASC the same poison card was re-picked every tick
+-- (3 model calls per tick, no refund) and burned the whole daily attempt cap
+-- (default 10) in ~2 hours. attempts counts FAILED verification attempts per
+-- card (bumped atomically in the same conditional UPDATE that releases the
+-- lease); at VERIFY_MAX_ATTEMPTS the card is settled terminal via the
+-- existing 'unverifiable' status + a verified_facts row explaining the
+-- exhaustion (the 0015 status CHECK has no 'failed' member and old migrations
+-- are immutable — 'unverifiable' is the semantically-equivalent terminal:
+-- out of rotation, never re-picked). The pending-card picker also excludes
+-- attempts >= VERIFY_MAX_ATTEMPTS and sorts attempts ASC so retried cards
+-- sink behind fresh ones.
+ALTER TABLE fact_cards ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;

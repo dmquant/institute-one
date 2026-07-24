@@ -26,12 +26,18 @@ export default function Research() {
   const { itemId } = useParams();
   const navigate = useNavigate();
   const { lastEvent } = useSSE({ types: ["research", "workflow"], max: 1 });
-  const queue = useLoad(() => listResearchQueue(undefined, 100), [lastEvent?.id ?? 0], 20000);
+  const queue = useLoad(
+    () => listResearchQueue(undefined, 100),
+    [lastEvent?.id ?? 0],
+    20000,
+  );
   const log = useLoad(() => getResearchLog(50), [lastEvent?.id ?? 0], 60000);
 
   const [topic, setTopic] = useState("");
   const [priority, setPriority] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [ticking, setTicking] = useState(false);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -59,6 +65,7 @@ export default function Research() {
   };
 
   const tick = async () => {
+    setTicking(true);
     setErr(null);
     setNote("正在处理队列（可能需要较长时间）…");
     try {
@@ -69,14 +76,31 @@ export default function Research() {
     } catch (e) {
       setNote(null);
       setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTicking(false);
+    }
+  };
+
+  const cancel = async (id: string) => {
+    setCancellingId(id);
+    setErr(null);
+    setNote(null);
+    try {
+      await cancelResearchItem(id);
+      setNote(`已取消研究条目：${id}`);
+      queue.reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancellingId(null);
     }
   };
 
   return (
     <>
       <PageHead zh="深度研究" en="Deep Research">
-        <button className="ghost" onClick={tick}>
-          手动处理一条 (tick)
+        <button className="ghost" onClick={tick} disabled={ticking}>
+          {ticking ? "处理中…" : "手动处理一条 (tick)"}
         </button>
       </PageHead>
       {note && <div className="ok-note">{note}</div>}
@@ -118,43 +142,59 @@ export default function Research() {
           </h2>
           <ErrorNote error={queue.error} />
           {queue.loading && !queue.data && <Loading />}
-          <table className="data">
-            <thead>
-              <tr>
-                <th>题目</th>
-                <th>状态</th>
-                <th>优先级</th>
-                <th>创建</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {(queue.data ?? []).map((it) => (
-                <tr key={it.id}>
-                  <td>
-                    <Link to={`/research/${it.id}`}>{it.topic}</Link>
-                    {it.error && <div className="faint ellipsis">{it.error}</div>}
-                  </td>
-                  <td>
-                    <StatusBadge status={it.status} />
-                  </td>
-                  <td className="mono">{it.priority}</td>
-                  <td className="dim nowrap">{ago(it.created_at)}</td>
-                  <td>
-                    {(it.status === "pending" || it.status === "running") && (
-                      <button
-                        className="small danger"
-                        onClick={() => cancelResearchItem(it.id).then(queue.reload)}
-                      >
-                        取消
-                      </button>
-                    )}
-                  </td>
+          {queue.data && queue.data.length > 0 && (
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>题目 / 关联</th>
+                  <th>状态</th>
+                  <th>优先级</th>
+                  <th>创建</th>
+                  <th></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-          {queue.data?.length === 0 && <Empty text="队列为空" />}
+              </thead>
+              <tbody>
+                {queue.data.map((it) => (
+                  <tr key={it.id}>
+                    <td>
+                      <Link to={`/research/${it.id}`}>{it.topic}</Link>
+                      {(it.thesis_id || it.security_id) && (
+                        <div
+                          className="faint mono"
+                          style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px", fontSize: 11, marginTop: 3 }}
+                        >
+                          {it.thesis_id && <span title="关联论点">论点 {it.thesis_id}</span>}
+                          {it.security_id && <span title="关联标的">标的 {it.security_id}</span>}
+                        </div>
+                      )}
+                      {it.error && (
+                        <div className="faint ellipsis" title={it.error}>
+                          {it.error}
+                        </div>
+                      )}
+                    </td>
+                    <td>
+                      <StatusBadge status={it.status} />
+                    </td>
+                    <td className="mono">{it.priority}</td>
+                    <td className="dim nowrap">{ago(it.created_at)}</td>
+                    <td>
+                      {(it.status === "pending" || it.status === "running") && (
+                        <button
+                          className="small danger"
+                          disabled={cancellingId !== null}
+                          onClick={() => cancel(it.id)}
+                        >
+                          {cancellingId === it.id ? "取消中…" : "取消"}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {queue.data?.length === 0 && !queue.loading && <Empty text="队列为空" />}
         </div>
 
         <div className="card">
@@ -162,29 +202,32 @@ export default function Research() {
             研究日志<span className="en">research log</span>
           </h2>
           <ErrorNote error={log.error} />
-          <table className="data">
-            <thead>
-              <tr>
-                <th>题目</th>
-                <th>摘要</th>
-                <th>完成于</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(log.data ?? []).map((r) => (
-                <tr key={r.id}>
-                  <td className="nowrap">{r.topic}</td>
-                  <td className="dim ellipsis" title={r.summary ?? ""}>
-                    {r.summary ?? ""}
-                  </td>
-                  <td className="dim nowrap" title={fmtTime(r.completed_at)}>
-                    {ago(r.completed_at)}
-                  </td>
+          {log.loading && !log.data && <Loading />}
+          {log.data && log.data.length > 0 && (
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>题目</th>
+                  <th>摘要</th>
+                  <th>完成于</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-          {log.data?.length === 0 && <Empty text="还没有完成的研究" />}
+              </thead>
+              <tbody>
+                {log.data.map((r) => (
+                  <tr key={r.id}>
+                    <td className="nowrap">{r.topic}</td>
+                    <td className="dim ellipsis" title={r.summary ?? ""}>
+                      {r.summary ?? ""}
+                    </td>
+                    <td className="dim nowrap" title={fmtTime(r.completed_at)}>
+                      {ago(r.completed_at)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {log.data?.length === 0 && !log.loading && <Empty text="还没有完成的研究" />}
         </div>
       </div>
 
@@ -195,7 +238,11 @@ export default function Research() {
 
 function ItemDetail({ itemId, onClose }: { itemId: string; onClose: () => void }) {
   const { lastEvent } = useSSE({ types: ["research", "workflow", "task"], max: 1 });
-  const item = useLoad(() => getResearchItem(itemId), [itemId, lastEvent?.id ?? 0], 15000);
+  const item = useLoad(
+    () => getResearchItem(itemId),
+    [itemId, lastEvent?.id ?? 0],
+    15000,
+  );
   const [report, setReport] = useState<{ path: string; text: string } | null>(null);
   const [reportErr, setReportErr] = useState<string | null>(null);
 
@@ -241,6 +288,18 @@ function ItemDetail({ itemId, onClose }: { itemId: string; onClose: () => void }
               <dd>{it.priority}</dd>
               <dt>来源</dt>
               <dd>{it.source}</dd>
+              {it.thesis_id && (
+                <>
+                  <dt>关联论点</dt>
+                  <dd className="mono">{it.thesis_id}</dd>
+                </>
+              )}
+              {it.security_id && (
+                <>
+                  <dt>关联标的</dt>
+                  <dd className="mono">{it.security_id}</dd>
+                </>
+              )}
               <dt>运行</dt>
               <dd>
                 {it.run_id ? <Link to={`/workflows/runs/${it.run_id}`}>{it.run_id}</Link> : "—"}
@@ -282,7 +341,7 @@ function ItemDetail({ itemId, onClose }: { itemId: string; onClose: () => void }
             {report ? (
               <FileView path={report.path} text={report.text} />
             ) : (
-              !reportErr && <Empty text={finalFile ? "加载报告中…" : "暂无报告文件"} />
+              !reportErr && (finalFile ? <Loading /> : <Empty text="暂无报告文件" />)
             )}
           </>
         )}

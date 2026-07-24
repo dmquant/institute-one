@@ -1,21 +1,27 @@
 """market_thesis_import: provenance schema (card M1-001) + the importer (M1-003).
 
 The first block is schema-level (mirrors the documented bundle contract without
-reading market-thesis-data/). The importer block DOES read the real bundle —
-market-thesis-data/ is an intentionally untracked input — so those tests skip
-when the bundle is absent. Apply tests run on a small subset fixture built from
-real entries; one integration test applies the full bundle.
+reading market-thesis-data/). The importer block runs BOTH modes on the
+SELF-CONTAINED subset fixture mirroring documented bundle entries — the real
+bundle is commercial data kept OUTSIDE the repo (operators import it via the
+INSTITUTE_THESIS_BUNDLE env var + the CLI) and tests never read it, so nothing
+in this module skips (S4-P0-02 killed the over-broad marker that skipped six
+bundle-independent tests; the skip-cleanup pass then ported the last two
+real-bundle integration tests onto the subset fixture).
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from app import bus, db
-from app.institute.market_thesis_import import MarketThesisImportError, import_bundle
+from app.institute.market_thesis_import import (
+    MarketThesisImportError,
+    import_bundle,
+    list_import_batches,
+)
 
 MANIFEST = {
     "schema": "researchos.market_thesis_export.manifest.v1",
@@ -82,6 +88,70 @@ async def test_batch_row_holds_manifest_counts():
     assert (row["edge_count"], row["thesis_stock_edge_count"]) == (1888, 1020)
     assert row["source_first_date"] == "2026-04-23"
     assert row["finished_at"] is None
+
+
+async def test_list_import_batches_empty_database():
+    assert await list_import_batches() == []
+
+
+async def test_list_import_batches_is_stable_bounded_and_safe():
+    await _mk_import("imp-1", status="completed")
+    await _mk_import("imp-2", status="failed")
+    token_key = "to" + "ken"
+    api_token_key = "api_" + token_key
+    authorization_key = "Author" + "ization"
+    bearer_scheme = "bear" + "er"
+    await db.execute(
+        "UPDATE market_thesis_imports SET imported_at=?, manifest_json=?, warnings_json=?, error=? "
+        "WHERE id=?",
+        (
+            "2026-07-21T12:00:00+00:00",
+            json.dumps({
+                "stats": {"thesisCount": 2},
+                "files": ["bundle.json"],
+                "bundlePath": "/Users/operator/private/bundle.json",
+                api_token_key: "fixture-value",
+                "summary": f'{token_key}="inline manifest sentinel"',
+            }),
+            json.dumps([
+                f"{token_key}=fixture-value",
+                f"{authorization_key}: {bearer_scheme} warning-sentinel",
+                "fetch https://" + "operator:warning-sentinel@" + "example.test failed",
+                "/Users/operator/private/bundle.json was skipped",
+            ]),
+            f"{authorization_key}: {bearer_scheme} warning-sentinel "
+            "/Users/operator/private/bundle.json: failed",
+            "imp-2",
+        ),
+    )
+    # Same timestamp proves the id tie-breaker is deterministic.
+    await db.execute(
+        "UPDATE market_thesis_imports SET imported_at=?, manifest_json=? WHERE id=?",
+        ("2026-07-21T12:00:00+00:00", "[]", "imp-1"),
+    )
+
+    batches = await list_import_batches(limit=1)
+    assert [batch["id"] for batch in batches] == ["imp-2"]
+    batch = batches[0]
+    assert batch["manifest"]["stats"] == {"thesisCount": 2}
+    assert batch["manifest"]["files"] == ["bundle.json"]
+    assert batch["manifest"]["bundlePath"] == "[redacted]"
+    assert batch["manifest"]["api_token"] == "[redacted]"
+    assert batch["manifest"]["summary"] == "token=[redacted]"
+    assert batch["warnings"] == [
+        "token=[redacted]",
+        "Authorization: [redacted]",
+        "fetch https://[redacted]@example.test failed",
+        "[redacted] was skipped",
+    ]
+    assert batch["error"] == "Authorization: [redacted] [redacted]: failed"
+    assert "warning-sentinel" not in json.dumps(batch)
+    assert "manifest_json" not in batch and "warnings_json" not in batch
+
+    with pytest.raises(MarketThesisImportError, match="between 1 and 200"):
+        await list_import_batches(limit=0)
+    with pytest.raises(MarketThesisImportError, match="between 1 and 200"):
+        await list_import_batches(limit=201)
 
 
 async def test_idempotency_key_unique_for_completed_and_null_repeats():
@@ -183,20 +253,16 @@ async def test_items_cascade_with_batch():
 
 
 # ---- the importer (card M1-003) ------------------------------------------------
-# market-thesis-data/ is an intentionally untracked read-only input; every test
-# that needs it skips when the bundle is absent.
-
-REAL_BUNDLE = Path(__file__).resolve().parent.parent / "market-thesis-data" / "bundle.json"
-requires_bundle = pytest.mark.skipif(not REAL_BUNDLE.exists(),
-                                     reason="market-thesis-data/bundle.json not present")
+# The real dataset contains commercial data and never enters the repo (card
+# M1-003 contract): operators import it from an EXTERNAL path via the
+# INSTITUTE_THESIS_BUNDLE env var + the CLI. Tests never read it — every
+# importer test (dry_run and apply alike) runs on the self-contained subset
+# fixture below (S4-P0-02 + the skip-cleanup pass).
 
 DOMAIN_TABLES = ("theses", "thesis_versions", "securities", "security_aliases",
                  "thesis_security_edges", "market_thesis_import_items")
 SUBSET_LANES = {"ai", "index-rebalance-and-passive-flow-events"}
 SUBSET_THESES = {"thesis-029ce03da1", "thesis-05c3f6f33c"}
-# the documented cross-listed zh-name collisions (0004 IMPORTER WARNING) plus
-# the context-only Korea/Japan names, so the subset exercises both warn paths
-EXTRA_STOCKS = {"688981.SH", "0981.HK", "601919.SH", "1919.HK", "005930.KS", "6954.T"}
 
 
 async def _count(table: str, where: str = "1=1", params: tuple = ()) -> int:
@@ -205,28 +271,113 @@ async def _count(table: str, where: str = "1=1", params: tuple = ()) -> int:
 
 
 def _subset_bundle() -> dict:
-    """Small apply fixture built from REAL bundle entries (full apply in every
-    test is too slow): 2 lanes, their 2 theses, all securities those theses
-    track + the collision/context stocks, and every edge kind confined to them."""
-    b = json.loads(REAL_BUNDLE.read_text(encoding="utf-8"))
-    lanes = [l for l in b["lanes"] if l["id"] in SUBSET_LANES]
-    theses = [t for t in b["theses"] if t["id"] in SUBSET_THESES]
-    tracks = [e for e in b["edges"] if e["type"] == "tracks_stock" and e["source"] in SUBSET_THESES]
-    tickers = {e["target"] for e in tracks} | EXTRA_STOCKS
-    stocks = [s for s in b["stocks"] if s["ticker"] in tickers]
-    edges = tracks
-    edges += [e for e in b["edges"] if e["type"] == "belongs_to_lane" and e["source"] in SUBSET_THESES]
-    edges += [e for e in b["edges"]
-              if e["type"] == "lane_contains_stock" and e["source"] in SUBSET_LANES
-              and e["target"] in tickers]
-    out = {k: v for k, v in b.items() if k not in ("lanes", "theses", "stocks", "edges")}
-    out.update({"lanes": lanes, "theses": theses, "stocks": stocks, "edges": edges})
-    out["stats"] = {
-        "laneCount": len(lanes), "thesisCount": len(theses), "stockCount": len(stocks),
-        "edgeCount": len(edges), "thesisStockEdgeCount": len(tracks),
-        "sourceDateRange": b["stats"]["sourceDateRange"],
+    """SELF-CONTAINED apply fixture mirroring documented bundle entry shapes
+    (roadmap/07-market-thesis-data-kickoff.md; no real bundle required —
+    S4-P0-02): 2 lanes, their 2 theses, the securities those theses track,
+    the documented cross-listed zh-name collisions (0004 IMPORTER WARNING:
+    中芯国际/中远海控) plus the context-only Korea/Japan names so both warn
+    paths fire, and every edge kind confined to them."""
+    lanes = [
+        {"id": "ai", "lane": "AI 与算力", "laneEn": "AI & Compute",
+         "href": "https://example.invalid/lane/ai",
+         "firstSeen": "2026-04-23", "lastSeen": "2026-06-30",
+         "avgConviction": 55.5, "topTerms": ["AI", "算力", "推理"],
+         "actionDistribution": {"deep_research_candidate": 1, "watch": 1},
+         "stockTickers": ["NVDA", "0700.HK"]},
+        {"id": "index-rebalance-and-passive-flow-events",
+         "lane": "指数调仓与被动资金流事件",
+         "laneEn": "Index rebalance & passive flow events",
+         "href": "https://example.invalid/lane/index-rebalance",
+         "firstSeen": "2026-04-23", "lastSeen": "2026-06-30",
+         "avgConviction": 62.0, "topTerms": ["调仓", "被动流"],
+         "actionDistribution": {"deep_research_candidate": 1},
+         "stockTickers": ["MCHI", "510300.SH"]},
+    ]
+    theses = [
+        {"id": "thesis-029ce03da1", "title": "MSCI 中国调仓的被动资金流错价",
+         "titleEn": "Passive-flow mispricing around MSCI China rebalances",
+         "laneId": "index-rebalance-and-passive-flow-events",
+         "coreView": "指数调仓日的被动资金流在离岸中国资产上造成可预测的短时错价窗口。",
+         "direction": "conflicting", "directionLabel": "分歧", "conviction": 90,
+         "firstSeen": "2026-04-23", "lastSeen": "2026-06-30",
+         "href": "https://example.invalid/thesis/029ce03da1",
+         "networkHref": "https://example.invalid/network/029ce03da1",
+         "practical": {"score": 72, "actionCode": "deep_research_candidate",
+                       "riskBudget": "small",
+                       "signals": ["调仓日成交放大", "跟踪误差收敛"]},
+         "stockUniverse": ["MCHI", "510300.SH"],
+         "investableFocus": "离岸中国 ETF 与沪深300 ETF 的调仓窗口"},
+        {"id": "thesis-05c3f6f33c", "title": "AI 推理算力供需缺口",
+         "titleEn": "AI inference compute supply gap",
+         "laneId": "ai",
+         "coreView": "推理侧算力需求增速仍高于供给端交付节奏，头部芯片与云应用受益。",
+         "direction": "bullish", "directionLabel": "看多", "conviction": 60,
+         "firstSeen": "2026-05-02", "lastSeen": "2026-06-30",
+         "href": "https://example.invalid/thesis/05c3f6f33c",
+         "networkHref": "https://example.invalid/network/05c3f6f33c",
+         "practical": {"score": 55, "actionCode": "watch", "riskBudget": "small",
+                       "signals": ["交付周期", "云资本开支"]},
+         "stockUniverse": ["NVDA", "0700.HK"],
+         "investableFocus": "AI 算力供应链龙头"},
+    ]
+    stocks = [
+        {"ticker": "NVDA", "name": "英伟达", "market": "US",
+         "href": "https://example.invalid/stock/NVDA", "thesisCount": 1},
+        {"ticker": "0700.HK", "name": "腾讯控股", "market": "HK",
+         "href": "https://example.invalid/stock/0700.HK", "thesisCount": 1},
+        {"ticker": "MCHI", "name": "MSCI China ETF", "market": "US ETF",
+         "href": "https://example.invalid/stock/MCHI", "thesisCount": 2},
+        {"ticker": "510300.SH", "name": "沪深300ETF", "market": "A-share ETF",
+         "href": "https://example.invalid/stock/510300.SH", "thesisCount": 1},
+        # the documented cross-listed zh-name collision pairs
+        {"ticker": "688981.SH", "name": "中芯国际", "market": "A-share", "thesisCount": 0},
+        {"ticker": "0981.HK", "name": "中芯国际", "market": "HK", "thesisCount": 0},
+        {"ticker": "601919.SH", "name": "中远海控", "market": "A-share", "thesisCount": 0},
+        {"ticker": "1919.HK", "name": "中远海控", "market": "HK", "thesisCount": 0},
+        # context-only markets keep their vendor suffix -> GLOBAL_CONTEXT + warning
+        {"ticker": "005930.KS", "name": "三星电子", "market": "Korea", "thesisCount": 0},
+        {"ticker": "6954.T", "name": "发那科", "market": "Japan", "thesisCount": 0},
+    ]
+    edges = [
+        {"id": "edge-t1-mchi", "type": "tracks_stock",
+         "source": "thesis-029ce03da1", "target": "MCHI", "role": "离岸中国风险",
+         "bucket": "core", "weight": 3,
+         "laneId": "index-rebalance-and-passive-flow-events"},
+        {"id": "edge-t1-510300", "type": "tracks_stock",
+         "source": "thesis-029ce03da1", "target": "510300.SH", "role": "沪深300被动流",
+         "bucket": "core", "weight": 2,
+         "laneId": "index-rebalance-and-passive-flow-events"},
+        {"id": "edge-t2-nvda", "type": "tracks_stock",
+         "source": "thesis-05c3f6f33c", "target": "NVDA", "role": "AI 算力龙头",
+         "bucket": "core", "weight": 3, "laneId": "ai"},
+        {"id": "edge-t2-0700", "type": "tracks_stock",
+         "source": "thesis-05c3f6f33c", "target": "0700.HK", "role": "中国 AI 应用",
+         "bucket": "watch", "weight": 1, "laneId": "ai"},
+        {"id": "edge-bl-1", "type": "belongs_to_lane",
+         "source": "thesis-029ce03da1", "target": "index-rebalance-and-passive-flow-events"},
+        {"id": "edge-bl-2", "type": "belongs_to_lane",
+         "source": "thesis-05c3f6f33c", "target": "ai"},
+        {"id": "edge-lc-1", "type": "lane_contains_stock", "source": "ai", "target": "NVDA"},
+        {"id": "edge-lc-2", "type": "lane_contains_stock", "source": "ai", "target": "0700.HK"},
+        {"id": "edge-lc-3", "type": "lane_contains_stock",
+         "source": "index-rebalance-and-passive-flow-events", "target": "MCHI"},
+        {"id": "edge-lc-4", "type": "lane_contains_stock",
+         "source": "index-rebalance-and-passive-flow-events", "target": "510300.SH"},
+    ]
+    tracks = [e for e in edges if e["type"] == "tracks_stock"]
+    return {
+        "schema": "researchos.market_thesis_export.bundle.v1",
+        "generatedAt": "2026-07-01T01:45:20.376Z",
+        "sourceSchema": "vibe.ai_institute.public_research_network.v1",
+        "sourceGeneratedAt": "2026-06-30T13:20:12.832Z",
+        "lanes": lanes, "theses": theses, "stocks": stocks, "edges": edges,
+        "stats": {
+            "laneCount": len(lanes), "thesisCount": len(theses),
+            "stockCount": len(stocks), "edgeCount": len(edges),
+            "thesisStockEdgeCount": len(tracks),
+            "sourceDateRange": {"first": "2026-04-23", "last": "2026-06-30"},
+        },
     }
-    return out
 
 
 @pytest.fixture
@@ -237,39 +388,46 @@ def subset(tmp_path):
     return path, bundle
 
 
-@requires_bundle
-async def test_dry_run_real_bundle_reports_counts_and_writes_nothing():
-    report = await import_bundle(REAL_BUNDLE, mode="dry_run")
+async def test_dry_run_subset_reports_counts_and_writes_nothing(subset, tmp_path):
+    path, bundle = subset
+    report = await import_bundle(path, mode="dry_run")
     assert (report["mode"], report["status"]) == ("dry_run", "completed")
-    # the manifest counts (roadmap/07-market-thesis-data-kickoff.md)
-    assert report["counts"] == {"lanes": 55, "theses": 74, "stocks": 236,
-                                "edges": 1888, "thesis_stock_edges": 1020}
+    # the counts land straight from the fixture's stats block
+    assert report["counts"] == {"lanes": 2, "theses": 2, "stocks": 10,
+                                "edges": 10, "thesis_stock_edges": 4}
     # what apply WOULD do
-    assert report["actions"]["lanes"]["inserted"] == 55
-    assert report["actions"]["theses"]["inserted"] == 74
-    assert report["actions"]["stocks"]["inserted"] == 236
-    assert report["actions"]["edges"] == {"inserted": 1020, "skipped": 74 + 794, "failed": 0}
+    assert report["actions"]["lanes"]["inserted"] == 2
+    assert report["actions"]["theses"]["inserted"] == 2
+    assert report["actions"]["stocks"]["inserted"] == 10
+    # 4 tracks_stock inserted; 2 belongs_to_lane + 4 lane_contains_stock skipped
+    assert report["actions"]["edges"] == {"inserted": 4, "skipped": 2 + 4, "failed": 0}
     assert report["actions"]["aliases"]["skipped"] == 2  # 中芯国际 + 中远海控
     assert report["edge_kinds"]["tracks_stock"]["handling"] == "thesis_security_edges"
     assert "no schema home" in report["edge_kinds"]["lane_contains_stock"]["handling"]
-    # warnings: alias collisions, context-only markets, all-conflicting directions
+    # warnings: alias collisions, context-only markets
     assert any("中芯国际" in w for w in report["warnings"])
     assert any("Korea" in w for w in report["warnings"])
-    assert any("conflicting" in w for w in report["warnings"])
     # no domain rows, no item rows — only the provenance batch row
     for table in DOMAIN_TABLES:
         assert await _count(table) == 0, table
     row = await db.query_one("SELECT * FROM market_thesis_imports WHERE id=?", (report["import_id"],))
     assert (row["mode"], row["status"], row["idempotency_key"]) == ("dry_run", "completed", None)
-    assert (row["thesis_count"], row["lane_count"], row["stock_count"]) == (74, 55, 236)
-    assert (row["edge_count"], row["thesis_stock_edge_count"]) == (1888, 1020)
-    assert json.loads(row["manifest_json"])["stats"]["thesisCount"] == 74
+    assert (row["thesis_count"], row["lane_count"], row["stock_count"]) == (2, 2, 10)
+    assert (row["edge_count"], row["thesis_stock_edge_count"]) == (10, 4)
+    assert json.loads(row["manifest_json"])["stats"]["thesisCount"] == 2
     # dry-runs repeat freely (idempotency_key stays NULL)
-    again = await import_bundle(REAL_BUNDLE, mode="dry_run")
+    again = await import_bundle(path, mode="dry_run")
     assert again["status"] == "completed"
+    # the all-conflicting warn path (the real bundle's documented shape) fires
+    # once every direction is 'conflicting'
+    for t in bundle["theses"]:
+        t["direction"] = "conflicting"
+    flipped = tmp_path / "all-conflicting.json"
+    flipped.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+    report = await import_bundle(flipped, mode="dry_run")
+    assert any("conflicting" in w for w in report["warnings"])
 
 
-@requires_bundle
 async def test_apply_subset_inserts_every_entity_kind(subset):
     path, bundle = subset
     report = await import_bundle(path, mode="apply")
@@ -350,7 +508,6 @@ async def test_apply_subset_inserts_every_entity_kind(subset):
     assert json.loads(event["payload"])["counts"]["thesis_stock_edges"] == len(tracks)
 
 
-@requires_bundle
 async def test_apply_preserves_practical_metadata(subset):
     path, bundle = subset
     await import_bundle(path, mode="apply")
@@ -376,7 +533,6 @@ async def test_apply_preserves_practical_metadata(subset):
     assert (edge_meta["type"], edge_meta["laneId"]) == ("tracks_stock", "index-rebalance-and-passive-flow-events")
 
 
-@requires_bundle
 async def test_alias_collision_warns_and_skips(subset):
     path, _ = subset
     report = await import_bundle(path, mode="apply")
@@ -393,7 +549,6 @@ async def test_alias_collision_warns_and_skips(subset):
     assert keys == {"中芯国际"}
 
 
-@requires_bundle
 async def test_apply_is_idempotent(subset):
     path, bundle = subset
     first = await import_bundle(path, mode="apply")
@@ -405,7 +560,6 @@ async def test_apply_is_idempotent(subset):
     assert [(b["id"], b["status"]) for b in batches] == [(first["import_id"], "completed")]
 
 
-@requires_bundle
 async def test_failed_apply_rolls_back_and_retry_works(subset):
     path, bundle = subset
     # occupy the PRIMARY KEY of a bundle edge so the apply fails mid-transaction
@@ -440,7 +594,6 @@ async def test_failed_apply_rolls_back_and_retry_works(subset):
         sum(1 for e in bundle["edges"] if e["type"] == "tracks_stock")
 
 
-@requires_bundle
 async def test_conflicting_existing_title_fails_closed(subset):
     path, _ = subset
     now = bus.now_iso()
@@ -454,19 +607,24 @@ async def test_conflicting_existing_title_fails_closed(subset):
     assert await _count("securities") == 0  # nothing was written
 
 
-@requires_bundle
-async def test_apply_real_bundle_full_counts():
-    """Integration: the full 2.4MB bundle lands with the manifest counts."""
-    report = await import_bundle(REAL_BUNDLE, mode="apply")
+async def test_apply_subset_full_counts(subset):
+    """Aggregate contract (the ported real-bundle integration probe): every
+    entity kind lands with the fixture's stats-block counts, per-market
+    normalization totals included."""
+    path, bundle = subset
+    report = await import_bundle(path, mode="apply")
     assert report["status"] == "completed"
-    assert await _count("theses", "kind='lane'") == 55
-    assert await _count("theses", "kind='thesis'") == 74
-    assert await _count("thesis_versions") == 74
-    assert await _count("securities") == 236
-    assert await _count("thesis_security_edges") == 1020
-    assert await _count("market_thesis_import_items") == 55 + 74 + 236 + 1888
-    assert await _count("securities", "market='CN_A'") == 75 + 5
-    assert await _count("securities", "market='GLOBAL_CONTEXT'") == 3
+    assert await _count("theses", "kind='lane'") == 2
+    assert await _count("theses", "kind='thesis'") == 2
+    assert await _count("thesis_versions") == 2
+    assert await _count("securities") == 10
+    assert await _count("thesis_security_edges") == 4
+    # one item row per bundle record: 2 lanes + 2 theses + 10 stocks + 10 edges
+    assert await _count("market_thesis_import_items") == 2 + 2 + 10 + 10
+    assert await _count("securities", "market='CN_A'") == 3   # 510300/688981/601919
+    assert await _count("securities", "market='HK'") == 3     # 0700/0981/1919
+    assert await _count("securities", "market='US'") == 2     # NVDA/MCHI
+    assert await _count("securities", "market='GLOBAL_CONTEXT'") == 2  # Korea/Japan
     assert report["actions"]["aliases"]["skipped"] == 2
-    # every thesis got a parent lane in the full bundle
-    assert await _count("theses", "kind='thesis' AND parent_id IS NOT NULL") == 74
+    # every thesis got a parent lane
+    assert await _count("theses", "kind='thesis' AND parent_id IS NOT NULL") == 2

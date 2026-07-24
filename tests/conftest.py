@@ -25,6 +25,10 @@ for _flag in ("CLAUDE", "CODEX", "GEMINI", "OPENCODE", "OLLAMA", "AGY"):
 os.environ["INSTITUTE_ENABLE_ECHO"] = "true"
 os.environ["INSTITUTE_DEFAULT_HAND"] = "echo"
 os.environ["INSTITUTE_RESEARCH_HANDS"] = "echo"
+# pin explicitly: pydantic-settings also reads the repo .env, so an operator
+# flipping INSTITUTE_ENABLE_VECTORS=true there must not leak into tests
+# (vector suites opt in per-test via monkeypatch)
+os.environ["INSTITUTE_ENABLE_VECTORS"] = "false"
 
 from app import config  # noqa: E402
 
@@ -35,12 +39,14 @@ import asyncio  # noqa: E402
 import pytest  # noqa: E402
 
 from app import db  # noqa: E402
+from app.background import all_background_tasks  # noqa: E402
 from app.config import get_settings  # noqa: E402
 from app.hands import registry as registry_mod  # noqa: E402
 from app.institute import mailbox as mailbox_mod  # noqa: E402
 from app.institute import research as research_mod  # noqa: E402
+from app.institute import research_tree as research_tree_mod  # noqa: E402
+from app.institute import scheduler as scheduler_mod  # noqa: E402
 from app.institute import whiteboard as whiteboard_mod  # noqa: E402
-from app.institute import workflows as workflows_mod  # noqa: E402
 from app.router import executor  # noqa: E402
 from app.vault import writer as vault_writer_mod  # noqa: E402
 
@@ -68,21 +74,25 @@ async def app_runtime():
     executor._hand_locks.clear()
     executor._running.clear()
     research_mod._claim_lock = asyncio.Lock()
+    research_mod._cap_disabled_logged = False
+    research_tree_mod._announce_lock = asyncio.Lock()
     whiteboard_mod._active_cards.clear()
     mailbox_mod._inflight.clear()
     vault_writer_mod.reset_writer()
+    # the scheduler's ~5s admin_state cache is process-global; tests write
+    # admin_state directly (bypassing the invalidating write paths), so a
+    # warm cache would leak stale switch state across tests
+    scheduler_mod._admin_state_cache.clear()
 
     await db.init()
     registry_mod.init_registry(settings)
 
     yield
 
-    # stop any background work before closing the connection
-    pending: set[asyncio.Task] = set()
-    pending |= set(whiteboard_mod._bg_tasks)
-    pending |= set(mailbox_mod._bg_tasks)
-    pending |= set(workflows_mod._driving)
-    pending |= set(executor._running.values())
+    # stop any background work before closing the connection — the registry
+    # union lives in app.background.all_background_tasks (single source of
+    # truth shared with app.main._drain_background)
+    pending: set[asyncio.Task] = all_background_tasks()
     for t in pending:
         t.cancel()
     if pending:

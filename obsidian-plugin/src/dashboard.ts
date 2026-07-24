@@ -2,13 +2,23 @@ import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
 import {
 	DailyStatus,
 	EventRow,
+	ForecastRow,
 	HandStatus,
 	MetaResult,
+	NavRow,
+	OperatorAction,
+	OperatorActionsResult,
+	PaperPositionRow,
+	ResearchTreeDetail,
+	ResearchTreeNode,
+	ResearchTreeRow,
 	TaskRow,
+	TriageResult,
 	errMsg,
 	fmtClock,
 	fmtCountdown,
 	fmtElapsed,
+	isMissingEndpoint,
 	sgtDate,
 } from "./api";
 import type InstituteOnePlugin from "./main";
@@ -61,10 +71,43 @@ const DAILY_STATUS_ZH: Record<string, string> = {
 	failed: "失败",
 	pending: "待运行",
 };
+const FORECAST_DIRECTION_ZH: Record<string, string> = {
+	long: "看多",
+	short: "看空",
+	neutral: "中性",
+};
+const FORECAST_STATUS_ZH: Record<string, string> = {
+	open: "待结算",
+	settled: "已结算",
+	invalid: "无效",
+};
+const FORECAST_VERDICT_ZH: Record<string, string> = {
+	hit: "命中",
+	miss: "落空",
+	partial: "部分命中",
+	invalid: "无效",
+};
+const TREE_STATUS_ZH: Record<string, string> = {
+	pending: "待探索",
+	exploring: "探索中",
+	completed: "已完成",
+	stopped: "已停止",
+	failed: "失败",
+};
+const TREE_NODE_STATUS_ZH: Record<string, string> = {
+	pending: "待处理",
+	running: "运行中",
+	completed: "已完成",
+	failed: "失败",
+	pruned: "已剪枝",
+};
 
 export class InstituteDashboardView extends ItemView {
 	private plugin: InstituteOnePlugin;
 	private refreshing = false;
+	/** details sections expanded at least once — collapsed ones are not fetched
+	 * before their first expand (see watchExtra) */
+	private extrasOpened = new Set<string>();
 
 	// events cursor (durable ids from the backend events table)
 	private cursor = 0;
@@ -78,6 +121,22 @@ export class InstituteDashboardView extends ItemView {
 	private dailyEl!: HTMLElement;
 	private runningEl!: HTMLElement;
 	private eventsEl!: HTMLElement;
+	// collapsible extras (hidden entirely when the backend lacks the endpoints)
+	private inboxWrapEl!: HTMLDetailsElement;
+	private inboxSummaryEl!: HTMLElement;
+	private inboxBodyEl!: HTMLElement;
+	private forecastsWrapEl!: HTMLDetailsElement;
+	private forecastsSummaryEl!: HTMLElement;
+	private forecastsBodyEl!: HTMLElement;
+	private treesWrapEl!: HTMLDetailsElement;
+	private treesSummaryEl!: HTMLElement;
+	private treesBodyEl!: HTMLElement;
+	private triageWrapEl!: HTMLDetailsElement;
+	private triageSummaryEl!: HTMLElement;
+	private triageBodyEl!: HTMLElement;
+	private bookWrapEl!: HTMLDetailsElement;
+	private bookSummaryEl!: HTMLElement;
+	private bookBodyEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: InstituteOnePlugin) {
 		super(leaf);
@@ -120,6 +179,25 @@ export class InstituteDashboardView extends ItemView {
 		this.handsEl = this.section(root, "执行手");
 		this.dailyEl = this.section(root, "今日日报");
 		this.runningEl = this.section(root, "进行中");
+
+		[this.inboxWrapEl, this.inboxSummaryEl, this.inboxBodyEl] =
+			this.collapsible(root, "Operator 收件箱");
+		[this.forecastsWrapEl, this.forecastsSummaryEl, this.forecastsBodyEl] =
+			this.collapsible(root, "预测账本速览");
+		[this.treesWrapEl, this.treesSummaryEl, this.treesBodyEl] =
+			this.collapsible(root, "研究树监控");
+		[this.triageWrapEl, this.triageSummaryEl, this.triageBodyEl] =
+			this.collapsible(root, "操作台 triage");
+		[this.bookWrapEl, this.bookSummaryEl, this.bookBodyEl] =
+			this.collapsible(root, "纸面账本");
+
+		// collapsed <details> fetch nothing until their first expand
+		this.watchExtra("inbox", this.inboxWrapEl, () => this.refreshOperatorInbox());
+		this.watchExtra("forecasts", this.forecastsWrapEl, () => this.refreshForecasts());
+		this.watchExtra("trees", this.treesWrapEl, () => this.refreshResearchTrees());
+		this.watchExtra("triage", this.triageWrapEl, () => this.refreshTriage());
+		this.watchExtra("book", this.bookWrapEl, () => this.refreshBook());
+
 		this.eventsEl = this.section(root, "最近事件");
 
 		// quick actions
@@ -133,8 +211,9 @@ export class InstituteDashboardView extends ItemView {
 		this.actionButton(actions, "路线图", () => void this.plugin.activateRoadmap());
 		this.actionButton(actions, "打开操作台", () => this.plugin.openOperatorUi());
 
-		// auto-poll while visible; registerInterval is cleared when the view unloads
-		void this.refresh();
+		// auto-poll while visible (isShown() === false skips the fetch);
+		// registerInterval is cleared when the view unloads
+		void this.refresh(true); // first paint even if the leaf is still attaching
 		const everyMs = Math.max(5, this.plugin.settings.pollIntervalS || 10) * 1000;
 		this.registerInterval(window.setInterval(() => void this.refresh(), everyMs));
 	}
@@ -157,6 +236,34 @@ export class InstituteDashboardView extends ItemView {
 		return wrap.createDiv();
 	}
 
+	/**
+	 * Collapsible section built ONCE (a native <details> keeps its open state
+	 * across refreshes because we only rewrite summary/body contents).
+	 * Returns [wrap, summaryText, body]; hide `wrap` when the backend lacks
+	 * the endpoint.
+	 */
+	private collapsible(
+		root: HTMLElement,
+		title: string,
+	): [HTMLDetailsElement, HTMLElement, HTMLElement] {
+		const wrap = root.createEl("details");
+		wrap.style.marginBottom = "12px";
+		const summary = wrap.createEl("summary");
+		summary.style.cursor = "pointer";
+		summary.style.listStyle = "revert";
+		const label = summary.createSpan({ text: title });
+		label.style.fontWeight = "600";
+		label.style.fontSize = "11px";
+		label.style.letterSpacing = "0.05em";
+		label.style.color = "var(--text-muted)";
+		const summaryText = summary.createSpan({ text: "" });
+		summaryText.style.fontSize = "12px";
+		summaryText.style.marginLeft = "6px";
+		const body = wrap.createDiv();
+		body.style.padding = "4px 0 0 12px";
+		return [wrap, summaryText, body];
+	}
+
 	private actionButton(parent: HTMLElement, text: string, onClick: () => void): void {
 		const btn = parent.createEl("button", { text });
 		btn.addEventListener("click", onClick);
@@ -177,13 +284,32 @@ export class InstituteDashboardView extends ItemView {
 
 	// ---- polling ---------------------------------------------------------------
 
-	private async refresh(): Promise<void> {
+	/**
+	 * Lazy-load a collapsible section: a collapsed <details> is not fetched
+	 * until the user expands it the first time; afterwards the regular poll
+	 * keeps it fresh (also when re-collapsed).
+	 */
+	private watchExtra(key: string, wrap: HTMLDetailsElement, load: () => Promise<void>): void {
+		wrap.addEventListener("toggle", () => {
+			if (wrap.open && !this.extrasOpened.has(key)) {
+				this.extrasOpened.add(key);
+				void load();
+			}
+		});
+	}
+
+	private extraReady(key: string, wrap: HTMLDetailsElement): boolean {
+		return wrap.open || this.extrasOpened.has(key);
+	}
+
+	private async refresh(force = false): Promise<void> {
 		if (this.refreshing) return;
+		if (!force && !this.containerEl.isShown()) return; // hidden leaf: skip the network round
 		this.refreshing = true;
 		try {
 			let meta: MetaResult;
 			try {
-				meta = await this.plugin.api.meta();
+				meta = await this.plugin.getMeta();
 			} catch (e) {
 				this.bannerEl.style.display = "block";
 				this.bannerEl.setText(
@@ -204,12 +330,20 @@ export class InstituteDashboardView extends ItemView {
 			}
 
 			const [daily, running, queued] = await Promise.all([
-				this.plugin.api.dailyStatus().catch(() => null),
+				this.plugin.getDailyStatus().catch(() => null),
 				this.plugin.api.listTasks("running").catch(() => [] as TaskRow[]),
 				this.plugin.api.listTasks("queued").catch(() => [] as TaskRow[]),
 			]);
 			this.renderDaily(daily);
 			this.renderRunning(running, queued);
+
+			await Promise.all([
+				this.refreshOperatorInbox(),
+				this.refreshForecasts(),
+				this.refreshResearchTrees(),
+				this.refreshTriage(),
+				this.refreshBook(),
+			]);
 
 			try {
 				await this.pollEvents();
@@ -220,6 +354,205 @@ export class InstituteDashboardView extends ItemView {
 		} finally {
 			this.refreshing = false;
 		}
+	}
+
+	// ---- Operator 收件箱（裁决仍只在 SPA 中进行） ------------------------------------
+
+	private async refreshOperatorInbox(): Promise<void> {
+		if (!this.extraReady("inbox", this.inboxWrapEl)) return;
+		let result: OperatorActionsResult;
+		try {
+			result = await this.plugin.api.operatorActions("open", 1000);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.inboxWrapEl.style.display = "none";
+			} else {
+				this.inboxWrapEl.style.display = "";
+				this.inboxSummaryEl.setText("（获取失败）");
+				this.inboxBodyEl.empty();
+				this.muted(this.inboxBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.inboxWrapEl.style.display = "";
+		this.inboxBodyEl.empty();
+
+		const count = result.count;
+		this.inboxSummaryEl.setText(`${count >= 1000 ? "1000+" : count} 待裁决`);
+		this.inboxSummaryEl.style.color =
+			count > 0 ? "var(--color-orange)" : "var(--text-muted)";
+
+		if (!result.actions.length) {
+			this.muted(this.inboxBodyEl, "没有待裁决 action。");
+			return;
+		}
+		for (const action of result.actions.slice(0, 5)) {
+			const line = this.inboxBodyEl.createDiv({
+				text: `${action.priority > 1 ? "⚠️ " : ""}${action.title}`,
+			});
+			line.style.padding = "2px 0";
+			line.style.color = "var(--text-accent)";
+			line.style.cursor = "pointer";
+			line.setAttribute("title", "在 Web 操作台中处理");
+			line.addEventListener("click", () => this.openOperatorAction(action));
+		}
+		if (count > 5) {
+			this.muted(this.inboxBodyEl, `… 还有 ${count - 5} 条，点击标题前往操作台`);
+		}
+	}
+
+	private openOperatorAction(action: OperatorAction): void {
+		new Notice(`Institute: action #${action.id} 的裁决只在 Web 操作台进行。`, 5000);
+		window.open(`${this.plugin.api.baseUrl()}/operator`);
+	}
+
+	// ---- 预测账本速览（API 无 stats；聚合近 5 条的 detail verdict） ----------------------
+
+	private async refreshForecasts(): Promise<void> {
+		if (!this.extraReady("forecasts", this.forecastsWrapEl)) return;
+		let rows: ForecastRow[];
+		try {
+			const recent = await this.plugin.api.forecasts(5);
+			rows = await Promise.all(
+				recent.map((row) =>
+					row.status === "open" ? Promise.resolve(row) : this.plugin.api.forecast(row.id),
+				),
+			);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.forecastsWrapEl.style.display = "none";
+			} else {
+				this.forecastsWrapEl.style.display = "";
+				this.forecastsSummaryEl.setText("（获取失败）");
+				this.forecastsBodyEl.empty();
+				this.muted(this.forecastsBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.forecastsWrapEl.style.display = "";
+		this.forecastsBodyEl.empty();
+
+		const evaluated = rows.filter(
+			(row) => row.settlement && row.settlement.verdict !== "invalid",
+		);
+		const hits = evaluated.filter((row) => row.settlement?.verdict === "hit").length;
+		const partial = evaluated.filter((row) => row.settlement?.verdict === "partial").length;
+		const rate = evaluated.length ? `${Math.round((hits / evaluated.length) * 100)}%` : "—";
+		this.forecastsSummaryEl.setText(
+			`近 ${rows.length} 条 · 命中率 ${rate}` +
+				(evaluated.length ? `（${hits}/${evaluated.length}）` : ""),
+		);
+		this.forecastsSummaryEl.style.color = "var(--text-muted)";
+
+		if (!rows.length) {
+			this.muted(this.forecastsBodyEl, "还没有预测记录。");
+			return;
+		}
+		for (const row of rows) {
+			const verdict = row.settlement?.verdict;
+			const state = verdict
+				? (FORECAST_VERDICT_ZH[verdict] ?? verdict)
+				: (FORECAST_STATUS_ZH[row.status] ?? row.status);
+			const direction = FORECAST_DIRECTION_ZH[row.direction] ?? row.direction;
+			const date = sgtDate(row.made_at) ?? "";
+			const line = this.forecastsBodyEl.createDiv({
+				text: `${direction} · ${row.claim}${date ? ` · ${date}` : ""} · ${state}`,
+			});
+			line.style.padding = "1px 0";
+			line.setAttribute("title", row.claim);
+		}
+		const denominator = `口径：近 5 条中的命中/落空/部分命中，invalid 不计`;
+		this.muted(
+			this.forecastsBodyEl,
+			partial > 0 ? `${denominator}；部分命中 ${partial}` : denominator,
+		);
+	}
+
+	// ---- 研究树监控 ----------------------------------------------------------------
+
+	private async refreshResearchTrees(): Promise<void> {
+		if (!this.extraReady("trees", this.treesWrapEl)) return;
+		let active: ResearchTreeRow[];
+		let activeTruncated = false;
+		let detail: ResearchTreeDetail | null;
+		let latest: ResearchTreeRow | null;
+		try {
+			const [pending, exploring] = await Promise.all([
+				this.plugin.api.researchTrees("pending", 200),
+				this.plugin.api.researchTrees("exploring", 200),
+			]);
+			active = [...pending, ...exploring].sort((a, b) =>
+				b.created_at.localeCompare(a.created_at),
+			);
+			activeTruncated = pending.length >= 200 || exploring.length >= 200;
+			if (active.length) {
+				latest = active[0];
+			} else {
+				const recent = await this.plugin.api.researchTrees(undefined, 1);
+				latest = recent[0] ?? null;
+			}
+			detail = latest ? await this.plugin.api.researchTree(latest.id) : null;
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.treesWrapEl.style.display = "none";
+			} else {
+				this.treesWrapEl.style.display = "";
+				this.treesSummaryEl.setText("（获取失败）");
+				this.treesBodyEl.empty();
+				this.muted(this.treesBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.treesWrapEl.style.display = "";
+		this.treesBodyEl.empty();
+
+		this.treesSummaryEl.setText(
+			`${active.length}${activeTruncated ? "+" : ""} 活跃` +
+				(detail ? ` · 最新 ${TREE_STATUS_ZH[detail.status] ?? detail.status}` : ""),
+		);
+		this.treesSummaryEl.style.color =
+			active.length > 0 ? "var(--color-green)" : "var(--text-muted)";
+
+		if (!latest || !detail) {
+			this.muted(this.treesBodyEl, "还没有研究树。");
+			return;
+		}
+		const progress = `${latest.nodes_completed ?? 0}/${latest.nodes_total ?? detail.nodes.length}`;
+		const treeLine = this.treesBodyEl.createDiv({
+			text: `${detail.root_topic} · 节点 ${progress}`,
+		});
+		treeLine.style.padding = "1px 0";
+
+		const latestNode = this.latestTreeNode(detail.nodes);
+		if (latestNode) {
+			const state = TREE_NODE_STATUS_ZH[latestNode.status] ?? latestNode.status;
+			const nodeLine = this.treesBodyEl.createDiv({
+				text: `最新节点：${latestNode.topic} · ${state}`,
+			});
+			nodeLine.style.padding = "1px 0";
+			nodeLine.style.color =
+				latestNode.status === "failed"
+					? "var(--color-red)"
+					: latestNode.status === "running"
+						? "var(--color-green)"
+						: "";
+		} else {
+			this.muted(this.treesBodyEl, "该树尚无节点。");
+		}
+	}
+
+	private latestTreeNode(nodes: ResearchTreeNode[]): ResearchTreeNode | null {
+		let latest: ResearchTreeNode | null = null;
+		let latestAt = Number.NEGATIVE_INFINITY;
+		for (const node of nodes) {
+			const at = Date.parse(node.finished_at ?? node.created_at);
+			const rank = Number.isNaN(at) ? 0 : at;
+			if (rank >= latestAt) {
+				latest = node;
+				latestAt = rank;
+			}
+		}
+		return latest;
 	}
 
 	// ---- 状态 / 队列 / 执行手 -----------------------------------------------------
@@ -335,9 +668,146 @@ export class InstituteDashboardView extends ItemView {
 	private async runAllDailies(): Promise<void> {
 		try {
 			await this.plugin.api.runAllDailies();
+			this.plugin.invalidateStatusCaches();
 			new Notice("Institute: 已启动全员日报（后台运行，完成后自动导出）。", 6000);
 		} catch (e) {
 			new Notice(`Institute: 启动全员日报失败 — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	// ---- 操作台 triage（Phase 6；旧后端 404 时整块隐藏） -------------------------------
+
+	private async refreshTriage(): Promise<void> {
+		if (!this.extraReady("triage", this.triageWrapEl)) return;
+		let t: TriageResult;
+		try {
+			t = await this.plugin.api.triage();
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.triageWrapEl.style.display = "none";
+			} else {
+				this.triageWrapEl.style.display = "";
+				this.triageSummaryEl.setText("（获取失败）");
+				this.triageBodyEl.empty();
+				this.muted(this.triageBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.triageWrapEl.style.display = "";
+		this.triageBodyEl.empty();
+
+		const open = t.actions?.open ?? 0;
+		const paused = t.maintenance?.paused === true;
+		this.triageSummaryEl.setText(
+			`${open} 待处理 · ${paused ? "维护中 ⏸" : "运行中"}`,
+		);
+		this.triageSummaryEl.style.color = paused
+			? "var(--color-orange)"
+			: open > 0
+				? "var(--color-orange)"
+				: "var(--text-muted)";
+
+		const line = (text: string, warn = false) => {
+			const el = this.triageBodyEl.createDiv({ text });
+			el.style.padding = "1px 0";
+			if (warn) el.style.color = "var(--color-orange)";
+			return el;
+		};
+
+		if (paused) {
+			line(`维护暂停中 — 排队深度 ${t.maintenance?.drain_depth ?? 0}`, true);
+		}
+		const byKind = t.actions?.open_by_kind ?? {};
+		const kinds = Object.entries(byKind).sort((a, b) => b[1] - a[1]);
+		if (kinds.length) {
+			line(`待处理 action：${kinds.map(([k, n]) => `${k} ${n}`).join(" · ")}`);
+		} else {
+			line("没有待处理 action。");
+		}
+		const failing = t.cron?.failing ?? [];
+		if (failing.length) {
+			line(`失败的定时任务：${failing.join("、")}`, true);
+		}
+		const conflicts = t.vault?.conflicts ?? 0;
+		if (conflicts > 0) {
+			line(`vault 冲突笔记：${conflicts}`, true);
+		}
+		const switches = Object.entries(t.feature_switches ?? {});
+		const off = switches.filter(([, v]) => !v).map(([k]) => k);
+		if (off.length) {
+			line(`已关闭的开关：${off.join("、")}`);
+		}
+	}
+
+	// ---- 纸面账本（paper book；旧后端 404 时整块隐藏） -----------------------------------
+
+	private async refreshBook(): Promise<void> {
+		if (!this.extraReady("book", this.bookWrapEl)) return;
+		let nav: NavRow[];
+		let positions: PaperPositionRow[];
+		try {
+			[nav, positions] = await Promise.all([
+				this.plugin.api.bookNav(30),
+				this.plugin.api.bookPositions("open"),
+			]);
+		} catch (e) {
+			if (isMissingEndpoint(e)) {
+				this.bookWrapEl.style.display = "none";
+			} else {
+				this.bookWrapEl.style.display = "";
+				this.bookSummaryEl.setText("（获取失败）");
+				this.bookBodyEl.empty();
+				this.muted(this.bookBodyEl, errMsg(e).slice(0, 120));
+			}
+			return;
+		}
+		this.bookWrapEl.style.display = "";
+		this.bookBodyEl.empty();
+
+		const latest = nav.length ? nav[nav.length - 1] : null;
+		const fmtNav = (v: number | null | undefined) =>
+			v == null || !Number.isFinite(v) ? "—" : v.toFixed(4);
+		this.bookSummaryEl.setText(
+			latest
+				? `NAV ${fmtNav(latest.nav)} · 持仓 ${positions.length}`
+				: `尚无 NAV · 持仓 ${positions.length}`,
+		);
+		this.bookSummaryEl.style.color =
+			latest && latest.nav < 1 ? "var(--color-red)" : "var(--text-muted)";
+
+		const line = (text: string, warn = false) => {
+			const el = this.bookBodyEl.createDiv({ text });
+			el.style.padding = "1px 0";
+			if (warn) el.style.color = "var(--color-orange)";
+			return el;
+		};
+
+		if (latest) {
+			line(
+				`${latest.work_date} · NAV ${fmtNav(latest.nav)}` +
+					(latest.benchmark_nav != null
+						? ` · 基准 ${fmtNav(latest.benchmark_nav)}`
+						: "") +
+					` · 累计已实现 ${fmtNav(latest.realized_pnl_cum)}`,
+			);
+			if (latest.n_unpriced > 0) {
+				line(`⚠️ ${latest.n_unpriced} 个仓位无法定价（NAV 为部分口径）`, true);
+			}
+		} else {
+			line("MTM 任务尚未写入 NAV 历史。");
+		}
+		if (positions.length) {
+			for (const p of positions.slice(0, 6)) {
+				const dir = p.direction === "short" ? "空" : "多";
+				line(
+					`${dir} ${p.security_id ?? "?"} @ ${p.entry_price} · ${p.entry_date}`,
+				);
+			}
+			if (positions.length > 6) {
+				this.muted(this.bookBodyEl, `… 还有 ${positions.length - 6} 个持仓`);
+			}
+		} else {
+			line("当前无未平仓位。");
 		}
 	}
 
@@ -386,6 +856,7 @@ export class InstituteDashboardView extends ItemView {
 					: `Institute: 任务 ${taskId} 无法取消（可能已结束）。`,
 				5000,
 			);
+			this.plugin.invalidateStatusCaches();
 			void this.refresh();
 		} catch (e) {
 			new Notice(`Institute: 取消失败 — ${errMsg(e)}`, 8000);

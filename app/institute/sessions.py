@@ -8,19 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .. import bus, db
 from ..config import get_settings
+from ..util import new_id
 
 log = logging.getLogger("institute.sessions")
 
 
 async def create_session(title: str, kind: str = "chat", analyst_id: str | None = None) -> dict[str, Any]:
-    session_id = uuid.uuid4().hex[:12]
+    session_id = new_id()
     workspace = get_settings().workspaces_dir / "sessions" / session_id
     workspace.mkdir(parents=True, exist_ok=True)
     now = bus.now_iso()
@@ -69,8 +69,22 @@ async def get_message(message_id: int) -> dict[str, Any] | None:
     return await db.query_one("SELECT * FROM messages WHERE id = ?", (message_id,))
 
 
-async def list_messages(session_id: str) -> list[dict[str, Any]]:
-    return await db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY id ASC", (session_id,))
+async def list_messages(session_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    """Most recent ``limit`` messages, returned oldest-first (id ASC).
+
+    An unbounded read pulled a session's entire history into memory on every
+    poll; 500 covers any human-readable backlog. The response shape is
+    unchanged — a plain ascending list — so the API / MCP / SPA consumers
+    need no pagination contract (a session past the cap simply shows its
+    newest 500). ``max(limit, 0)`` because SQLite treats LIMIT -1 as
+    "no limit" — exactly the unbounded read this guard exists to remove.
+    """
+    rows = await db.query(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+        (session_id, max(limit, 0)),
+    )
+    rows.reverse()
+    return rows
 
 
 # ---- workspace ----------------------------------------------------------

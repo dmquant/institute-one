@@ -194,7 +194,8 @@ export interface RoadmapDependencyRow {
 	depends_on_status: string | null;
 }
 
-/** roadmap_coding_sessions row; GET /api/roadmap/sessions adds n_commands */
+/** roadmap_coding_sessions row; GET /api/roadmap/sessions adds n_commands,
+ * GET /api/roadmap/process additionally joins card_title */
 export interface RoadmapSession {
 	id: string;
 	card_id: string;
@@ -207,6 +208,7 @@ export interface RoadmapSession {
 	started_at: string;
 	finished_at: string | null;
 	n_commands?: number;
+	card_title?: string;
 }
 
 /** GET /api/roadmap/cards/{id} — also returned by POST …/move */
@@ -237,6 +239,223 @@ export interface RoadmapReleaseGate {
 	remaining: string[];
 }
 
+/** roadmap_decisions row; GET /api/roadmap/process joins card_title */
+export interface RoadmapDecision {
+	id: string;
+	card_id: string | null;
+	title: string;
+	question: string;
+	options: string[];
+	decision: string | null;
+	status: string; // open | resolved
+	created_at: string;
+	resolved_at: string | null;
+	card_title?: string | null;
+}
+
+/** GET /api/roadmap/process — release-gate readiness (card status + evidence) */
+export interface RoadmapProcessGate {
+	gate: string;
+	description: string;
+	prefixes: string[];
+	cards_total: number;
+	cards_done: number;
+	/** scoped cards carrying at least one pass-verdict evidence row */
+	evidence_ready: number;
+	/** not-done scoped cards blocked by blocked_reason or open dependencies */
+	blockers: string[];
+	ready: boolean;
+}
+
+/** GET /api/roadmap/process — blocked card row (visible without opening the card) */
+export interface RoadmapBlockedCard {
+	id: string;
+	title: string;
+	phase: string;
+	status: string;
+	owner: string | null;
+	blocked_reason: string | null;
+	open_dependencies: string[];
+}
+
+/** GET /api/roadmap/process — institute.roadmap.process_overview() (M7-006) */
+export interface RoadmapProcessOverview {
+	active_sessions: RoadmapSession[];
+	open_decisions: RoadmapDecision[];
+	release_gates: RoadmapProcessGate[];
+	blocked_cards: RoadmapBlockedCard[];
+}
+
+/** POST /api/meta/claim_check_before_write hit (institute.factcheck.claim_check) */
+export interface ClaimCheckHit {
+	fact_card_id: string;
+	claim: string;
+	category: string;
+	verdict: string; // VERIFIED | DISPUTED
+	similarity: number; // cosine or keyword-overlap, 0..1
+	source: string; // vector | keyword
+}
+
+/** POST /api/meta/claim_check_before_write — never raises server-side */
+export interface ClaimCheckResult {
+	mode: string; // none | vector+keyword | keyword | error
+	hits: ClaimCheckHit[];
+}
+
+/** GET /api/operator/triage — one aggregate for the triage panel */
+export interface TriageResult {
+	maintenance?: {
+		paused?: boolean;
+		drain_depth?: number;
+		queue?: { by_status?: Record<string, number> };
+	};
+	feature_switches?: Record<string, boolean>;
+	hand_weights?: { configured?: number; by_scope?: Record<string, Record<string, number>> };
+	cron?: { window_days?: number; jobs?: number; failing?: string[] };
+	vault?: { ledger_total?: number; conflicts?: number };
+	actions?: {
+		by_status?: Record<string, number>;
+		open_by_kind?: Record<string, number>;
+		open?: number;
+	};
+}
+
+/** GET /api/operator/actions — operator_actions rows with dispositions inlined. */
+export type OperatorActionStatus = "open" | "in_progress" | "done" | "dismissed";
+
+export interface OperatorActionDisposition {
+	id: number;
+	action_id: number;
+	proposed_by: string;
+	disposition: string;
+	confidence: number | null;
+	shadow: number;
+	flags: string;
+	created_at: string;
+}
+
+export interface OperatorAction {
+	id: number;
+	kind: string;
+	ref: string;
+	title: string;
+	detail: string;
+	status: OperatorActionStatus;
+	priority: number;
+	created_at: string;
+	updated_at: string;
+	resolved_at: string | null;
+	resolution: string | null;
+	dispositions: OperatorActionDisposition[];
+}
+
+export interface OperatorActionsResult {
+	actions: OperatorAction[];
+	count: number;
+}
+
+/** GET /api/book/nav — nav_history rows, ascending by work_date */
+export interface NavRow {
+	work_date: string;
+	nav: number;
+	benchmark_nav: number | null;
+	gross_exposure: number;
+	n_open: number;
+	n_unpriced: number;
+	realized_pnl_cum: number;
+}
+
+/** GET /api/book/positions — paper_positions rows */
+export interface PaperPositionRow {
+	id: string;
+	forecast_id: string;
+	security_id: string | null;
+	direction: string; // long | short
+	entry_date: string;
+	entry_price: number;
+	size: number;
+	status: string; // open | closed
+	opened_at: string;
+	closed_at: string | null;
+	close_reason: string | null;
+	close_price: number | null;
+	realized_pnl: number | null;
+}
+
+/** GET /api/forecasts — forecast ledger row. The settlement row is inlined
+ * on BOTH list and detail responses (full row or null). */
+export interface ForecastRow {
+	id: string;
+	thesis_id: string;
+	security_id: string | null;
+	claim: string;
+	direction: "long" | "short" | "neutral";
+	conviction: number | null;
+	horizon_days: number;
+	settlement_rule: { type: string; threshold?: number; benchmark_id?: string } | string;
+	made_at: string;
+	expires_at: string;
+	status: "open" | "settled" | "invalid";
+	created_at: string;
+	updated_at: string;
+	settlement?: ForecastSettlement | null;
+}
+
+/** forecast_settlements row — inlined as `settlement` on forecast responses. */
+export interface ForecastSettlement {
+	id: string;
+	forecast_id: string;
+	verdict: "hit" | "miss" | "partial" | "invalid";
+	settled_at: string;
+	benchmark_return: number | null;
+	actual_return: number | null;
+	note: string;
+	created_at: string;
+}
+
+/** GET /api/research/trees — list row with node-count aggregates. */
+export type ResearchTreeStatus = "pending" | "exploring" | "completed" | "stopped" | "failed";
+export type ResearchTreeNodeStatus = "pending" | "running" | "completed" | "failed" | "pruned";
+
+export interface ResearchTreeRow {
+	id: string;
+	root_topic: string;
+	status: ResearchTreeStatus;
+	max_depth: number;
+	max_nodes: number;
+	created_at: string;
+	finished_at: string | null;
+	announced_at: string | null;
+	nodes_total?: number;
+	nodes_completed?: number;
+}
+
+export interface ResearchTreeNode {
+	id: string;
+	tree_id: string;
+	parent_id: string | null;
+	depth: number;
+	topic: string;
+	question: string;
+	status: ResearchTreeNodeStatus;
+	task_id: string | null;
+	summary: string | null;
+	score: number | null;
+	created_at: string;
+	finished_at: string | null;
+}
+
+export interface ResearchTreeDetail extends ResearchTreeRow {
+	nodes: ResearchTreeNode[];
+}
+
+/** One NDJSON frame from POST /api/ask/stream (app/api/ask_stream.py) */
+export interface AskStreamFrame {
+	type: string; // stdout | stderr | status | done
+	text?: string;
+	task?: AskTask;
+}
+
 // ---------------------------------------------------------------------------
 // Small shared helpers
 // ---------------------------------------------------------------------------
@@ -254,6 +473,16 @@ export class ApiError extends Error {
 	) {
 		super(message);
 	}
+}
+
+/**
+ * True when an error means "this backend doesn't serve that endpoint yet"
+ * (plugin newer than backend): unknown route (404), wrong method on an
+ * existing prefix (405), or an explicit not-implemented (501). Callers hide
+ * the feature or show a "后端未启用" notice instead of an error.
+ */
+export function isMissingEndpoint(e: unknown): boolean {
+	return e instanceof ApiError && (e.status === 404 || e.status === 405 || e.status === 501);
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -374,10 +603,18 @@ export function researchStatusIcon(status: string): string {
 // ---------------------------------------------------------------------------
 
 export class InstituteApi {
-	constructor(private getBaseUrl: () => string) {}
+	constructor(
+		private getBaseUrl: () => string,
+		private getToken: () => string,
+	) {}
 
 	baseUrl(): string {
 		return this.getBaseUrl().replace(/\/+$/, "");
+	}
+
+	private authHeaders(): Record<string, string> | undefined {
+		const token = this.getToken().trim();
+		return token ? { Authorization: `Bearer ${token}` } : undefined;
 	}
 
 	/** JSON request with a hard timeout (default 10s). Never uses fetch. */
@@ -391,6 +628,7 @@ export class InstituteApi {
 			requestUrl({
 				url,
 				method,
+				headers: this.authHeaders(),
 				contentType: opts.body !== undefined ? "application/json" : undefined,
 				body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
 				throw: false,
@@ -408,6 +646,23 @@ export class InstituteApi {
 			throw new ApiError(`HTTP ${resp.status} — ${detail.slice(0, 300)}`, resp.status);
 		}
 		return resp.json as T;
+	}
+
+	/** Plain-text GET (the /api/institute/*.md digests return text/markdown). */
+	async requestText(path: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string> {
+		const url = this.baseUrl() + path;
+		const resp = await withTimeout(
+			requestUrl({ url, method: "GET", headers: this.authHeaders(), throw: false }),
+			timeoutMs,
+			`GET ${path}`,
+		);
+		if (resp.status >= 400) {
+			throw new ApiError(
+				`HTTP ${resp.status} — ${(resp.text ?? "").slice(0, 300)}`,
+				resp.status,
+			);
+		}
+		return resp.text ?? "";
 	}
 
 	// ---- meta / status -----------------------------------------------------
@@ -494,10 +749,13 @@ export class InstituteApi {
 		});
 	}
 
-	archiveSearch(q: string, limit = 15): Promise<ArchiveHit[]> {
-		return this.request<ArchiveHit[]>(
+	async archiveSearch(q: string, limit = 15): Promise<ArchiveHit[]> {
+		// backend now returns {mode, results} (vector-search upgrade); keep the
+		// ArchiveHit[] contract for callers
+		const resp = await this.request<{ mode: string; results: ArchiveHit[] }>(
 			`/api/archive/search?q=${encodeURIComponent(q)}&limit=${limit}`,
 		);
+		return resp.results ?? [];
 	}
 
 	// ---- roadmap -----------------------------------------------------------------
@@ -584,6 +842,18 @@ export class InstituteApi {
 		return this.request<RoadmapReleaseGate[]>("/api/roadmap/release-gates");
 	}
 
+	/** GET /api/roadmap/cards/{id}/prompt — deterministic agent prompt (M7-007). */
+	cardPrompt(cardId: string): Promise<{ prompt: string }> {
+		return this.request<{ prompt: string }>(
+			`/api/roadmap/cards/${encodeURIComponent(cardId)}/prompt`,
+		);
+	}
+
+	/** GET /api/roadmap/process — sessions + decisions + gates + blocked cards (M7-006). */
+	processOverview(): Promise<RoadmapProcessOverview> {
+		return this.request<RoadmapProcessOverview>("/api/roadmap/process");
+	}
+
 	// ---- events ------------------------------------------------------------------
 
 	events(since: number, limit: number, types?: string): Promise<EventRow[]> {
@@ -600,6 +870,97 @@ export class InstituteApi {
 	vaultIndex(state: string, limit = 200): Promise<VaultIndexRow[]> {
 		return this.request<VaultIndexRow[]>(
 			`/api/vault/index?state=${encodeURIComponent(state)}&limit=${limit}`,
+		);
+	}
+
+	// ---- fact-check (Phase 3) --------------------------------------------------
+
+	/** POST /api/meta/claim_check_before_write — writing-time claim check. */
+	claimCheck(text: string, k = 8): Promise<ClaimCheckResult> {
+		return this.request<ClaimCheckResult>("/api/meta/claim_check_before_write", {
+			method: "POST",
+			// backend caps text at 20K (422 above it) — pre-slice so a huge
+			// paragraph degrades to a partial check instead of an error
+			body: { text: text.slice(0, 20000), k },
+			timeoutMs: 30_000, // embedding leg can be slow on first call
+		});
+	}
+
+	// ---- operator triage (Phase 6) ----------------------------------------------
+
+	/** GET /api/operator/triage — maintenance/actions/cron/vault aggregate. */
+	triage(): Promise<TriageResult> {
+		return this.request<TriageResult>("/api/operator/triage");
+	}
+
+	/** GET /api/operator/actions — `open` is the backend's pending-inbox state. */
+	operatorActions(
+		status: OperatorActionStatus = "open",
+		limit = 1000,
+	): Promise<OperatorActionsResult> {
+		return this.request<OperatorActionsResult>(
+			`/api/operator/actions?status=${encodeURIComponent(status)}&limit=${limit}`,
+		);
+	}
+
+	// ---- paper book ---------------------------------------------------------------
+
+	/** GET /api/book/nav — nav_history rows ascending; last row = latest NAV. */
+	bookNav(days = 30): Promise<NavRow[]> {
+		return this.request<NavRow[]>(`/api/book/nav?days=${days}`);
+	}
+
+	/** GET /api/book/positions?status=open — open paper positions. */
+	bookPositions(status = "open", limit = 200): Promise<PaperPositionRow[]> {
+		return this.request<PaperPositionRow[]>(
+			`/api/book/positions?status=${encodeURIComponent(status)}&limit=${limit}`,
+		);
+	}
+
+	// ---- forecasts ----------------------------------------------------------------
+
+	/** GET /api/forecasts — newest first. */
+	forecasts(limit = 5): Promise<ForecastRow[]> {
+		return this.request<ForecastRow[]>(`/api/forecasts?limit=${limit}`);
+	}
+
+	/** GET /api/forecasts/{id} — includes the settlement row. */
+	forecast(forecastId: string): Promise<ForecastRow> {
+		return this.request<ForecastRow>(
+			`/api/forecasts/${encodeURIComponent(forecastId)}`,
+		);
+	}
+
+	// ---- research trees -----------------------------------------------------------
+
+	researchTrees(status?: ResearchTreeStatus, limit = 200): Promise<ResearchTreeRow[]> {
+		const q = status
+			? `?status=${encodeURIComponent(status)}&limit=${limit}`
+			: `?limit=${limit}`;
+		return this.request<ResearchTreeRow[]>(`/api/research/trees${q}`);
+	}
+
+	researchTree(treeId: string): Promise<ResearchTreeDetail> {
+		return this.request<ResearchTreeDetail>(
+			`/api/research/tree/${encodeURIComponent(treeId)}`,
+		);
+	}
+
+	// ---- digests (/api/institute/*.md — text/markdown) ---------------------------
+
+	digestRecentReports(days = 7): Promise<string> {
+		return this.requestText(`/api/institute/recent-reports.md?days=${days}`);
+	}
+
+	digestAnalystMemory(analystId: string): Promise<string> {
+		return this.requestText(
+			`/api/institute/analyst-memory/${encodeURIComponent(analystId)}.md`,
+		);
+	}
+
+	digestAnalystDisputes(analystId: string): Promise<string> {
+		return this.requestText(
+			`/api/institute/analyst-disputes/${encodeURIComponent(analystId)}.md`,
 		);
 	}
 }

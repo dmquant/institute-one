@@ -41,7 +41,9 @@ class OllamaHand(Hand):
             "stream": False,
         }
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
+            # trust_env=False: ollama is a loopback service — the machine-wide
+            # SOCKS proxy env vars must not apply (same pitfall as api_hands)
+            async with httpx.AsyncClient(timeout=timeout_s, trust_env=False) as client:
                 resp = await client.post(f"{self._base_url}/api/generate", json=body)
         except httpx.HTTPError as exc:
             return HandResult(output=f"ollama request failed: {exc}", exit_code=1)
@@ -66,7 +68,7 @@ class OllamaHand(Hand):
         if not self.available():
             return False
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
                 resp = await client.get(f"{self._base_url}/api/tags")
             return resp.status_code == 200
         except httpx.HTTPError:

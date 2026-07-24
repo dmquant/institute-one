@@ -113,9 +113,14 @@ export default function Whiteboard() {
       <div className="grid cols-2">
         <div className="card">
           <h2>
-            主题池<span className="en">topic pool (pending)</span>
+            主题池
+            <span className="badge st-pending" style={{ marginLeft: 8 }}>
+              pending {topics.data?.length ?? "…"}
+            </span>
+            <span className="en">topic pool</span>
           </h2>
           <ErrorNote error={topics.error} />
+          {topics.loading && !topics.data && <Loading />}
           <table className="data">
             <thead>
               <tr>
@@ -174,8 +179,8 @@ export default function Whiteboard() {
                   <td>
                     <StatusBadge status={b.status} />
                   </td>
-                  <td className="mono">
-                    {b.n_cards ?? 0}/{b.max_cards}
+                  <td>
+                    <BoardProgress value={b.n_cards ?? 0} max={b.max_cards} />
                   </td>
                   <td className="dim mono">{b.work_date}</td>
                   <td className="dim nowrap">{ago(b.updated_at)}</td>
@@ -187,5 +192,46 @@ export default function Whiteboard() {
         </div>
       </div>
     </>
+  );
+}
+
+function BoardProgress({ value, max }: { value: number; max: number }) {
+  const total = Math.max(1, max);
+  const completed = Math.min(total, Math.max(0, value));
+  const percent = (completed / total) * 100;
+
+  return (
+    <div
+      style={{ display: "flex", minWidth: 100, flexDirection: "column", gap: 4 }}
+      title={`卡片进度 ${value}/${max}`}
+    >
+      <span className="mono">
+        {value}/{max}
+      </span>
+      <span
+        role="progressbar"
+        aria-label="卡片进度"
+        aria-valuemin={0}
+        aria-valuemax={total}
+        aria-valuenow={completed}
+        style={{
+          display: "block",
+          height: 6,
+          overflow: "hidden",
+          border: "1px solid var(--border)",
+          borderRadius: 999,
+          background: "var(--panel-2)",
+        }}
+      >
+        <span
+          style={{
+            display: "block",
+            width: `${percent}%`,
+            height: "100%",
+            background: completed >= total ? "var(--green)" : "var(--accent)",
+          }}
+        />
+      </span>
+    </div>
   );
 }

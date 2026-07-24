@@ -34,6 +34,17 @@ Exit criteria:
 - forecast/alpha pages exist;
 - vault projections exist.
 
+The live control plane later extended the projection without rewriting these
+historical A–C targets:
+
+- **Release D — Post-Audit Hardening:** M8 cards;
+- **Release E — North Star R1:** M9 cards;
+- **Release F — Bounded-Autonomy Loop:** M10 cards.
+
+Backend and offline-plugin projections use the exact leading phase token, so
+new milestone families must be added to both release-gate definitions and
+their contract tests.
+
 ## Initial Cards By Phase
 
 ### M0 - Research Hand Policy

@@ -12,19 +12,31 @@ import {
 import {
 	Analyst,
 	ArchiveHit,
+	DailyStatus,
 	InstituteApi,
+	MetaResult,
 	ResearchQueueItem,
 	VaultIndexRow,
 	errMsg,
 	exportSlug,
 	fileSlug,
+	isMissingEndpoint,
 	researchStatusIcon,
 	researchStatusZh,
 	sgtDate,
 	todayStr,
 } from "./api";
+import { AskStreamView, VIEW_TYPE_ASK_STREAM } from "./askstream";
 import { InstituteDashboardView, VIEW_TYPE_DASHBOARD } from "./dashboard";
-import { AskModal, MailModal, PickModal, PromptModal, VaultDoctorModal } from "./modals";
+import {
+	AskModal,
+	ClaimCheckModal,
+	DigestModal,
+	MailModal,
+	PickModal,
+	PromptModal,
+	VaultDoctorModal,
+} from "./modals";
 import { RoadmapView, VIEW_TYPE_ROADMAP } from "./roadmap";
 
 // ---------------------------------------------------------------------------
@@ -33,6 +45,8 @@ import { RoadmapView, VIEW_TYPE_ROADMAP } from "./roadmap";
 
 export interface InstituteSettings {
 	baseUrl: string;
+	/** Optional bearer token matching the backend's INSTITUTE_TOKEN. */
+	token: string;
 	/** Obsidian-vault subfolder that maps to the backend's vault_dir. */
 	vaultSubfolder: string;
 	/** Last-used / default analyst id ("" = default hand, no persona). */
@@ -46,6 +60,7 @@ export interface InstituteSettings {
 
 export const DEFAULT_SETTINGS: InstituteSettings = {
 	baseUrl: "http://127.0.0.1:8100",
+	token: "",
 	vaultSubfolder: "Institute",
 	defaultAnalyst: "",
 	insertStyle: "callout",
@@ -64,15 +79,23 @@ export default class InstituteOnePlugin extends Plugin {
 	private statusBar!: HTMLElement;
 	private roster: Analyst[] | null = null;
 	private rosterAt = 0;
+	private metaCache: MetaResult | null = null;
+	private metaAt = 0;
+	private dailyCache: DailyStatus | null = null;
+	private dailyAt = 0;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
-		this.api = new InstituteApi(() => this.settings.baseUrl);
+		this.api = new InstituteApi(
+			() => this.settings.baseUrl,
+			() => this.settings.token,
+		);
 		this.addSettingTab(new InstituteSettingTab(this.app, this));
 
 		// ---- dashboard view ------------------------------------------------
 		this.registerView(VIEW_TYPE_DASHBOARD, (leaf) => new InstituteDashboardView(leaf, this));
 		this.registerView(VIEW_TYPE_ROADMAP, (leaf) => new RoadmapView(leaf, this));
+		this.registerView(VIEW_TYPE_ASK_STREAM, (leaf) => new AskStreamView(leaf, this));
 		this.addRibbonIcon("gauge", "Institute 仪表盘", () => void this.activateDashboard());
 		this.addRibbonIcon("columns-3", "Institute 路线图", () => void this.activateRoadmap());
 
@@ -93,6 +116,36 @@ export default class InstituteOnePlugin extends Plugin {
 			id: "ask",
 			name: "Institute: 提问 (Ask)",
 			callback: () => this.openAskModal(),
+		});
+
+		this.addCommand({
+			id: "ask-stream",
+			name: "Institute: 流式问答（侧边栏）",
+			callback: () => void this.activateAskStream(),
+		});
+
+		this.addCommand({
+			id: "claim-check-selection",
+			name: "Institute: 查证选中文本",
+			editorCallback: (editor) => void this.claimCheckCommand(editor),
+		});
+
+		this.addCommand({
+			id: "digest-recent-reports",
+			name: "Institute: 打开今日简报摘要",
+			callback: () => void this.openDigestCommand("reports"),
+		});
+
+		this.addCommand({
+			id: "digest-analyst-memory",
+			name: "Institute: 我的分析师记忆",
+			callback: () => void this.openDigestCommand("memory"),
+		});
+
+		this.addCommand({
+			id: "digest-analyst-disputes",
+			name: "Institute: 争议清单",
+			callback: () => void this.openDigestCommand("disputes"),
 		});
 
 		this.addCommand({
@@ -201,6 +254,110 @@ export default class InstituteOnePlugin extends Plugin {
 		await workspace.revealLeaf(leaf);
 	}
 
+	async activateAskStream(): Promise<void> {
+		const { workspace } = this.app;
+		const existing = workspace.getLeavesOfType(VIEW_TYPE_ASK_STREAM);
+		if (existing.length > 0) {
+			await workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = workspace.getRightLeaf(false);
+		if (!leaf) return;
+		await leaf.setViewState({ type: VIEW_TYPE_ASK_STREAM, active: true });
+		await workspace.revealLeaf(leaf);
+	}
+
+	// ---- 查证选中文本 (claim check, Phase 3) -------------------------------------
+
+	async claimCheckCommand(editor: Editor): Promise<void> {
+		const selection = editor.getSelection()?.trim() ?? "";
+		const text = selection || paragraphAround(editor);
+		if (!text.trim()) {
+			new Notice("Institute: 没有选中文本，光标也不在段落内。");
+			return;
+		}
+		const notice = new Notice("Institute: 查证中…", 0);
+		try {
+			const result = await this.api.claimCheck(text);
+			notice.hide();
+			new ClaimCheckModal(this.app, text, result).open();
+		} catch (e) {
+			notice.hide();
+			if (isMissingEndpoint(e)) {
+				new Notice(
+					"Institute: 后端未启用写作时查证（fact-check v2）— 请升级并重启后端。",
+					8000,
+				);
+			} else {
+				new Notice(`Institute: 查证失败 — ${errMsg(e)}`, 8000);
+			}
+		}
+	}
+
+	// ---- digest 快捷命令（/api/institute/*.md） ------------------------------------
+
+	async openDigestCommand(kind: "reports" | "memory" | "disputes"): Promise<void> {
+		if (kind === "reports") {
+			await this.showDigest("近期报告摘要 (recent reports)", () =>
+				this.api.digestRecentReports(),
+			);
+			return;
+		}
+		// memory / disputes are per-analyst: pick one (default analyst listed first)
+		let roster: Analyst[];
+		try {
+			roster = await this.getRoster();
+		} catch (e) {
+			new Notice(`Institute: 无法加载分析师名册 — ${errMsg(e)}`, 8000);
+			return;
+		}
+		if (!roster.length) {
+			new Notice("Institute: 名册为空。");
+			return;
+		}
+		const preferred = this.settings.defaultAnalyst;
+		const items = [...roster].sort((a, b) =>
+			a.id === preferred ? -1 : b.id === preferred ? 1 : 0,
+		);
+		new PickModal(
+			this.app,
+			items,
+			(a) => `${a.emoji} ${a.name}（${a.id}）— ${a.focus}`,
+			(a) => {
+				if (kind === "memory") {
+					void this.showDigest(`分析师记忆 — ${a.name}`, () =>
+						this.api.digestAnalystMemory(a.id),
+					);
+				} else {
+					void this.showDigest(`争议清单 — ${a.name}`, () =>
+						this.api.digestAnalystDisputes(a.id),
+					);
+				}
+			},
+			"选择分析师…",
+		).open();
+	}
+
+	private async showDigest(title: string, fetchMd: () => Promise<string>): Promise<void> {
+		const notice = new Notice("Institute: 获取摘要中…", 0);
+		try {
+			const md = await fetchMd();
+			notice.hide();
+			if (!md.trim()) {
+				new Notice("Institute: 摘要为空。", 5000);
+				return;
+			}
+			new DigestModal(this.app, title, md).open();
+		} catch (e) {
+			notice.hide();
+			if (isMissingEndpoint(e)) {
+				new Notice("Institute: 后端未启用该摘要端点 — 请升级并重启后端。", 8000);
+			} else {
+				new Notice(`Institute: 获取摘要失败 — ${errMsg(e)}`, 8000);
+			}
+		}
+	}
+
 	// ---- roster cache ----------------------------------------------------------
 
 	async getRoster(maxAgeMs = 10 * 60_000): Promise<Analyst[]> {
@@ -214,6 +371,33 @@ export default class InstituteOnePlugin extends Plugin {
 	/** Sync lookup against the cached roster (may miss before the first fetch). */
 	analystById(id: string): Analyst | null {
 		return this.roster?.find((a) => a.id === id) ?? null;
+	}
+
+	// ---- status caches (shared by the status bar and the dashboard) ---------------
+
+	/** Short-TTL /api/meta cache — same shape as getRoster. */
+	async getMeta(maxAgeMs = 5_000): Promise<MetaResult> {
+		const now = Date.now();
+		if (this.metaCache && now - this.metaAt < maxAgeMs) return this.metaCache;
+		this.metaCache = await this.api.meta();
+		this.metaAt = now;
+		return this.metaCache;
+	}
+
+	/** Short-TTL /api/analysts/daily/status cache — same shape as getRoster. */
+	async getDailyStatus(maxAgeMs = 5_000): Promise<DailyStatus> {
+		const now = Date.now();
+		if (this.dailyCache && now - this.dailyAt < maxAgeMs) return this.dailyCache;
+		this.dailyCache = await this.api.dailyStatus();
+		this.dailyAt = now;
+		return this.dailyCache;
+	}
+
+	/** Drop the status caches after a mutation (ask / research enqueue / daily
+	 * run / task cancel / base-URL change) so the next refresh refetches. */
+	invalidateStatusCaches(): void {
+		this.metaCache = null;
+		this.dailyCache = null;
 	}
 
 	// ---- 提问 (Ask) ----------------------------------------------------------------
@@ -237,8 +421,10 @@ export default class InstituteOnePlugin extends Plugin {
 			const s = Math.round((Date.now() - started) / 1000);
 			notice.setMessage(`Institute: ${who} 思考中… ${s}s`);
 		}, 1000);
+		this.registerInterval(tick); // also cleared if the plugin unloads mid-run
 		try {
 			const task = await this.api.ask(prompt, analyst?.id ?? null);
+			this.invalidateStatusCaches(); // a task ran: the queue numbers changed
 			const out = (task.output ?? "").trim();
 			let text: string;
 			if (!out) {
@@ -252,15 +438,24 @@ export default class InstituteOnePlugin extends Plugin {
 				text = out;
 			}
 			if (editor) {
-				const cursor = editor.getCursor("to");
-				const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
-				editor.replaceRange(`\n\n${text}\n`, lineEnd);
+				try {
+					const cursor = editor.getCursor("to");
+					const lineEnd = { line: cursor.line, ch: editor.getLine(cursor.line).length };
+					editor.replaceRange(`\n\n${text}\n`, lineEnd);
+				} catch {
+					// the captured editor can go stale while the task runs (note
+					// closed / view reloaded) — the answer itself succeeded, so fall
+					// back to a note instead of misreporting 提问失败
+					await this.createAskNote(prompt, analyst, text);
+					new Notice("Institute: 原编辑器已失效，回答已写入新的 Ask 笔记。", 6000);
+				}
 			} else {
 				await this.createAskNote(prompt, analyst, text);
 			}
 			const s = Math.round((Date.now() - started) / 1000);
 			notice.setMessage(`Institute: 完成（任务 ${task.id}，${task.status}，${s}s）。`);
-			window.setTimeout(() => notice.hide(), 5000);
+			const hideTimer = window.setTimeout(() => notice.hide(), 5000);
+			this.register(() => window.clearTimeout(hideTimer)); // cleared on unload too
 		} catch (e) {
 			notice.hide();
 			new Notice(`Institute: 提问失败 — ${errMsg(e)}`, 8000);
@@ -320,6 +515,7 @@ export default class InstituteOnePlugin extends Plugin {
 		}
 		try {
 			const res = await this.api.enqueueResearch(topic);
+			this.invalidateStatusCaches();
 			if (res.refused === "cooldown") {
 				new Notice(
 					`Institute: 「${topic}」被拒 — 冷却中（上次完成于 ${res.last_completed_at ?? "最近"}）。`,
@@ -512,7 +708,7 @@ export default class InstituteOnePlugin extends Plugin {
 			return;
 		}
 		try {
-			marks = (await this.api.dailyStatus()).analysts ?? {};
+			marks = (await this.getDailyStatus()).analysts ?? {};
 		} catch {
 			/* marks are cosmetic */
 		}
@@ -537,6 +733,7 @@ export default class InstituteOnePlugin extends Plugin {
 	private async runOneDaily(a: Analyst): Promise<void> {
 		try {
 			await this.api.runAnalystDaily(a.id);
+			this.invalidateStatusCaches();
 			new Notice(
 				`Institute: 已启动 ${a.emoji} ${a.name} 的日报（后台运行，完成后自动导出）。`,
 				6000,
@@ -622,13 +819,13 @@ export default class InstituteOnePlugin extends Plugin {
 
 	async refreshStatus(): Promise<void> {
 		try {
-			const meta = await this.api.meta();
+			const meta = await this.getMeta();
 			const by = meta.queue?.by_status ?? {};
 			const running = by["running"] ?? 0;
 			const queued = by["queued"] ?? 0;
 			let dailyTxt = "";
 			try {
-				const ds = await this.api.dailyStatus();
+				const ds = await this.getDailyStatus();
 				const vals = Object.values(ds.analysts ?? {});
 				const done = vals.filter((v) => v === "completed").length;
 				if (vals.length > 0 && done < vals.length) dailyTxt = ` ·日报${done}/${vals.length}`;
@@ -672,6 +869,22 @@ export default class InstituteOnePlugin extends Plugin {
 // helpers
 // ---------------------------------------------------------------------------
 
+/** The paragraph around the cursor: expand from the cursor line to the
+ * nearest blank lines in both directions ("" when the cursor sits on a
+ * blank line). Used by claim-check when there is no selection. */
+function paragraphAround(editor: Editor): string {
+	const cur = editor.getCursor().line;
+	if (!editor.getLine(cur).trim()) return "";
+	let start = cur;
+	while (start > 0 && editor.getLine(start - 1).trim()) start--;
+	let end = cur;
+	const last = editor.lineCount() - 1;
+	while (end < last && editor.getLine(end + 1).trim()) end++;
+	const lines: string[] = [];
+	for (let i = start; i <= end; i++) lines.push(editor.getLine(i));
+	return lines.join("\n").trim();
+}
+
 /** First non-empty content line of a note body (skips frontmatter, strips #). */
 function firstContentLine(body: string): string {
 	let lines = body.split("\n");
@@ -686,11 +899,31 @@ function firstContentLine(body: string): string {
 	return "";
 }
 
+/**
+ * Normalize a base-URL setting value before saving: "" resets to the default;
+ * only absolute http(s) URLs are accepted (null = reject, keep the last valid
+ * value). Trailing slashes are stripped like before.
+ */
+function parseBaseUrl(value: string): string | null {
+	const trimmed = value.trim().replace(/\/+$/, "");
+	if (!trimmed) return DEFAULT_SETTINGS.baseUrl;
+	try {
+		const u = new URL(trimmed);
+		if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+		return trimmed;
+	} catch {
+		return null;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Settings tab
 // ---------------------------------------------------------------------------
 
 class InstituteSettingTab extends PluginSettingTab {
+	/** debounce for the invalid-base-URL warning (one Notice per pause, not per keystroke) */
+	private baseUrlWarnTimer = 0;
+
 	constructor(
 		app: App,
 		private plugin: InstituteOnePlugin,
@@ -704,18 +937,46 @@ class InstituteSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("后端地址 (base URL)")
-			.setDesc("Institute One 后端运行的地址。")
+			.setDesc("Institute One 后端运行的地址。仅支持 http(s)，如 http://127.0.0.1:8100。")
 			.addText((t) =>
 				t
 					.setPlaceholder(DEFAULT_SETTINGS.baseUrl)
 					.setValue(this.plugin.settings.baseUrl)
 					.onChange(async (v) => {
-						this.plugin.settings.baseUrl =
-							v.trim().replace(/\/+$/, "") || DEFAULT_SETTINGS.baseUrl;
+						const parsed = parseBaseUrl(v);
+						if (parsed === null) {
+							// reject: keep the last valid value; warn once the user stops
+							// typing instead of stacking a Notice per keystroke
+							window.clearTimeout(this.baseUrlWarnTimer);
+							this.baseUrlWarnTimer = window.setTimeout(() => {
+								if (parseBaseUrl(t.inputEl.value) === null) {
+									new Notice(
+										"Institute: 后端地址无效 — 仅支持 http(s) URL（如 http://127.0.0.1:8100），未保存。",
+										8000,
+									);
+								}
+							}, 1200);
+							return;
+						}
+						this.plugin.settings.baseUrl = parsed;
 						await this.plugin.saveSettings();
+						this.plugin.invalidateStatusCaches(); // cached meta belongs to the old backend
 						void this.plugin.refreshStatus();
 					}),
 			);
+
+		new Setting(containerEl)
+			.setName("访问令牌 (bearer token)")
+			.setDesc("后端设置 INSTITUTE_TOKEN 时填写同一令牌；未启用鉴权时留空。")
+			.addText((t) => {
+				t.inputEl.type = "password";
+				t.setPlaceholder("未设置")
+					.setValue(this.plugin.settings.token)
+					.onChange(async (v) => {
+						this.plugin.settings.token = v.trim();
+						await this.plugin.saveSettings();
+					});
+			});
 
 		new Setting(containerEl)
 			.setName("Vault 子目录")

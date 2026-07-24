@@ -137,12 +137,13 @@ curl -X POST localhost:8100/api/research/queue -H 'content-type: application/jso
 ```bash
 ./scripts/stop.sh                          # stop
 tail -f ~/.institute-one/logs/server.log   # logs
-.venv/bin/python -m pytest tests -q        # 39 tests, run on the echo hand
+.venv/bin/python -m pytest tests -q        # test suite, runs on the echo hand (no quota)
 ```
 
-- **Pause everything new**: set `admin_state` key `maintenance` to `{"paused": true}` — kickoff jobs skip, in-flight work drains.
+- **Pause everything new**: `POST /api/admin/maintenance {"paused": true}` (also a Dashboard switch; state readable at `GET /api/admin/state`). Every job that would submit new model calls skips — briefing, daily report, analyst dailies, whiteboard kickoff/tick, mailbox sweep, research tick, memory compact — while no-quota jobs (janitor, hand scorecard, market refresh) keep running; in-flight work drains.
+- **Cron health**: `GET /api/cron/health` — per-job last fire, ok-rate, duration trend and last error, aggregated from `cron_metrics` (30-day window).
 - **Quota walls**: per-CLI rate-limit signatures are parsed, cooldowns persist in `~/.institute-one/rate_limits.json` (never auto-shortened), tasks fall back along `claude ↔ codex ↔ gemini → *-api` (`gemini` and `agy` chain into each other first). Clear manually: `POST /api/hands/{name}/cooldown/clear`.
-- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically. Deep-research steps round-robin the configured research hands (`INSTITUTE_RESEARCH_HANDS`, default `codex,agy`), and their rate-limit fallback stays inside that chain.
+- **One CLI = one task at a time** (per-hand mutex). Parallelism comes from spreading across hands; analyst dailies round-robin claude/codex/gemini automatically. Deep-research steps round-robin the configured research hands (`INSTITUTE_RESEARCH_HANDS`, default `codex,agy`), and their rate-limit fallback stays inside that chain. Optionally, `INSTITUTE_ENABLE_HAND_WEIGHTS=true` turns those rotations into weighted picks driven by `GET/PUT /api/hands/weights` (per scope: whiteboard/research/daily/mailbox; explicit analyst hands always win; research weights stay inside the research chain).
 - **Backups**: nightly SQLite backup to `~/.institute-one/backups/` (03:00–05:00 SGT); the vault is a human-readable second copy of every product.
 - **Vault safety**: notes carry `managed: institute`; if you hand-edit a note the institute never clobbers it — updates arrive as `… (institute update <date>).md` siblings; `POST /api/vault/doctor` reports drift.
 - **Restarts are safe but not free**: in-flight tasks are marked `orphaned by restart` at boot and domain loops re-drive from durable rows — still, prefer restarting when the queue is idle (`GET /api/tasks/queue`).
@@ -151,24 +152,27 @@ tail -f ~/.institute-one/logs/server.log   # logs
 
 v0.1 is the MVP slice (~25%) of the full single-node institute designed in [`../proposal/PROPOSAL.md`](../proposal/PROPOSAL.md). The rest is mapped, grounded, and **written to be built by you with an AI coding agent**: **[`ROADMAP.md`](./ROADMAP.md)** breaks every remaining feature into self-contained milestones — each grounded in the proposal section it implements, the legacy source it ports from, and the files to touch; keystone items carry a ready-to-paste prompt for Claude Code / Codex / Gemini. Pick a box, prompt your agent, review the diff, keep `pytest -q` green, tick it off.
 
-There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M7), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. The Obsidian plugin renders it as a roadmap Kanban view (command *Institute: 打开路线图*) and can export the board as a Markdown note. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
+There is also an execution-level **roadmap control plane** in [`roadmap/`](./roadmap/): design docs plus a machine-readable card board (`backlog.json`, phases M0–M10), where every non-trivial change flows design → card → coding session → diff → verification → review → release gate → done. SQLite rows are the operator truth; the repo JSON is a reviewed seed/export artifact, and `POST /api/roadmap/import` can preview reconciliation before applying it. The Obsidian plugin renders the same board (command *Institute: 打开路线图*) and can export it as Markdown. `ROADMAP.md` stays the long-horizon feature map; `roadmap/` is how individual cards get executed.
 
-The execution track so far (statuses from `backlog.json`, 2026-07-03 — 8 done · 2 in review · 6 inbox of 16 seed cards):
+Current execution families (live counts come from `GET /api/roadmap/process`, not this README):
 
 ```mermaid
 flowchart LR
-    M0["M0 ☑ Research hands<br/>codex+agy round-robin"]
-    M1["M1 ◔ Thesis registry<br/>3/4 done · bundle import in review"]
-    M2["M2 ☑ Securities & stock map<br/>.SH/.SZ/.BJ master"]
-    M3["M3 ☐ Thesis-aware research"]
-    M4["M4 ☐ Market data & PIT store"]
-    M5["M5 ☐ Forecast ledger"]
-    M6["M6 ☐ Alpha & paper book"]
-    M7["M7 ◔ Control plane<br/>API + Kanban ✅ · sessions in review"]
+    M0["M0 Research hands"]
+    M1["M1 Thesis registry"]
+    M2["M2 Securities map"]
+    M3["M3 Thesis-aware research"]
+    M4["M4 Market data"]
+    M5["M5 Forecast ledger"]
+    M7["M7 Control plane"]
+    M8["M8 Post-audit hardening"]
+    M9["M9 North Star systems"]
+    M10["M10 Bounded autonomy"]
     M0 --> M1 --> M2
     M1 & M2 --> M3
-    M2 --> M4 --> M5 --> M6
+    M2 --> M4 --> M5
     M1 --> M5
+    M7 --> M8 --> M9 --> M10
 ```
 
 And the long-horizon dependency map to the full proposal:

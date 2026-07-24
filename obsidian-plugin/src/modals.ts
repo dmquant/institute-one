@@ -1,5 +1,16 @@
-import { App, Editor, FuzzySuggestModal, Modal, Notice, Setting } from "obsidian";
-import { Analyst, VaultIndexRow, errMsg } from "./api";
+import {
+	App,
+	Component,
+	Editor,
+	FuzzySuggestModal,
+	MarkdownRenderer,
+	Modal,
+	Notice,
+	Setting,
+	TFile,
+	normalizePath,
+} from "obsidian";
+import { Analyst, ClaimCheckResult, VaultIndexRow, errMsg, fileSlug, todayStr } from "./api";
 import type InstituteOnePlugin from "./main";
 
 // ---------------------------------------------------------------------------
@@ -280,6 +291,190 @@ export class MailModal extends Modal {
 	}
 
 	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 查证选中文本 (claim check before write, Phase 3)
+// ---------------------------------------------------------------------------
+
+const CLAIM_CHECK_MODE_ZH: Record<string, string> = {
+	"vector+keyword": "向量近邻 + 关键词",
+	keyword: "关键词（向量层不可用，已降级）",
+	error: "检查失败（向量与关键词两条腿都不可用）",
+	none: "文本为空",
+};
+
+export class ClaimCheckModal extends Modal {
+	constructor(
+		app: App,
+		private checkedText: string,
+		private result: ClaimCheckResult,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.titleEl.setText("查证结果 (claim check)");
+
+		// what was checked, collapsed to one line
+		const src = contentEl.createDiv();
+		src.style.color = "var(--text-muted)";
+		src.style.fontSize = "12px";
+		src.style.marginBottom = "8px";
+		src.style.overflow = "hidden";
+		src.style.whiteSpace = "nowrap";
+		src.style.textOverflow = "ellipsis";
+		const flat = this.checkedText.replace(/\s+/g, " ").trim();
+		src.setText(`已查证：${flat.length > 80 ? flat.slice(0, 80) + "…" : flat}`);
+		src.setAttribute("title", flat.slice(0, 500));
+
+		const mode = contentEl.createDiv();
+		mode.style.fontSize = "12px";
+		mode.style.marginBottom = "10px";
+		mode.setText(`匹配方式：${CLAIM_CHECK_MODE_ZH[this.result.mode] ?? this.result.mode}`);
+		if (this.result.mode === "keyword" || this.result.mode === "error") {
+			mode.style.color = "var(--color-orange)";
+		} else {
+			mode.style.color = "var(--text-muted)";
+		}
+
+		const hits = this.result.hits ?? [];
+		if (!hits.length) {
+			const ok = contentEl.createDiv({
+				text: "未命中任何已核查事实 — 该文本不与事实库中的 VERIFIED/DISPUTED 论断重叠。",
+			});
+			ok.style.color = "var(--text-muted)";
+			return;
+		}
+
+		const disputed = hits.filter((h) => h.verdict === "DISPUTED").length;
+		if (disputed > 0) {
+			const warn = contentEl.createDiv({
+				text: `⚠️ ${disputed} 条命中为「有争议 (DISPUTED)」— 写入前请复核。`,
+			});
+			warn.style.color = "var(--text-error)";
+			warn.style.fontWeight = "600";
+			warn.style.marginBottom = "8px";
+		}
+
+		for (const h of hits) {
+			const isDisputed = h.verdict === "DISPUTED";
+			const row = contentEl.createDiv();
+			row.style.padding = "6px 8px";
+			row.style.marginBottom = "6px";
+			row.style.borderRadius = "6px";
+			row.style.border = "1px solid var(--background-modifier-border)";
+			if (isDisputed) {
+				row.style.background = "rgba(var(--color-red-rgb), 0.12)";
+				row.style.borderColor = "var(--color-red)";
+			}
+
+			const head = row.createDiv();
+			head.style.display = "flex";
+			head.style.alignItems = "baseline";
+			head.style.gap = "8px";
+			head.style.marginBottom = "2px";
+
+			const badge = head.createSpan({
+				text: isDisputed ? "有争议 DISPUTED" : "已核实 VERIFIED",
+			});
+			badge.style.fontSize = "11px";
+			badge.style.fontWeight = "700";
+			badge.style.color = isDisputed ? "var(--text-error)" : "var(--color-green)";
+
+			const simPct = Number.isFinite(h.similarity)
+				? `${(h.similarity * 100).toFixed(1)}%`
+				: "?";
+			const meta = head.createSpan({
+				text: `相似度 ${simPct} · ${h.category} · ${h.source === "vector" ? "向量" : "关键词"}`,
+			});
+			meta.style.fontSize = "11px";
+			meta.style.color = "var(--text-muted)";
+
+			const claim = row.createDiv({ text: h.claim });
+			claim.style.fontSize = "13px";
+			if (isDisputed) claim.style.color = "var(--text-error)";
+
+			const cardId = row.createDiv({ text: `卡片：${h.fact_card_id}` });
+			cardId.style.fontSize = "10px";
+			cardId.style.color = "var(--text-faint)";
+		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Digest 展示（/api/institute/*.md — 渲染 markdown，可另存为笔记）
+// ---------------------------------------------------------------------------
+
+export class DigestModal extends Modal {
+	private renderHost = new Component();
+
+	constructor(
+		app: App,
+		private title: string,
+		private markdown: string,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		this.titleEl.setText(this.title);
+		this.renderHost.load();
+
+		const body = contentEl.createDiv();
+		body.style.maxHeight = "60vh";
+		body.style.overflowY = "auto";
+		body.style.padding = "4px 2px";
+		void MarkdownRenderer.render(this.app, this.markdown, body, "", this.renderHost);
+
+		const actions = contentEl.createDiv();
+		actions.style.display = "flex";
+		actions.style.gap = "8px";
+		actions.style.marginTop = "12px";
+
+		const save = actions.createEl("button", { text: "另存为笔记" });
+		save.addEventListener("click", () => void this.saveAsNote());
+		const copy = actions.createEl("button", { text: "复制 Markdown" });
+		copy.addEventListener("click", () => {
+			void navigator.clipboard.writeText(this.markdown);
+			new Notice("Institute: 已复制。", 3000);
+		});
+	}
+
+	private async saveAsNote(): Promise<void> {
+		const folder = "Ask";
+		if (!this.app.vault.getAbstractFileByPath(folder)) {
+			try {
+				await this.app.vault.createFolder(folder);
+			} catch {
+				/* already exists / race */
+			}
+		}
+		const base = `${todayStr()} ${fileSlug(this.title)}`;
+		let path = normalizePath(`${folder}/${base}.md`);
+		let n = 1;
+		while (this.app.vault.getAbstractFileByPath(path)) {
+			path = normalizePath(`${folder}/${base} ${++n}.md`);
+		}
+		try {
+			const file: TFile = await this.app.vault.create(path, this.markdown);
+			this.close();
+			await this.app.workspace.getLeaf(true).openFile(file);
+		} catch (e) {
+			new Notice(`Institute: 保存失败 — ${errMsg(e)}`, 8000);
+		}
+	}
+
+	onClose(): void {
+		this.renderHost.unload();
 		this.contentEl.empty();
 	}
 }

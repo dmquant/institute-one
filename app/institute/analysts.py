@@ -11,7 +11,6 @@ import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
-from functools import lru_cache
 
 from ..config import get_settings
 
@@ -36,10 +35,21 @@ class Analyst:
     model: str | None = None
 
 
-@lru_cache(maxsize=1)
+# mtime-checked cache: a manual edit to catalog/analysts.json is picked up on
+# the next read (no restart needed); CRUD still calls reload() explicitly.
+_cache: tuple[int, list[Analyst]] | None = None  # (catalog st_mtime_ns, parsed roster)
+
+
 def _load() -> list[Analyst]:
-    raw = json.loads(get_settings().catalog_path.read_text(encoding="utf-8"))
-    return [Analyst(**a) for a in raw["analysts"]]
+    global _cache
+    path = get_settings().catalog_path
+    mtime = path.stat().st_mtime_ns
+    if _cache is not None and _cache[0] == mtime:
+        return _cache[1]
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    analysts = [Analyst(**a) for a in raw["analysts"]]
+    _cache = (mtime, analysts)
+    return analysts
 
 
 def roster() -> list[Analyst]:
@@ -54,7 +64,8 @@ def get_analyst(analyst_id: str) -> Analyst | None:
 
 
 def reload() -> None:
-    _load.cache_clear()
+    global _cache
+    _cache = None
 
 
 # ---- CRUD (persists to catalog/analysts.json) -----------------------------

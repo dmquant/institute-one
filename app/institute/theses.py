@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import uuid
 from typing import Any
 
 from .. import bus, db
+from ..util import new_id
 
 STATUSES = ("candidate", "active", "watch", "dormant", "retired")
 # new theses enter the lifecycle at the top; watch/dormant/retired are reached
@@ -51,10 +51,6 @@ class TransitionConflict(ThesisError):
 
 
 # ---- helpers ---------------------------------------------------------------
-
-def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
-
 
 def _validate_enum(value: Any, allowed: set[str], label: str) -> None:
     if value not in allowed:
@@ -228,7 +224,7 @@ async def create_thesis(fields: dict[str, Any]) -> dict[str, Any]:
 
     now = bus.now_iso()
     seed_version = bool(summary or any(content_lists.values()))
-    version_id = _new_id()
+    version_id = new_id()
     # one transaction so a thesis never lands without its seeded version row.
     # NB: transaction() holds the db write lock — use the yielded conn directly
     # (db.execute/insert or bus.emit in here would deadlock); events after commit.
@@ -403,7 +399,7 @@ async def update_thesis(thesis_id: str, fields: dict[str, Any]) -> dict[str, Any
             params.append(fields[key])
 
     version_no = None
-    version_id = _new_id()
+    version_id = new_id()
     sets.append("updated_at = ?")
     params.append(now)
 

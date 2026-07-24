@@ -1,6 +1,15 @@
 import { App, ItemView, Modal, Notice, TFile, TFolder, WorkspaceLeaf, normalizePath } from "obsidian";
 import backlog from "../../roadmap/backlog.json";
-import { ApiError, RoadmapApiCard, RoadmapReleaseGate, RoadmapSession, errMsg } from "./api";
+import {
+	ApiError,
+	RoadmapApiCard,
+	RoadmapBlockedCard,
+	RoadmapProcessGate,
+	RoadmapProcessOverview,
+	RoadmapReleaseGate,
+	RoadmapSession,
+	errMsg,
+} from "./api";
 import type InstituteOnePlugin from "./main";
 
 export const VIEW_TYPE_ROADMAP = "institute-roadmap";
@@ -84,6 +93,8 @@ export class RoadmapView extends ItemView {
 	private status = "all";
 	private type = "all";
 	private selectedId = ROADMAP.cards[0]?.id ?? "";
+	/** "board" = Kanban + detail + gates; "process" = the M7-006 global process view. */
+	private tab: "board" | "process" = "board";
 
 	/** "api" = backend rows are truth; "offline" = bundled seed + local overrides. */
 	private mode: "api" | "offline" = "offline";
@@ -97,13 +108,21 @@ export class RoadmapView extends ItemView {
 	private sessionsFetched = new Set<string>();
 	/** null = the fetch failed; the panel renders a retry row instead of 加载中 */
 	private sessionsByCard = new Map<string, RoadmapSession[] | null>();
+	/** backend-generated agent prompts (GET /cards/{id}/prompt), keyed by card id;
+	 * null = the fetch failed — the panel keeps the local template and renders an
+	 * explicit retry button (same pattern as sessionsByCard) */
+	private promptsByCard = new Map<string, string | null>();
+	/** undefined = not loaded yet; null = the fetch failed (retry row) */
+	private processData: RoadmapProcessOverview | null | undefined = undefined;
 
 	private subtitleEl!: HTMLElement;
 	private summaryEl!: HTMLElement;
+	private tabsEl!: HTMLElement;
 	private filtersEl!: HTMLElement;
 	private boardEl!: HTMLElement;
 	private detailEl!: HTMLElement;
 	private gatesEl!: HTMLElement;
+	private processEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, plugin: InstituteOnePlugin) {
 		super(leaf);
@@ -124,7 +143,7 @@ export class RoadmapView extends ItemView {
 	}
 
 	async onOpen(): Promise<void> {
-		ensureRoadmapStyles();
+		// roadmap styles live in styles.css — Obsidian loads/unloads it with the plugin
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("institute-roadmap");
@@ -140,10 +159,12 @@ export class RoadmapView extends ItemView {
 		);
 
 		this.summaryEl = root.createDiv({ cls: "ir-summary" });
+		this.tabsEl = root.createDiv({ cls: "ir-tabs" });
 		this.filtersEl = root.createDiv({ cls: "ir-filters" });
 		this.boardEl = root.createDiv({ cls: "ir-board" });
 		this.detailEl = root.createDiv({ cls: "ir-detail" });
 		this.gatesEl = root.createDiv({ cls: "ir-gates" });
+		this.processEl = root.createDiv({ cls: "ir-process" });
 		this.render(); // instant paint from the bundled seed…
 		void this.reload(); // …then prefer the live backend
 	}
@@ -180,15 +201,19 @@ export class RoadmapView extends ItemView {
 				this.detailFetched.clear();
 				this.sessionsFetched.clear();
 				this.sessionsByCard.clear();
+				this.promptsByCard.clear();
 				this.apiGates = await this.plugin.api.releaseGates().catch(() => null);
+				this.processData = await this.plugin.api.processOverview().catch(() => null);
 			} else {
 				this.apiCards = null;
 				this.apiGates = null;
+				this.processData = undefined;
 				this.mode = "offline";
 			}
 		} catch {
 			this.apiCards = null;
 			this.apiGates = null;
+			this.processData = undefined;
 			this.mode = "offline";
 		}
 		this.loading = false;
@@ -234,10 +259,40 @@ export class RoadmapView extends ItemView {
 	private render(): void {
 		this.renderSubtitle();
 		this.renderSummary();
-		this.renderFilters();
-		this.renderBoard();
-		this.renderDetail();
-		this.renderGates();
+		this.renderTabs();
+		const board = this.tab === "board";
+		for (const el of [this.filtersEl, this.boardEl, this.detailEl, this.gatesEl]) {
+			el.style.display = board ? "" : "none";
+		}
+		this.processEl.style.display = board ? "none" : "";
+		if (board) {
+			this.renderFilters();
+			this.renderBoard();
+			this.renderDetail();
+			this.renderGates();
+		} else {
+			this.renderProcess();
+		}
+	}
+
+	private renderTabs(): void {
+		this.tabsEl.empty();
+		const tabs: Array<{ id: "board" | "process"; label: string; title: string }> = [
+			{ id: "board", label: "看板", title: "Kanban 看板与卡片详情" },
+			{ id: "process", label: "流程", title: "活动会话、开放决策、release gates 与阻塞卡（M7-006）" },
+		];
+		for (const t of tabs) {
+			const btn = this.tabsEl.createEl("button", {
+				text: t.label,
+				cls: `ir-tab${this.tab === t.id ? " is-active" : ""}`,
+			});
+			btn.setAttribute("title", t.title);
+			btn.addEventListener("click", () => {
+				if (this.tab === t.id) return;
+				this.tab = t.id;
+				this.render();
+			});
+		}
 	}
 
 	private renderSubtitle(): void {
@@ -341,6 +396,7 @@ export class RoadmapView extends ItemView {
 		this.selectedId = card.id;
 		this.hydrateDetail(card);
 		this.hydrateSessions(card);
+		this.hydratePrompt(card);
 		const blocked = isBlocked(card, byId);
 
 		const top = this.detailEl.createDiv({ cls: "ir-detail-head" });
@@ -366,7 +422,7 @@ export class RoadmapView extends ItemView {
 		const side = body.createDiv();
 		this.dependencyBlock(side, card, byId);
 		if (this.mode === "api") this.sessionsBlock(side, card);
-		this.block(side, "执行提示", [agentPrompt(card)], "pre");
+		this.promptBlock(side, card);
 		if (blocked) {
 			const reasons: string[] = [];
 			if (hasOpenDeps(card, byId)) {
@@ -425,6 +481,73 @@ export class RoadmapView extends ItemView {
 				if (this.selectedId === card.id) this.renderDetail();
 			},
 		);
+	}
+
+	/** API mode: lazily fetch the backend's deterministic agent prompt
+	 * (GET /cards/{id}/prompt, M7-007) so the panel previews what 复制 copies.
+	 * Offline keeps the local seed-derived template as the fallback; a failed
+	 * fetch stores null (retry button) instead of refetching on every render. */
+	private hydratePrompt(card: RoadmapCard): void {
+		if (this.mode !== "api" || this.promptsByCard.has(card.id)) return;
+		void this.plugin.api.cardPrompt(card.id).then(
+			(res) => {
+				this.promptsByCard.set(card.id, res.prompt);
+				if (this.selectedId === card.id) this.renderDetail();
+			},
+			() => {
+				// keep the null marker — a bare re-render must not refetch in a
+				// loop; the local template stays visible with a retry button
+				this.promptsByCard.set(card.id, null);
+				if (this.selectedId === card.id) this.renderDetail();
+			},
+		);
+	}
+
+	private refreshPrompt(card: RoadmapCard): void {
+		this.promptsByCard.delete(card.id);
+		this.renderDetail(); // hydratePrompt refetches and re-renders
+	}
+
+	/** Agent prompt panel (M7-007): preview + a copy button. API mode copies the
+	 * backend's deterministic prompt; offline copies the bundled-seed template. */
+	private promptBlock(parent: HTMLElement, card: RoadmapCard): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		const head = box.createDiv({ cls: "ir-sessions-head" });
+		head.createEl("h4", { text: "Agent Prompt" });
+		this.button(head, "复制 Agent Prompt", "生成并复制该卡的 agent prompt 到剪贴板", () =>
+			void this.copyAgentPrompt(card),
+		);
+		const prompt = this.promptsByCard.get(card.id);
+		box.createEl("pre", { text: prompt ?? agentPrompt(card) });
+		if (prompt === null) {
+			box.createDiv({ cls: "ir-empty", text: "后端 prompt 加载失败，上方为本地模板。" });
+			this.button(box, "重试", "重新获取后端 Agent Prompt", () => this.refreshPrompt(card));
+		}
+	}
+
+	private async copyAgentPrompt(card: RoadmapCard): Promise<void> {
+		let prompt: string;
+		let source = "后端生成";
+		if (this.mode === "api") {
+			try {
+				prompt = (await this.plugin.api.cardPrompt(card.id)).prompt;
+				this.promptsByCard.set(card.id, prompt);
+				if (this.selectedId === card.id) this.renderDetail();
+			} catch (e) {
+				new Notice(`Institute Roadmap: 获取 Agent Prompt 失败 — ${errMsg(e)}`, 8000);
+				return;
+			}
+		} else {
+			prompt = agentPrompt(card);
+			source = "离线模板";
+		}
+		try {
+			await navigator.clipboard.writeText(prompt);
+		} catch (e) {
+			new Notice(`Institute Roadmap: 写入剪贴板失败 — ${errMsg(e)}`, 8000);
+			return;
+		}
+		new Notice(`Institute Roadmap: 已复制 ${card.id} 的 Agent Prompt（${source}）。`, 5000);
 	}
 
 	/** Sessions panel (API mode only): the backend refuses moving a card to
@@ -526,6 +649,156 @@ export class RoadmapView extends ItemView {
 			});
 			box.createDiv({ cls: "ir-gate-meta", text: `${gate.done}/${gate.total} cards · ${gate.pct}%` });
 		}
+	}
+
+	/** 流程 tab (M7-006): active sessions, open decisions, release-gate
+	 * readiness (status + evidence), and blocked cards — one aggregate fetch
+	 * (GET /api/roadmap/process), no per-card drilling. Offline falls back to
+	 * what the bundled seed can compute (gates + blocked); sessions/decisions
+	 * live only in the backend. */
+	private renderProcess(): void {
+		const root = this.processEl;
+		root.empty();
+
+		if (this.mode !== "api") {
+			root.createDiv({
+				cls: "ir-warning",
+				text:
+					"离线模式 — 编码会话与决策需要后端连接。以下 release gates 与阻塞卡由内置 " +
+					"roadmap/backlog.json 本地计算（无 evidence 数据）。",
+			});
+			this.processGates(root, localProcessGates(this.cards()), true);
+			this.processBlocked(root, localBlockedCards(this.cards()));
+			return;
+		}
+		if (this.processData === undefined) {
+			root.createDiv({ cls: "ir-empty", text: "加载中…" });
+			return;
+		}
+		if (this.processData === null) {
+			root.createDiv({ cls: "ir-empty", text: "流程数据加载失败。" });
+			this.button(root, "重试", "重新加载流程聚合", () => void this.reloadProcess());
+			return;
+		}
+		const data = this.processData;
+
+		const sessBox = root.createDiv({ cls: "ir-block" });
+		sessBox.createEl("h4", { text: `活动编码会话（${data.active_sessions.length}）` });
+		if (!data.active_sessions.length) {
+			sessBox.createDiv({ cls: "ir-empty", text: "无活动会话。" });
+		}
+		for (const sess of data.active_sessions) {
+			const row = sessBox.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			meta.createSpan({ cls: "ir-id", text: sess.actor });
+			this.cardLink(meta, sess.card_id, sess.card_title);
+			meta.createSpan({ text: `${sess.n_commands ?? 0} 条命令` });
+			row.createDiv({ cls: "ir-session-goal", text: sess.goal });
+		}
+
+		const decBox = root.createDiv({ cls: "ir-block" });
+		decBox.createEl("h4", { text: `开放决策（${data.open_decisions.length}）` });
+		if (!data.open_decisions.length) {
+			decBox.createDiv({ cls: "ir-empty", text: "无开放决策。" });
+		}
+		for (const dec of data.open_decisions) {
+			const row = decBox.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			meta.createSpan({ cls: "ir-pill decision-open", text: "open" });
+			if (dec.card_id) this.cardLink(meta, dec.card_id, dec.card_title ?? undefined);
+			else meta.createSpan({ text: "（板级决策）" });
+			row.createDiv({ cls: "ir-session-goal", text: dec.title });
+			row.createDiv({ cls: "ir-session-summary", text: dec.question });
+			if (dec.options.length) {
+				row.createDiv({ cls: "ir-session-summary", text: `选项：${dec.options.join(" / ")}` });
+			}
+		}
+
+		this.processGates(root, data.release_gates, false);
+		this.processBlocked(root, data.blocked_cards);
+	}
+
+	/** Release-gate readiness cards. Offline mode has no evidence rows, so the
+	 * evidence column and the ready verdict are suppressed there. */
+	private processGates(parent: HTMLElement, gates: RoadmapProcessGate[], offline: boolean): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		box.createEl("h4", { text: "Release Gates（状态 + evidence）" });
+		const wrap = box.createDiv({ cls: "ir-gate-grid" });
+		for (const gate of gates) {
+			const g = wrap.createDiv({ cls: "ir-gate" });
+			const head = g.createDiv({ cls: "ir-sessions-head" });
+			head.createDiv({ cls: "ir-gate-name", text: gate.gate });
+			if (!offline) {
+				head.createSpan({
+					cls: `ir-pill ${gate.ready ? "gate-ready" : "gate-open"}`,
+					text: gate.ready ? "ready" : "open",
+				});
+			}
+			g.createDiv({ cls: "ir-gate-desc", text: gate.description });
+			const pct = gate.cards_total
+				? Math.round((100 * gate.cards_done) / gate.cards_total)
+				: 0;
+			g.createDiv({ cls: "ir-progress" }).createDiv({
+				cls: "ir-progress-bar",
+				attr: { style: `width: ${pct}%` },
+			});
+			const meta = offline
+				? `done ${gate.cards_done}/${gate.cards_total}`
+				: `done ${gate.cards_done}/${gate.cards_total} · evidence ${gate.evidence_ready}/${gate.cards_total}`;
+			g.createDiv({ cls: "ir-gate-meta", text: meta });
+			if (gate.blockers.length) {
+				g.createDiv({
+					cls: "ir-gate-meta ir-gate-blockers",
+					text: `阻塞：${gate.blockers.join(", ")}`,
+				});
+			}
+		}
+	}
+
+	private processBlocked(parent: HTMLElement, blocked: RoadmapBlockedCard[]): void {
+		const box = parent.createDiv({ cls: "ir-block" });
+		box.createEl("h4", { text: `阻塞卡片（${blocked.length}）` });
+		if (!blocked.length) {
+			box.createDiv({ cls: "ir-empty", text: "没有被阻塞的卡片。" });
+			return;
+		}
+		for (const c of blocked) {
+			const row = box.createDiv({ cls: "ir-session" });
+			const meta = row.createDiv({ cls: "ir-card-meta" });
+			this.cardLink(meta, c.id, c.title);
+			meta.createSpan({ cls: "ir-pill", text: STATUS_ZH[c.status as RoadmapStatus] ?? c.status });
+			if (c.owner) meta.createSpan({ text: c.owner });
+			const reasons: string[] = [];
+			if (c.blocked_reason) reasons.push(`标记阻塞：${c.blocked_reason}`);
+			if (c.open_dependencies.length) reasons.push(`未完成依赖：${c.open_dependencies.join(", ")}`);
+			row.createDiv({ cls: "ir-session-summary is-missing", text: reasons.join(" · ") });
+		}
+	}
+
+	/** Clickable card reference: jumps back to the 看板 tab with the card selected. */
+	private cardLink(parent: HTMLElement, cardId: string, title?: string): void {
+		const link = parent.createEl("a", {
+			cls: "ir-card-link",
+			text: title ? `${cardId} · ${title}` : cardId,
+		});
+		link.setAttribute("title", "在看板中打开该卡片");
+		link.addEventListener("click", (ev) => {
+			ev.preventDefault();
+			this.tab = "board";
+			this.selectedId = cardId;
+			this.render();
+		});
+	}
+
+	private async reloadProcess(): Promise<void> {
+		this.processData = undefined;
+		this.renderProcess();
+		try {
+			this.processData = await this.plugin.api.processOverview();
+		} catch {
+			this.processData = null;
+		}
+		if (this.tab === "process") this.renderProcess();
 	}
 
 	private async moveCard(card: RoadmapCard, status: RoadmapStatus): Promise<void> {
@@ -891,6 +1164,9 @@ const RELEASE_GATES = [
 	{ name: "Release A", description: "Thesis Registry + Forecastable Research", prefixes: ["M0", "M1", "M2", "M3"] },
 	{ name: "Release B", description: "Market Data + Forecast Ledger", prefixes: ["M4", "M5", "M6"] },
 	{ name: "Release C", description: "Roadmap Control Plane", prefixes: ["M7"] },
+	{ name: "Release D", description: "Post-Audit Hardening", prefixes: ["M8"] },
+	{ name: "Release E", description: "North Star R1", prefixes: ["M9"] },
+	{ name: "Release F", description: "Bounded-Autonomy Loop", prefixes: ["M10"] },
 ];
 
 function localReleaseGates(cards: RoadmapCard[]): RoadmapReleaseGate[] {
@@ -906,6 +1182,45 @@ function localReleaseGates(cards: RoadmapCard[]): RoadmapReleaseGate[] {
 			remaining: scoped.filter((c) => c.status !== "done").map((c) => c.id).sort(),
 		};
 	});
+}
+
+/** Offline fallback for the 流程 tab's gate panel — evidence rows live only in
+ * the backend, so evidence_ready is 0 and ready is never claimed offline. */
+function localProcessGates(cards: RoadmapCard[]): RoadmapProcessGate[] {
+	const byId = mapById(cards);
+	return RELEASE_GATES.map((gate) => {
+		const scoped = cards.filter((c) => gate.prefixes.includes(c.phase.split(" ")[0]));
+		return {
+			gate: gate.name,
+			description: gate.description,
+			prefixes: gate.prefixes,
+			cards_total: scoped.length,
+			cards_done: scoped.filter((c) => c.status === "done").length,
+			evidence_ready: 0,
+			blockers: scoped
+				.filter((c) => c.status !== "done" && isBlocked(c, byId))
+				.map((c) => c.id)
+				.sort(),
+			ready: false,
+		};
+	});
+}
+
+/** Offline fallback for the 流程 tab's blocked list — mirrors the backend rule:
+ * blocked_reason or an open dependency, done cards excluded. */
+function localBlockedCards(cards: RoadmapCard[]): RoadmapBlockedCard[] {
+	const byId = mapById(cards);
+	return cards
+		.filter((c) => c.status !== "done" && isBlocked(c, byId))
+		.map((c) => ({
+			id: c.id,
+			title: c.title,
+			phase: c.phase,
+			status: c.status,
+			owner: null,
+			blocked_reason: c.blocked_reason ?? null,
+			open_dependencies: c.dependencies.filter((id) => byId.get(id)?.status !== "done"),
+		}));
 }
 
 function cardSort(a: RoadmapCard, b: RoadmapCard): number {
@@ -993,316 +1308,4 @@ function buildKanbanMarkdown(cards: RoadmapCard[], source: string): string {
 		"",
 	);
 	return lines.join("\n");
-}
-
-function ensureRoadmapStyles(): void {
-	if (document.getElementById("institute-roadmap-style")) return;
-	const style = document.createElement("style");
-	style.id = "institute-roadmap-style";
-	style.textContent = `
-.institute-roadmap {
-	padding: 12px;
-	font-size: 13px;
-	--ir-border: var(--background-modifier-border);
-	--ir-panel: var(--background-secondary);
-	--ir-panel-2: var(--background-primary);
-	--ir-muted: var(--text-muted);
-}
-.ir-head, .ir-detail-head {
-	display: flex;
-	align-items: flex-start;
-	justify-content: space-between;
-	gap: 12px;
-	margin-bottom: 12px;
-}
-.ir-head h2, .ir-detail h3, .ir-gates h3 {
-	margin: 0;
-	font-size: 18px;
-}
-.ir-subtitle {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin-top: 2px;
-}
-.ir-subtitle.offline {
-	color: var(--color-orange);
-}
-.ir-modal-actions {
-	display: flex;
-	gap: 8px;
-	justify-content: flex-end;
-	margin-top: 12px;
-}
-.ir-modal-input {
-	display: block;
-	width: 100%;
-	margin-top: 8px;
-}
-.ir-sessions-head {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 8px;
-}
-.ir-sessions-head h4 {
-	margin: 0 0 5px;
-	font-size: 12px;
-	color: var(--text-muted);
-}
-.ir-session {
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	background: var(--ir-panel-2);
-	padding: 8px;
-	margin-bottom: 8px;
-}
-.ir-pill.session-active {
-	color: var(--color-blue);
-}
-.ir-pill.session-blocked, .ir-pill.session-cancelled {
-	color: var(--color-orange);
-}
-.ir-pill.session-completed {
-	color: var(--color-green);
-}
-.ir-session-goal {
-	font-weight: 650;
-	margin-top: 6px;
-	line-height: 1.35;
-}
-.ir-session-summary {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin: 5px 0 6px;
-	white-space: pre-wrap;
-}
-.ir-session-summary.is-missing {
-	color: var(--color-orange);
-}
-.ir-actions, .ir-status-actions {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 6px;
-}
-.ir-summary {
-	display: grid;
-	grid-template-columns: repeat(5, minmax(88px, 1fr));
-	gap: 8px;
-	margin-bottom: 12px;
-}
-.ir-stat {
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 8px 10px;
-}
-.ir-stat-value {
-	font-family: var(--font-monospace);
-	font-weight: 700;
-	font-size: 18px;
-}
-.ir-stat-label {
-	color: var(--text-muted);
-	font-size: 11px;
-}
-.ir-filters {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 8px;
-	align-items: center;
-	margin-bottom: 12px;
-}
-.ir-filters input {
-	min-width: min(280px, 100%);
-}
-.ir-select {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	color: var(--text-muted);
-	font-size: 12px;
-}
-.ir-board {
-	display: grid;
-	grid-auto-flow: column;
-	grid-auto-columns: minmax(250px, 300px);
-	gap: 10px;
-	overflow-x: auto;
-	padding-bottom: 10px;
-	margin-bottom: 14px;
-}
-.ir-column {
-	min-height: 220px;
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 8px;
-}
-.ir-column-head {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	font-weight: 700;
-	margin-bottom: 8px;
-}
-.ir-count {
-	color: var(--text-muted);
-	font-family: var(--font-monospace);
-	font-size: 11px;
-}
-.ir-card {
-	border: 1px solid var(--ir-border);
-	border-left: 3px solid var(--color-blue);
-	background: var(--ir-panel-2);
-	border-radius: 8px;
-	padding: 8px;
-	margin-bottom: 8px;
-	cursor: pointer;
-}
-.ir-card.is-selected {
-	outline: 2px solid var(--text-accent);
-}
-.ir-card.is-blocked {
-	border-left-color: var(--color-orange);
-}
-.ir-card.status-done {
-	border-left-color: var(--color-green);
-}
-.ir-card.status-parked {
-	border-left-color: var(--text-faint);
-}
-.ir-card-meta, .ir-card-foot {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 5px;
-	align-items: center;
-	color: var(--text-muted);
-	font-size: 11px;
-}
-.ir-id {
-	font-family: var(--font-monospace);
-	color: var(--text-normal);
-	font-weight: 700;
-}
-.ir-pill {
-	border: 1px solid var(--ir-border);
-	border-radius: 999px;
-	padding: 0 6px;
-	font-family: var(--font-monospace);
-}
-.ir-pill.priority-p0, .ir-pill.blocked {
-	color: var(--color-red);
-}
-.ir-pill.priority-p1 {
-	color: var(--color-orange);
-}
-.ir-card-title {
-	font-weight: 650;
-	margin-top: 6px;
-	line-height: 1.35;
-}
-.ir-card-summary {
-	color: var(--text-muted);
-	font-size: 12px;
-	margin: 5px 0 6px;
-	display: -webkit-box;
-	-webkit-line-clamp: 3;
-	-webkit-box-orient: vertical;
-	overflow: hidden;
-}
-.ir-detail, .ir-gates {
-	border: 1px solid var(--ir-border);
-	background: var(--ir-panel);
-	border-radius: 8px;
-	padding: 12px;
-	margin-bottom: 12px;
-}
-.ir-detail-grid {
-	display: grid;
-	grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
-	gap: 14px;
-}
-.ir-block {
-	margin-bottom: 12px;
-}
-.ir-block h4 {
-	margin: 0 0 5px;
-	font-size: 12px;
-	color: var(--text-muted);
-}
-.ir-block ul {
-	margin: 0;
-	padding-left: 18px;
-}
-.ir-block li {
-	margin: 3px 0;
-}
-.ir-block code, .ir-block pre {
-	font-family: var(--font-monospace);
-	font-size: 12px;
-	white-space: pre-wrap;
-}
-.ir-block pre {
-	max-height: 260px;
-	overflow: auto;
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	padding: 8px;
-	background: var(--background-primary);
-}
-.ir-dep {
-	display: flex;
-	justify-content: space-between;
-	gap: 10px;
-	border-bottom: 1px solid var(--ir-border);
-	padding: 3px 0;
-	font-family: var(--font-monospace);
-}
-.ir-dep.ok {
-	color: var(--color-green);
-}
-.ir-dep.blocked, .ir-warning {
-	color: var(--color-orange);
-}
-.ir-warning {
-	border: 1px solid rgba(var(--color-orange-rgb), 0.45);
-	border-radius: 8px;
-	padding: 8px;
-}
-.ir-gate-grid {
-	display: grid;
-	grid-template-columns: repeat(3, minmax(0, 1fr));
-	gap: 10px;
-}
-.ir-gate {
-	border: 1px solid var(--ir-border);
-	border-radius: 8px;
-	padding: 9px;
-	background: var(--background-primary);
-}
-.ir-gate-name {
-	font-weight: 700;
-}
-.ir-gate-desc, .ir-gate-meta, .ir-empty {
-	color: var(--text-muted);
-	font-size: 12px;
-}
-.ir-progress {
-	height: 6px;
-	background: var(--background-modifier-border);
-	border-radius: 999px;
-	margin: 8px 0;
-	overflow: hidden;
-}
-.ir-progress-bar {
-	height: 100%;
-	background: var(--color-green);
-}
-@media (max-width: 900px) {
-	.ir-summary, .ir-gate-grid, .ir-detail-grid {
-		grid-template-columns: 1fr;
-	}
-}
-`;
-	document.head.appendChild(style);
 }
